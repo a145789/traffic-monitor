@@ -114,6 +114,20 @@ fn interruptible_sleep(dur: Duration) {
     }
 }
 
+struct MouseData {
+    level: u32,
+    charging: bool,
+    dpi: u32,
+}
+
+fn poll_mouse() -> Result<MouseData, ()> {
+    let api = HidApi::new().map_err(|_| ())?;
+    let device = find_mouse_device(&api).ok_or(())?;
+    let (level, charging) = query_mouse_battery(&device)?;
+    let dpi = query_mouse_dpi(&device)?;
+    Ok(MouseData { level, charging, dpi })
+}
+
 fn mouse_worker_loop() {
     loop {
         if SHOULD_STOP.load(Ordering::Relaxed) {
@@ -125,26 +139,18 @@ fn mouse_worker_loop() {
             continue;
         }
 
-        let poll_result = (|| -> Result<((u32, bool), u32), ()> {
-            let api = HidApi::new().map_err(|_| ())?;
-            let device = find_mouse_device(&api).ok_or(())?;
-            let (level, charging) = query_mouse_battery(&device)?;
-            let dpi = query_mouse_dpi(&device)?;
-            Ok(((level, charging), dpi))
-        })();
-
-        match poll_result {
-            Ok(((level, charging), dpi)) => {
-                MOUSE_BATTERY_LEVEL.store(level, Ordering::Relaxed);
-                MOUSE_IS_CHARGING.store(charging, Ordering::Relaxed);
-                MOUSE_DPI_VALUE.store(dpi, Ordering::Relaxed);
+        match poll_mouse() {
+            Ok(data) => {
+                MOUSE_BATTERY_LEVEL.store(data.level, Ordering::Relaxed);
+                MOUSE_IS_CHARGING.store(data.charging, Ordering::Relaxed);
+                MOUSE_DPI_VALUE.store(data.dpi, Ordering::Relaxed);
 
                 FAIL_COUNT.store(0, Ordering::Relaxed);
                 MOUSE_ONLINE.store(true, Ordering::Relaxed);
 
                 unsafe {
-                    let lparam = ((level & 0xFF) << 16) | (dpi & 0xFFFF);
-                    let wparam = charging as usize;
+                    let lparam = ((data.level & 0xFF) << 16) | (data.dpi & 0xFFFF);
+                    let wparam = data.charging as usize;
                     let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                     let _ = PostMessageW(
                         Some(hwnd),
@@ -156,10 +162,9 @@ fn mouse_worker_loop() {
 
                 interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_ONLINE));
             }
-            Err(_) => {
+            Err(()) => {
                 handle_mouse_offline();
                 interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
-                continue;
             }
         }
     }
