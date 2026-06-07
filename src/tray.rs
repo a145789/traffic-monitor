@@ -104,7 +104,7 @@ pub fn remove_tray_icon() {
 pub fn show_context_menu(hwnd: HWND) {
     unsafe {
         let mut point = POINT::default();
-        GetCursorPos(&mut point);
+        let _ = GetCursorPos(&mut point);
 
         let hmenu = CreatePopupMenu().unwrap();
 
@@ -121,7 +121,7 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
-        InsertMenuItemW(hmenu, 0, true, &autostart_item);
+        let _ = InsertMenuItemW(hmenu, 0, true, &autostart_item);
 
         let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
         let mut mouse_item = MENUITEMINFOW {
@@ -136,7 +136,7 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
-        InsertMenuItemW(hmenu, 1, true, &mouse_item);
+        let _ = InsertMenuItemW(hmenu, 1, true, &mouse_item);
 
         let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
         let mut exit_item = MENUITEMINFOW {
@@ -147,11 +147,11 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
-        InsertMenuItemW(hmenu, 2, true, &exit_item);
+        let _ = InsertMenuItemW(hmenu, 2, true, &exit_item);
 
-        SetForegroundWindow(hwnd);
+        let _ = SetForegroundWindow(hwnd);
 
-        TrackPopupMenu(
+        let _ = TrackPopupMenu(
             hmenu,
             TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
             point.x,
@@ -213,7 +213,7 @@ fn is_autostart_enabled() -> bool {
                 Some(buf.as_mut_ptr()),
                 Some(&mut buf_size),
             );
-            windows::Win32::System::Registry::RegCloseKey(hkey).ok();
+            let _ = windows::Win32::System::Registry::RegCloseKey(hkey).ok();
             result.is_ok()
         } else {
             false
@@ -243,13 +243,13 @@ fn toggle_autostart() {
         .is_ok()
         {
             if is_autostart_enabled() {
-                RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr())).ok();
+                let _ = RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr())).ok();
             } else {
                 let exe_path = std::env::current_exe().unwrap();
                 let path_str = exe_path.to_string_lossy().to_string();
                 let path_quoted = format!("\"{}\"", path_str);
                 let path_wide: Vec<u16> = path_quoted.encode_utf16().chain(std::iter::once(0)).collect();
-                RegSetValueExW(
+                let _ = RegSetValueExW(
                     hkey,
                     PCWSTR(value_name.as_ptr()),
                     0,
@@ -261,7 +261,7 @@ fn toggle_autostart() {
                 )
                 .ok();
             }
-            windows::Win32::System::Registry::RegCloseKey(hkey).ok();
+            let _ = windows::Win32::System::Registry::RegCloseKey(hkey).ok();
         }
     }
 }
