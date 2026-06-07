@@ -313,6 +313,43 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
     }
 }
 
+fn update_taskbar_position(hwnd: HWND) {
+    unsafe {
+        let h_taskbar = match FindWindowW(w!("Shell_TrayWnd"), w!("")) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let h_tray = match FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let mut rc_tray = RECT::default();
+        let mut rc_taskbar = RECT::default();
+        let _ = GetWindowRect(h_tray, &mut rc_tray);
+        let _ = GetWindowRect(h_taskbar, &mut rc_taskbar);
+
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+        let scale = dpi as f64 / 96.0;
+        let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
+        let display_height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
+        let gap = (GAP as f64 * scale).round() as i32;
+
+        let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
+        let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
+
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            display_x,
+            display_y,
+            display_width,
+            display_height,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
 const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 
@@ -371,6 +408,7 @@ pub unsafe extern "system" fn wnd_proc(
                 match wparam.0 {
                     TIMER_ID_NETWORK => {
                         check_fullscreen(hwnd);
+                        update_taskbar_position(hwnd);
                         if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                             collect_network();
                             let _ = InvalidateRect(Some(hwnd), None, false);
