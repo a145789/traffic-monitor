@@ -2,6 +2,7 @@
 AppName=Traffic Monitor
 AppVersion=0.2.1
 AppPublisher=Traffic Monitor
+AppMutex=TrafficMonitor_Mutex_Instance
 DefaultDirName={autopf}\Traffic Monitor
 DefaultGroupName=Traffic Monitor
 OutputBaseFilename=TrafficMonitor-Setup
@@ -43,26 +44,6 @@ function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
 begin
-  if FileExists(ExpandConstant('{app}\traffic-monitor.exe')) then
-  begin
-    Exec(
-      ExpandConstant('{app}\traffic-monitor.exe'),
-      '--quit',
-      '',
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    );
-
-    Exec(
-      ExpandConstant('{cmd}'),
-      '/C taskkill /F /IM traffic-monitor.exe',
-      '',
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    );
-  end;
-
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /T /IM traffic-monitor.exe >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := True;
 end;
