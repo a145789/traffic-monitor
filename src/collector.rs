@@ -12,6 +12,9 @@ use crate::config::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
 
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
+// NET_IF_INTERFACE_AND_OPER_STATUS_FLAGS_HARDWARE_INTERFACE (bit 0, mask 0x01)
+// windows-rs 0.62 does not expose a getter for this bitfield, so we use a manual mask.
+const HARDWARE_INTERFACE_MASK: u8 = 0x01;
 
 static PREV_IDLE_TIME: AtomicU64 = AtomicU64::new(0);
 static PREV_KERNEL_TIME: AtomicU64 = AtomicU64::new(0);
@@ -132,7 +135,7 @@ fn is_physical_interface(row: &MIB_IF_ROW2) -> bool {
         return false;
     }
 
-    if row.InterfaceAndOperStatusFlags._bitfield & 0x80 == 0 {
+    if row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE_MASK == 0 {
         return false;
     }
 
