@@ -42,7 +42,11 @@ jobs:
 
       - name: Compile installer
         run: |
-          & "C:\Program Files (x86)\Inno Setup 7\ISCC.exe" installer.iss
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $iscc) {
+            $iscc = "C:\Program Files (x86)\Inno Setup 7\ISCC.exe"
+          }
+          & $iscc installer.iss
 
       - name: Rename installer
         shell: bash

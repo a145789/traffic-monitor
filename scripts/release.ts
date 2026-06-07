@@ -31,7 +31,7 @@ writeFileSync("installer.iss", iss);
 
 // Git commit and tag
 console.log("Creating git commit and tag...");
-execSync("git add Cargo.toml installer.iss", { stdio: "inherit" });
+execSync("git add Cargo.toml installer.iss Cargo.lock", { stdio: "inherit" });
 execSync(`git commit -m "release: v${newVersion}"`, { stdio: "inherit" });
 execSync(`git tag v${newVersion}`, { stdio: "inherit" });
 
