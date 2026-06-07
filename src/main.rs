@@ -65,6 +65,7 @@ fn stop_and_join_mouse_thread() {
             let _ = handle.join();
         }
     });
+    trim_working_set();
 }
 
 fn is_immersive_color_set(lparam: LPARAM) -> bool {
