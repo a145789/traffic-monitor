@@ -48,5 +48,4 @@ fn is_physical_interface(row: &MIB_IF_ROW2) -> bool {
 - **工程量**：极小。代码行数变更通常在 5 行以内，不涉及任何状态同步与架构层面的调整。
 > **注**：当前项目依赖的 `windows` crate v0.62 尚未为该位域生成 `HardwareInterface()` getter，
 > 因此实际实现采用手工位掩码 `_bitfield & 0x01`。待依赖升级后可替换为更可读的 getter 调用。
-
 - **风险**：几乎没有。`HardwareInterface` 标志位从 Windows Vista / Windows 7 时代起就已经实装在 NDIS 协议栈底层，行为在 Windows 11 环境下极其可靠和稳定。合入此改动即可彻底解决因使用虚拟机或 WSL 引发的网速异常翻倍问题。
