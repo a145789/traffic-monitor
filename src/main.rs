@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowExW, FindWindowW, GetDesktopWindow, GetForegroundWindow,
     GetShellWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer,
-    MessageBoxW, PostQuitMessage, RegisterWindowMessageW, SetLayeredWindowAttributes,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetLayeredWindowAttributes,
     SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     HWND_TOP, GWL_EXSTYLE, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
     SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE, SWP_FRAMECHANGED,
@@ -133,7 +133,40 @@ fn check_fullscreen(hwnd: HWND) {
     }
 }
 
+fn quit_existing_instance() {
+    unsafe {
+        let class_name: Vec<u16> = crate::config::WINDOW_CLASS.encode_utf16().collect();
+        let hwnd = FindWindowW(
+            windows::core::PCWSTR(class_name.as_ptr()),
+            windows::core::PCWSTR(std::ptr::null()),
+        );
+
+        if let Ok(h) = hwnd {
+            if !h.is_invalid() {
+                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+                for _ in 0..50 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if FindWindowW(
+                        windows::core::PCWSTR(class_name.as_ptr()),
+                        windows::core::PCWSTR(std::ptr::null()),
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--quit") {
+        quit_existing_instance();
+        return;
+    }
+
     unsafe {
         // Enforce single instance via named Mutex
         let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();

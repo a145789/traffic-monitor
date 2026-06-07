@@ -2,7 +2,6 @@
 AppName=Traffic Monitor
 AppVersion=0.2.1
 AppPublisher=Traffic Monitor
-AppMutex=TrafficMonitor_Mutex_Instance
 DefaultDirName={autopf}\Traffic Monitor
 DefaultGroupName=Traffic Monitor
 OutputBaseFilename=TrafficMonitor-Setup
@@ -13,6 +12,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\traffic-monitor.exe
 SetupIconFile=assets\icon.ico
 WizardStyle=modern
+CloseApplications=no
+RestartApplications=no
 
 [Files]
 Source: "target\release\traffic-monitor.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -22,12 +23,46 @@ Name: "{group}\Traffic Monitor"; Filename: "{app}\traffic-monitor.exe"
 Name: "{group}\Uninstall Traffic Monitor"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Traffic Monitor"; Filename: "{app}\traffic-monitor.exe"; Tasks: desktopicon
 
+[Languages]
+Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
 [Tasks]
-Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Additional icons:"
-Name: "startup"; Description: "Run at Windows startup"; GroupDescription: "Startup:"
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"
+Name: "startup"; Description: "开机自动启动"; GroupDescription: "启动选项:"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TrafficMonitor"; ValueData: """{app}\traffic-monitor.exe"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-Filename: "{app}\traffic-monitor.exe"; Description: "Launch Traffic Monitor"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\traffic-monitor.exe"; \
+Description: "启动 Traffic Monitor"; \
+Flags: nowait postinstall skipifsilent
+
+[Code]
+function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  if FileExists(ExpandConstant('{app}\traffic-monitor.exe')) then
+  begin
+    Exec(
+      ExpandConstant('{app}\traffic-monitor.exe'),
+      '--quit',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+
+    Exec(
+      ExpandConstant('{cmd}'),
+      '/C taskkill /F /IM traffic-monitor.exe',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+  end;
+
+  Result := True;
+end;
