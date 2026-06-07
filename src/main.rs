@@ -275,6 +275,19 @@ pub unsafe extern "system" fn wnd_proc(
                         renderer.update_text_color();
                     }
                 });
+                let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+                if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+                }
+                if SHOW_MOUSE_INFO.load(Ordering::Relaxed)
+                    && !SUSPENDED.load(Ordering::Relaxed)
+                    && !FULLSCREEN.load(Ordering::Relaxed)
+                {
+                    stop_and_join_mouse_thread();
+                    MOUSE_THREAD.with(|m| {
+                        *m.borrow_mut() = Some(start_mouse_thread());
+                    });
+                }
             }
             return LRESULT(0);
         }
@@ -354,7 +367,7 @@ pub unsafe extern "system" fn wnd_proc(
                         SUSPENDED.store(false, Ordering::Relaxed);
                         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
                         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-                        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                             stop_and_join_mouse_thread();
                             MOUSE_THREAD.with(|m| {
                                 *m.borrow_mut() = Some(start_mouse_thread());
@@ -379,7 +392,7 @@ pub unsafe extern "system" fn wnd_proc(
                         SUSPENDED.store(false, Ordering::Relaxed);
                         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
                         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-                        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                             stop_and_join_mouse_thread();
                             MOUSE_THREAD.with(|m| {
                                 *m.borrow_mut() = Some(start_mouse_thread());

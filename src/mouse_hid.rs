@@ -81,7 +81,7 @@ pub fn init(hwnd: HWND) {
 pub fn start_mouse_thread() -> thread::JoinHandle<()> {
     SHOULD_STOP.store(false, Ordering::Release);
     thread::spawn(|| {
-        thread::sleep(Duration::from_secs(2));
+        interruptible_sleep(Duration::from_secs(2));
         mouse_worker_loop();
     })
 }
