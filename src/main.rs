@@ -121,7 +121,6 @@ fn check_fullscreen(hwnd: HWND) {
         if is_full && !was {
             KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
             stop_and_join_mouse_thread();
-            trim_working_set();
         } else if !is_full && was {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
@@ -422,7 +421,6 @@ pub unsafe extern "system" fn wnd_proc(
                         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
                         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
                         stop_and_join_mouse_thread();
-                        trim_working_set();
                     }
                     PBT_APMRESUMEAUTOMATIC => {
                         SUSPENDED.store(false, Ordering::Relaxed);
@@ -447,7 +445,6 @@ pub unsafe extern "system" fn wnd_proc(
                         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
                         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
                         stop_and_join_mouse_thread();
-                        trim_working_set();
                     }
                     WTS_SESSION_UNLOCK => {
                         SUSPENDED.store(false, Ordering::Relaxed);
