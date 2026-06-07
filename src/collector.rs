@@ -132,6 +132,10 @@ fn is_physical_interface(row: &MIB_IF_ROW2) -> bool {
         return false;
     }
 
+    if row.InterfaceAndOperStatusFlags._bitfield & 0x80 == 0 {
+        return false;
+    }
+
     true
 }
 
