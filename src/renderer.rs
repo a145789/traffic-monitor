@@ -328,6 +328,8 @@ impl Renderer {
             self.font_size = font_size;
             self.width = width;
             self.height = height;
+
+            let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
         }
     }
 }
@@ -375,40 +377,42 @@ fn format_speed(bytes_per_sec: u32) -> String {
 }
 
 pub unsafe fn is_system_light_theme() -> bool {
-    use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
-    };
-    use windows::core::PCWSTR;
+    unsafe {
+        use windows::Win32::System::Registry::{
+            RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER, KEY_READ,
+        };
+        use windows::core::PCWSTR;
 
-    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
-        .encode_utf16()
-        .collect();
-    let value_name: Vec<u16> = "SystemUsesLightTheme\0".encode_utf16().collect();
-    let mut hkey = Default::default();
+        let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+            .encode_utf16()
+            .collect();
+        let value_name: Vec<u16> = "SystemUsesLightTheme\0".encode_utf16().collect();
+        let mut hkey = Default::default();
 
-    if RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        PCWSTR(key_path.as_ptr()),
-        Some(0),
-        KEY_READ,
-        &mut hkey,
-    )
-    .is_ok()
-    {
-        let mut value: u32 = 0;
-        let mut value_size = std::mem::size_of::<u32>() as u32;
-        let result = RegQueryValueExW(
-            hkey,
-            PCWSTR(value_name.as_ptr()),
-            None,
-            None,
-            Some(&mut value as *mut u32 as *mut u8),
-            Some(&mut value_size),
-        );
-        let _ = windows::Win32::System::Registry::RegCloseKey(hkey);
-        if result.is_ok() {
-            return value == 1;
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_ok()
+        {
+            let mut value: u32 = 0;
+            let mut value_size = std::mem::size_of::<u32>() as u32;
+            let result = RegQueryValueExW(
+                hkey,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                None,
+                Some(&mut value as *mut u32 as *mut u8),
+                Some(&mut value_size),
+            );
+            let _ = RegCloseKey(hkey);
+            if result.is_ok() {
+                return value == 1;
+            }
         }
+        false
     }
-    false // 默认使用深色模式
 }

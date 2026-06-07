@@ -103,7 +103,10 @@ fn interruptible_sleep(dur: Duration) {
         if SHOULD_STOP.load(Ordering::Relaxed) {
             return;
         }
-        let remaining = dur - start.elapsed();
+        let remaining = dur.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
         thread::sleep(remaining.min(Duration::from_millis(500)));
     }
 }

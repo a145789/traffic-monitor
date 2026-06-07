@@ -11,13 +11,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MFS_UNCHECKED, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
 };
 
+use std::cell::RefCell;
 use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE};
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 pub const MENU_ID_AUTOSTART: u32 = 1001;
 pub const MENU_ID_EXIT: u32 = 1002;
 
-static mut TRAY_DATA: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+thread_local! {
+    static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = RefCell::new(None);
+}
 
 pub fn register_window_class() -> Result<(), String> {
     unsafe {
@@ -92,13 +95,19 @@ pub fn create_tray_icon(hwnd: HWND) {
 
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         let _ = Shell_NotifyIconW(windows::Win32::UI::Shell::NIM_SETVERSION, &nid);
-        TRAY_DATA = nid;
+        TRAY_DATA.with(|t| {
+            *t.borrow_mut() = Some(nid);
+        });
     }
 }
 
 pub fn remove_tray_icon() {
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &TRAY_DATA);
+        TRAY_DATA.with(|t| {
+            if let Some(nid) = t.borrow().as_ref() {
+                let _ = Shell_NotifyIconW(NIM_DELETE, nid);
+            }
+        });
     }
 }
 
