@@ -9,7 +9,8 @@ mod tray;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT,
 };
@@ -134,8 +135,24 @@ fn check_fullscreen(hwnd: HWND) {
 
 fn main() {
     unsafe {
+        // Enforce single instance via named Mutex
+        let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
+        let mutex_handle = CreateMutexW(None, true, windows::core::PCWSTR(mutex_name.as_ptr()));
+        if let Ok(handle) = mutex_handle {
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let _ = CloseHandle(handle);
+                return;
+            }
+        } else {
+            show_error("Failed to create mutex");
+            return;
+        }
+
         if register_window_class().is_err() {
             show_error("Failed to register window class");
+            if let Ok(handle) = mutex_handle {
+                let _ = CloseHandle(handle);
+            }
             return;
         }
 
@@ -143,6 +160,9 @@ fn main() {
             Ok(h) => h,
             Err(e) => {
                 show_error(&format!("Failed to create window: {}", e));
+                if let Ok(handle) = mutex_handle {
+                    let _ = CloseHandle(handle);
+                }
                 return;
             }
         };
@@ -153,6 +173,9 @@ fn main() {
 
         if !embed_in_taskbar(hwnd) {
             show_error("Failed to embed in taskbar. Make sure explorer.exe is running.");
+            if let Ok(handle) = mutex_handle {
+                let _ = CloseHandle(handle);
+            }
             return;
         }
 
@@ -193,6 +216,10 @@ fn main() {
         RENDERER.with(|r| {
             let _ = r.borrow_mut().take();
         });
+
+        if let Ok(handle) = mutex_handle {
+            let _ = CloseHandle(handle);
+        }
     }
 }
 

@@ -7,8 +7,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, GetCursorPos, LoadIconW,
     SetForegroundWindow, TrackPopupMenu, WM_USER, WNDCLASSEXW, IDI_APPLICATION,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE, WS_POPUP,
-    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MFS_CHECKED,
-    MFS_UNCHECKED, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
+    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MIIM_FTYPE,
+    MFS_CHECKED, MFS_UNCHECKED, MFS_DISABLED, MFT_SEPARATOR, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
 };
 
 use std::cell::RefCell;
@@ -17,6 +17,8 @@ use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 pub const MENU_ID_AUTOSTART: u32 = 1001;
 pub const MENU_ID_EXIT: u32 = 1002;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 thread_local! {
     static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = RefCell::new(None);
@@ -118,6 +120,29 @@ pub fn show_context_menu(hwnd: HWND) {
 
         let hmenu = CreatePopupMenu().unwrap();
 
+        // 1. Version item (Disabled)
+        let version_str = format!("Traffic Monitor v{}\0", VERSION);
+        let version_text: Vec<u16> = version_str.encode_utf16().collect();
+        let mut version_item = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+            fState: MFS_DISABLED,
+            wID: 0,
+            ..Default::default()
+        };
+        version_item.dwTypeData = PWSTR(version_text.as_ptr() as *mut u16);
+        let _ = InsertMenuItemW(hmenu, 0, true, &version_item);
+
+        // 2. Separator
+        let sep_item = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE,
+            fType: MFT_SEPARATOR,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(hmenu, 1, true, &sep_item);
+
+        // 3. Autostart
         let autostart_text: Vec<u16> = "开机自启\0".encode_utf16().collect();
         let mut autostart_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -131,8 +156,9 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
-        let _ = InsertMenuItemW(hmenu, 0, true, &autostart_item);
+        let _ = InsertMenuItemW(hmenu, 2, true, &autostart_item);
 
+        // 4. Show mouse info
         let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
         let mut mouse_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -146,8 +172,9 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
-        let _ = InsertMenuItemW(hmenu, 1, true, &mouse_item);
+        let _ = InsertMenuItemW(hmenu, 3, true, &mouse_item);
 
+        // 5. Exit
         let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
         let mut exit_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -157,7 +184,7 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
-        let _ = InsertMenuItemW(hmenu, 2, true, &exit_item);
+        let _ = InsertMenuItemW(hmenu, 4, true, &exit_item);
 
         let _ = SetForegroundWindow(hwnd);
 

@@ -2,6 +2,7 @@
 AppName=Traffic Monitor
 AppVersion=0.1.2
 AppPublisher=Traffic Monitor
+AppMutex=TrafficMonitor_Mutex_Instance
 DefaultDirName={autopf}\Traffic Monitor
 DefaultGroupName=Traffic Monitor
 OutputBaseFilename=TrafficMonitor-Setup

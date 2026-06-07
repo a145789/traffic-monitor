@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 pub const APP_NAME: &str = "TrafficMonitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";
 pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
+pub const MUTEX_NAME: &str = "TrafficMonitor_Mutex_Instance\0";
 
 pub const DISPLAY_WIDTH: i32 = 240;
 pub const DISPLAY_HEIGHT: i32 = 32;
