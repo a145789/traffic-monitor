@@ -1,11 +1,12 @@
 use std::sync::atomic::Ordering;
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
-    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, GetWindowDC, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, HDC, HFONT, HBITMAP, HGDIOBJ, HBRUSH,
+    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, GetTextExtentPoint32W,
+    GetWindowDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    HDC, HFONT, HBITMAP, HGDIOBJ, HBRUSH,
     SRCCOPY, FONT_QUALITY, LOGFONTW, TRANSPARENT,
-    DrawTextW, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER
+    DrawTextW, DT_LEFT, DT_RIGHT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER
 };
 
 use crate::config::{
@@ -26,6 +27,7 @@ pub struct Renderer {
     font_size: i32,
     width: i32,
     height: i32,
+    arrow_width: i32,
 }
 
 impl Renderer {
@@ -43,6 +45,13 @@ impl Renderer {
 
             let _ = SetBkMode(hdc_mem, TRANSPARENT);
 
+            let arrow_width = {
+                let arrow_text = to_wide("\u{2191} ");
+                let mut size = SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc_mem, &arrow_text[..arrow_text.len() - 1], &mut size);
+                size.cx
+            };
+
             let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
 
             Self {
@@ -56,6 +65,7 @@ impl Renderer {
                 font_size: FONT_BASE_SIZE,
                 width: DISPLAY_WIDTH,
                 height: DISPLAY_HEIGHT,
+                arrow_width,
             }
         }
     }
@@ -95,40 +105,74 @@ impl Renderer {
             let scale = self.width as f64 / DISPLAY_WIDTH as f64;
 
             // 1. 绘制第三列 (网速) - 最右列
-            // 网速列宽度 76，右边距 4
+            // 箭头左对齐，数值右对齐 — 表格效果
             let col_gap = (13.0 * scale).round() as i32;
             let speed_right = self.width - (4.0 * scale).round() as i32;
             let speed_left = speed_right - (76.0 * scale).round() as i32;
+            let arrow_right = speed_left + self.arrow_width;
 
             SetTextColor(self.hdc_mem, self.text_color);
-            let speed_up_text = format!("\u{2191} {}", format_speed(speed_up));
-            let mut rc_speed_up = RECT {
+
+            // 上行箭头
+            let mut rc_up_arrow = RECT {
                 left: speed_left,
+                top: 0,
+                right: arrow_right,
+                bottom: half_height,
+            };
+            let mut up_arrow = to_wide("\u{2191}");
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut up_arrow,
+                &mut rc_up_arrow,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+            );
+
+            // 上行数值
+            let speed_up_text = format_speed(speed_up);
+            let mut rc_up_val = RECT {
+                left: arrow_right,
                 top: 0,
                 right: speed_right,
                 bottom: half_height,
             };
-            let mut speed_up_wide = to_wide(&speed_up_text);
+            let mut up_val = to_wide(&speed_up_text);
             let _ = DrawTextW(
                 self.hdc_mem,
-                &mut speed_up_wide,
-                &mut rc_speed_up,
+                &mut up_val,
+                &mut rc_up_val,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
+            );
+
+            // 下行箭头
+            let mut rc_down_arrow = RECT {
+                left: speed_left,
+                top: half_height,
+                right: arrow_right,
+                bottom: self.height,
+            };
+            let mut down_arrow = to_wide("\u{2193}");
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut down_arrow,
+                &mut rc_down_arrow,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
             );
 
-            let speed_down_text = format!("\u{2193} {}", format_speed(speed_down));
-            let mut rc_speed_down = RECT {
-                left: speed_left,
+            // 下行数值
+            let speed_down_text = format_speed(speed_down);
+            let mut rc_down_val = RECT {
+                left: arrow_right,
                 top: half_height,
                 right: speed_right,
                 bottom: self.height,
             };
-            let mut speed_down_wide = to_wide(&speed_down_text);
+            let mut down_val = to_wide(&speed_down_text);
             let _ = DrawTextW(
                 self.hdc_mem,
-                &mut speed_down_wide,
-                &mut rc_speed_down,
-                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                &mut down_val,
+                &mut rc_down_val,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
 
             // 2. 绘制第二列 (鼠标信息) - 中列
@@ -248,7 +292,7 @@ impl Renderer {
             } else {
                 speed_left - col_gap
             };
-            let cpu_left = cpu_right - (64.0 * scale).round() as i32;
+            let cpu_left = cpu_right - (76.0 * scale).round() as i32;
 
             let cpu_text = format!("CPU: {}%", cpu);
             let mut rc_cpu = RECT {
@@ -262,7 +306,7 @@ impl Renderer {
                 self.hdc_mem,
                 &mut cpu_wide,
                 &mut rc_cpu,
-                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
 
             let mem_text = format!("MEM: {}%", mem);
@@ -277,7 +321,7 @@ impl Renderer {
                 self.hdc_mem,
                 &mut mem_wide,
                 &mut rc_mem,
-                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
 
             SetTextColor(self.hdc_mem, self.text_color);
@@ -330,6 +374,14 @@ impl Renderer {
             self.height = height;
 
             let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
+
+            let arrow_width = {
+                let arrow_text = to_wide("\u{2191} ");
+                let mut size = SIZE::default();
+                let _ = GetTextExtentPoint32W(self.hdc_mem, &arrow_text[..arrow_text.len() - 1], &mut size);
+                size.cx
+            };
+            self.arrow_width = arrow_width;
         }
     }
 }
