@@ -5,8 +5,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DestroyWindow, GetCursorPos, PostQuitMessage,
-    SetForegroundWindow, TrackPopupMenu, WM_COMMAND, WM_USER, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_CHILD, WS_VISIBLE,
+    SetForegroundWindow, TrackPopupMenu, WM_USER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MFS_CHECKED,
     MFS_UNCHECKED, InsertMenuItemW,
 };

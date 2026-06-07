@@ -6,22 +6,25 @@ mod tray;
 
 use std::sync::atomic::Ordering;
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, FindWindowExW, FindWindowW, GetWindowRect,
+    DefWindowProcW, FindWindowExW, FindWindowW, GetDesktopWindow, GetForegroundWindow,
+    GetShellWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer,
     MessageBoxW, PostQuitMessage, RegisterWindowMessageW, SetLayeredWindowAttributes,
-    SetParent, SetTimer, SetWindowPos, HWND_TOP, LWA_COLORKEY,
-    MB_ICONERROR, MB_OK, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED,
-    WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    HWND_TOP, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
+    SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
 };
 
 use crate::collector::{collect_cpu, collect_memory, collect_network, trim_working_set};
 use crate::config::{
-    COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, SUSPENDED,
+    COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, FULLSCREEN, GAP, SUSPENDED,
     TIMER_ID_CPU_MEM, TIMER_ID_NETWORK,
 };
 use crate::mouse_hid::{start_mouse_thread, stop_mouse_thread, WM_USER_MOUSE_UPDATE, WM_USER_MOUSE_STATUS};
@@ -31,6 +34,8 @@ use crate::tray::{create_main_window, create_tray_icon, register_window_class, r
 static mut RENDERER: Option<Renderer> = None;
 static mut MOUSE_THREAD: Option<std::thread::JoinHandle<()>> = None;
 static mut TASKBAR_CREATED_MSG: u32 = 0;
+static mut H_TASKBAR: Option<HWND> = None;
+static mut H_TRAY: Option<HWND> = None;
 
 fn show_error(msg: &str) {
     unsafe {
@@ -42,6 +47,68 @@ fn show_error(msg: &str) {
             windows::core::PCWSTR(title.as_ptr()),
             MB_OK | MB_ICONERROR,
         );
+    }
+}
+
+fn is_immersive_color_set(lparam: LPARAM) -> bool {
+    let ptr = lparam.0 as *const u16;
+    if ptr.is_null() {
+        return false;
+    }
+    let expected: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
+    for (i, &expected_char) in expected.iter().enumerate() {
+        let actual_char = unsafe { *ptr.add(i) };
+        if actual_char != expected_char {
+            return false;
+        }
+        if actual_char == 0 {
+            return true;
+        }
+    }
+    true
+}
+
+fn check_fullscreen(hwnd: HWND) {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_invalid()
+            || GetDesktopWindow() == foreground
+            || GetShellWindow() == foreground
+            || foreground == hwnd
+        {
+            let was = FULLSCREEN.load(Ordering::Relaxed);
+            if was {
+                FULLSCREEN.store(false, Ordering::Relaxed);
+                let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
+                let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+                MOUSE_THREAD = Some(start_mouse_thread());
+            }
+            return;
+        }
+
+        let mut rect = RECT::default();
+        let _ = GetWindowRect(foreground, &mut rect);
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let is_full = (rect.right - rect.left) == screen_w
+            && (rect.bottom - rect.top) == screen_h;
+
+        let was = FULLSCREEN.load(Ordering::Relaxed);
+        FULLSCREEN.store(is_full, Ordering::Relaxed);
+
+        if is_full && !was {
+            KillTimer(hwnd, TIMER_ID_NETWORK).ok();
+            KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
+            stop_mouse_thread();
+            if let Some(handle) = MOUSE_THREAD.take() {
+                let _ = handle.join();
+            }
+            trim_working_set();
+        } else if !is_full && was {
+            let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
+            let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+            MOUSE_THREAD = Some(start_mouse_thread());
+        }
     }
 }
 
@@ -75,6 +142,12 @@ fn main() {
 
         RENDERER = Some(Renderer::new());
 
+        if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
+            if let Some(renderer) = &mut RENDERER {
+                renderer.update_text_color(h_tray, h_taskbar);
+            }
+        }
+
         let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
         let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
 
@@ -105,8 +178,8 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     };
 
-    let mut rc_tray = windows::Win32::Foundation::RECT::default();
-    let mut rc_taskbar = windows::Win32::Foundation::RECT::default();
+    let mut rc_tray = RECT::default();
+    let mut rc_taskbar = RECT::default();
     let _ = GetWindowRect(h_tray, &mut rc_tray);
     let _ = GetWindowRect(h_taskbar, &mut rc_taskbar);
 
@@ -114,6 +187,10 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
     let display_y = (rc_taskbar.bottom - rc_taskbar.top - DISPLAY_HEIGHT) / 2;
 
     let _ = SetParent(hwnd, h_taskbar);
+
+    let current_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, current_style | (WS_CHILD.0 as isize));
+
     let _ = SetWindowPos(
         hwnd,
         HWND_TOP,
@@ -123,6 +200,9 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
         DISPLAY_HEIGHT,
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
+
+    H_TASKBAR = Some(h_taskbar);
+    H_TRAY = Some(h_tray);
 
     true
 }
@@ -135,8 +215,15 @@ pub unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     if msg == TASKBAR_CREATED_MSG && TASKBAR_CREATED_MSG != 0 {
         remove_tray_icon();
-        embed_in_taskbar(hwnd);
-        create_tray_icon(hwnd);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        if embed_in_taskbar(hwnd) {
+            create_tray_icon(hwnd);
+            if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
+                if let Some(renderer) = &mut RENDERER {
+                    renderer.update_text_color(h_tray, h_taskbar);
+                }
+            }
+        }
         return LRESULT(0);
     }
 
@@ -156,13 +243,14 @@ pub unsafe extern "system" fn wnd_proc(
         WM_TIMER => {
             match wparam.0 {
                 TIMER_ID_NETWORK => {
-                    if !SUSPENDED.load(Ordering::Relaxed) {
+                    check_fullscreen(hwnd);
+                    if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                         collect_network();
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
                 TIMER_ID_CPU_MEM => {
-                    if !SUSPENDED.load(Ordering::Relaxed) {
+                    if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                         collect_cpu();
                         collect_memory();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -179,10 +267,11 @@ pub unsafe extern "system" fn wnd_proc(
         }
 
         WM_SETTINGCHANGE => {
-            if let Some(renderer) = &mut RENDERER {
-                let h_taskbar = FindWindowW(w!("Shell_TrayWnd"), w!(""));
-                if let Ok(taskbar) = h_taskbar {
-                    renderer.update_text_color(taskbar);
+            if is_immersive_color_set(lparam) {
+                if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
+                    if let Some(renderer) = &mut RENDERER {
+                        renderer.update_text_color(h_tray, h_taskbar);
+                    }
                 }
             }
             LRESULT(0)
@@ -190,7 +279,7 @@ pub unsafe extern "system" fn wnd_proc(
 
         WM_DPICHANGED => {
             if let Some(renderer) = &mut RENDERER {
-                renderer.recreate_font(14);
+                renderer.recreate_font(hwnd);
             }
             LRESULT(0)
         }
@@ -199,11 +288,18 @@ pub unsafe extern "system" fn wnd_proc(
             match wparam.0 as u32 {
                 PBT_APMSUSPEND => {
                     SUSPENDED.store(true, Ordering::Relaxed);
+                    KillTimer(hwnd, TIMER_ID_NETWORK).ok();
+                    KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
                     stop_mouse_thread();
+                    if let Some(handle) = MOUSE_THREAD.take() {
+                        let _ = handle.join();
+                    }
                     trim_working_set();
                 }
                 PBT_APMRESUMEAUTOMATIC => {
                     SUSPENDED.store(false, Ordering::Relaxed);
+                    let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
+                    let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
                     MOUSE_THREAD = Some(start_mouse_thread());
                 }
                 _ => {}

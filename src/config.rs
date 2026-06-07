@@ -11,14 +11,16 @@ pub const GAP: i32 = 8;
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 
-pub const MOUSE_VID: u16 = 0x04D9;
-pub const MOUSE_PID: u16 = 0xA02A;
-pub const MOUSE_USAGE_PAGE: u16 = 0xFF00;
-pub const MOUSE_USAGE: u16 = 0x0001;
+pub const MOUSE_VIDS: [u16; 2] = [0xA8A4, 0xA8A5];
+pub const MOUSE_PID: u16 = 0x2255;
+pub const MOUSE_USAGE_PAGE: u16 = 0xFF01;
+pub const MOUSE_USAGE: u16 = 0x0010;
 
 pub const MOUSE_POLL_INTERVAL_ONLINE: u64 = 180;
 pub const MOUSE_POLL_INTERVAL_OFFLINE: u64 = 300;
 pub const MOUSE_FAIL_THRESHOLD: u32 = 2;
+
+pub const DPI_SCALE_FACTOR: f64 = 1.173;
 
 pub const COLOR_KEY: u32 = 0x00FF00FF;
 pub const COLOR_DARK_TEXT: u32 = 0x00282828;
@@ -26,8 +28,11 @@ pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;
 pub const COLOR_LOW_BATTERY: u32 = 0x000000FF;
 pub const LUMINANCE_THRESHOLD: f64 = 125.0;
 
+pub const FONT_BASE_SIZE: i32 = 14;
+
 pub static MOUSE_ONLINE: AtomicBool = AtomicBool::new(false);
 pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
+pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
 pub static MOUSE_BATTERY_LEVEL: AtomicU32 = AtomicU32::new(0);
 pub static MOUSE_IS_CHARGING: AtomicBool = AtomicBool::new(false);

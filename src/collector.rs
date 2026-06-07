@@ -15,8 +15,11 @@ const IF_TYPE_IEEE80211: u32 = 71;
 static mut PREV_IDLE_TIME: u64 = 0;
 static mut PREV_KERNEL_TIME: u64 = 0;
 static mut PREV_USER_TIME: u64 = 0;
+static mut CPU_INITIALIZED: bool = false;
+
 static mut PREV_NET_IN: u64 = 0;
 static mut PREV_NET_OUT: u64 = 0;
+static mut NET_INITIALIZED: bool = false;
 
 pub fn collect_cpu() {
     unsafe {
@@ -31,9 +34,17 @@ pub fn collect_cpu() {
         )
         .is_ok()
         {
-            let idle_diff = idle_time - PREV_IDLE_TIME;
-            let kernel_diff = kernel_time - PREV_KERNEL_TIME;
-            let user_diff = user_time - PREV_USER_TIME;
+            if !CPU_INITIALIZED {
+                PREV_IDLE_TIME = idle_time;
+                PREV_KERNEL_TIME = kernel_time;
+                PREV_USER_TIME = user_time;
+                CPU_INITIALIZED = true;
+                return;
+            }
+
+            let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME);
+            let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME);
+            let user_diff = user_time.saturating_sub(PREV_USER_TIME);
             let total = kernel_diff + user_diff;
 
             if total > 0 {
@@ -97,13 +108,24 @@ pub fn collect_network() {
                 total_out += row.dwOutOctets as u64;
             }
 
-            if total_in >= PREV_NET_IN && total_out >= PREV_NET_OUT {
+            if !NET_INITIALIZED {
+                PREV_NET_IN = total_in;
+                PREV_NET_OUT = total_out;
+                NET_INITIALIZED = true;
+                return;
+            }
+
+            if total_in >= PREV_NET_IN {
                 let speed_down = (total_in - PREV_NET_IN) as u32;
-                let speed_up = (total_out - PREV_NET_OUT) as u32;
                 NET_SPEED_DOWN.store(speed_down, Ordering::Relaxed);
-                NET_SPEED_UP.store(speed_up, Ordering::Relaxed);
             } else {
                 NET_SPEED_DOWN.store(0, Ordering::Relaxed);
+            }
+
+            if total_out >= PREV_NET_OUT {
+                let speed_up = (total_out - PREV_NET_OUT) as u32;
+                NET_SPEED_UP.store(speed_up, Ordering::Relaxed);
+            } else {
                 NET_SPEED_UP.store(0, Ordering::Relaxed);
             }
 

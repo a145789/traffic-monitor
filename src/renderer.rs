@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, LUMINANCE_THRESHOLD, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, LUMINANCE_THRESHOLD, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
     NET_SPEED_DOWN, NET_SPEED_UP, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_IS_CHARGING,
 };
 
@@ -28,7 +28,7 @@ impl Renderer {
             let hbitmap = CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT);
             SelectObject(hdc_mem, hbitmap);
 
-            let hfont = create_font(14);
+            let hfont = create_font(FONT_BASE_SIZE);
             SelectObject(hdc_mem, hfont);
 
             SetBkMode(hdc_mem, TRANSPARENT);
@@ -44,13 +44,15 @@ impl Renderer {
         }
     }
 
-    pub fn update_text_color(&mut self, taskbar_hwnd: HWND) {
+    pub fn update_text_color(&mut self, tray_hwnd: HWND, taskbar_hwnd: HWND) {
         unsafe {
             let hdc = GetWindowDC(taskbar_hwnd);
             let mut tray_rc = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(taskbar_hwnd, &mut tray_rc);
-            let pixel_x = tray_rc.left - 10;
-            let pixel_y = (tray_rc.bottom - tray_rc.top) / 2;
+            let mut taskbar_rc = RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(tray_hwnd, &mut tray_rc);
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(taskbar_hwnd, &mut taskbar_rc);
+            let pixel_x = tray_rc.left - 10 - taskbar_rc.left;
+            let pixel_y = (taskbar_rc.bottom - taskbar_rc.top) / 2;
             let color = GetPixel(hdc, pixel_x, pixel_y);
             ReleaseDC(taskbar_hwnd, hdc);
 
@@ -99,7 +101,7 @@ impl Renderer {
             let line2 = if mouse_online {
                 if battery < 20 && !charging {
                     format!(
-                        "\u{2193} {}   \u{1F5B1}     DPI: {}",
+                        "\u{2193} {}   --     DPI: {}",
                         format_speed(speed_down),
                         dpi
                     )
@@ -142,9 +144,11 @@ impl Renderer {
         }
     }
 
-    pub fn recreate_font(&mut self, size: i32) {
+    pub fn recreate_font(&mut self, hwnd: HWND) {
         unsafe {
-            let new_font = create_font(size);
+            let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+            let font_size = (FONT_BASE_SIZE as f64 * dpi as f64 / 96.0).round() as i32;
+            let new_font = create_font(font_size);
             SelectObject(self.hdc_mem, new_font);
             DeleteObject(self.hfont);
             self.hfont = new_font;
@@ -167,7 +171,7 @@ fn create_font(size: i32) -> HFONT {
         let mut lf = LOGFONTW {
             lfHeight: size,
             lfWeight: 400,
-            lfQuality: FONT_QUALITY(5),
+            lfQuality: FONT_QUALITY(4),
             ..Default::default()
         };
         let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
