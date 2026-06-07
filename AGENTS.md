@@ -15,6 +15,19 @@ Stop-Process -Name "traffic-monitor" -Force
 - `build.rs` 通过 `winresource` 嵌入 DPI-aware manifest（PerMonitorV2）
 - Release 配置：`opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`
 
+## 安装包
+
+使用 Inno Setup 7 构建，脚本 `installer.iss`，输出到 `Output/`。
+
+```bash
+bun release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 打包 → git tag
+```
+
+- 安装路径：`Program Files\Traffic Monitor`
+- 包含开始菜单/桌面快捷方式、开机自启选项、标准卸载程序
+- 依赖：[Inno Setup 7](https://jrsoftware.org/isinfo.php)、[Bun](https://bun.sh)
+- 版本号需同步更新 `Cargo.toml` 和 `installer.iss`，详见 `VERSIONING.md`
+
 ## 架构（6 个源文件，约 1600 行）
 
 | 文件 | 行数 | 职责 |
