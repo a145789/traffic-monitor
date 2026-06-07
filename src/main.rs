@@ -92,8 +92,8 @@ fn check_fullscreen(hwnd: HWND) {
         let was = FULLSCREEN.load(Ordering::Relaxed);
         if was {
             FULLSCREEN.store(false, Ordering::Relaxed);
-            let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
-            let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+            let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
                 stop_and_join_mouse_thread();
                 MOUSE_THREAD = Some(start_mouse_thread());
@@ -113,13 +113,13 @@ fn check_fullscreen(hwnd: HWND) {
         FULLSCREEN.store(is_full, Ordering::Relaxed);
 
         if is_full && !was {
-            KillTimer(hwnd, TIMER_ID_NETWORK).ok();
-            KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
+            KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
+            KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
             stop_and_join_mouse_thread();
             trim_working_set();
         } else if !is_full && was {
-            let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
-            let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+            let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
                 stop_and_join_mouse_thread();
                 MOUSE_THREAD = Some(start_mouse_thread());
@@ -161,10 +161,10 @@ fn main() {
             renderer.update_text_color();
         }
 
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
 
-        let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
-        let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
 
         if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
             MOUSE_THREAD = Some(start_mouse_thread());
@@ -192,7 +192,7 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     };
 
-    let h_tray = match FindWindowExW(h_taskbar, None, w!("TrayNotifyWnd"), w!("")) {
+    let h_tray = match FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")) {
         Ok(h) => h,
         Err(_) => {
             show_error("Cannot find TrayNotifyWnd");
@@ -215,7 +215,7 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
     let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
     let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
 
-    let _ = SetParent(hwnd, h_taskbar);
+    let _ = SetParent(hwnd, Some(h_taskbar));
 
     // 覆盖 GWL_STYLE，强制去除所有顶级边框和标题栏样式，只保留 WS_CHILD 和 WS_VISIBLE
     SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
@@ -226,7 +226,7 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
     // 包含 SWP_FRAMECHANGED，以便让样式彻底生效
     let _ = SetWindowPos(
         hwnd,
-        HWND_TOP,
+        Some(HWND_TOP),
         display_x,
         display_y,
         display_width,
@@ -286,14 +286,14 @@ pub unsafe extern "system" fn wnd_proc(
                     check_fullscreen(hwnd);
                     if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                         collect_network();
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 TIMER_ID_CPU_MEM => {
                     if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                         collect_cpu();
                         collect_memory();
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 _ => {}
@@ -302,7 +302,7 @@ pub unsafe extern "system" fn wnd_proc(
         }
 
         WM_USER_MOUSE_UPDATE | WM_USER_MOUSE_STATUS => {
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
 
@@ -327,15 +327,15 @@ pub unsafe extern "system" fn wnd_proc(
             match wparam.0 as u32 {
                 PBT_APMSUSPEND => {
                     SUSPENDED.store(true, Ordering::Relaxed);
-                    KillTimer(hwnd, TIMER_ID_NETWORK).ok();
-                    KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
+                    KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
+                    KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
                     stop_and_join_mouse_thread();
                     trim_working_set();
                 }
                 PBT_APMRESUMEAUTOMATIC => {
                     SUSPENDED.store(false, Ordering::Relaxed);
-                    let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
-                    let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
                     if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
                         stop_and_join_mouse_thread();
                         MOUSE_THREAD = Some(start_mouse_thread());
@@ -350,15 +350,15 @@ pub unsafe extern "system" fn wnd_proc(
             match wparam.0 {
                 WTS_SESSION_LOCK => {
                     SUSPENDED.store(true, Ordering::Relaxed);
-                    KillTimer(hwnd, TIMER_ID_NETWORK).ok();
-                    KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
+                    KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
+                    KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
                     stop_and_join_mouse_thread();
                     trim_working_set();
                 }
                 WTS_SESSION_UNLOCK => {
                     SUSPENDED.store(false, Ordering::Relaxed);
-                    let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
-                    let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
                     if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
                         stop_and_join_mouse_thread();
                         MOUSE_THREAD = Some(start_mouse_thread());
@@ -385,7 +385,7 @@ pub unsafe extern "system" fn wnd_proc(
                         SHOW_MOUSE_INFO.store(true, Ordering::Relaxed);
                         stop_and_join_mouse_thread();
                         MOUSE_THREAD = Some(start_mouse_thread());
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     } else {
                         show_error("未检测到物理鼠标或鼠标不支持");
                     }
@@ -393,7 +393,7 @@ pub unsafe extern "system" fn wnd_proc(
                     SHOW_MOUSE_INFO.store(false, Ordering::Relaxed);
                     stop_and_join_mouse_thread();
                     MOUSE_ONLINE.store(false, Ordering::Relaxed);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             } else {
                 tray::handle_menu_command(hwnd, menu_id);

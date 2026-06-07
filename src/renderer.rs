@@ -31,19 +31,19 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Self {
         unsafe {
-            let hdc_screen = GetWindowDC(HWND(std::ptr::null_mut()));
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            let hdc_screen = GetWindowDC(Some(HWND(std::ptr::null_mut())));
+            let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
             let hbitmap = CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-            let old_bitmap = SelectObject(hdc_mem, hbitmap);
+            let old_bitmap = SelectObject(hdc_mem, hbitmap.into());
 
             let hfont = create_font(FONT_BASE_SIZE);
-            let old_font = SelectObject(hdc_mem, hfont);
+            let old_font = SelectObject(hdc_mem, hfont.into());
 
             let hbrush = CreateSolidBrush(COLORREF(COLOR_KEY));
 
             let _ = SetBkMode(hdc_mem, TRANSPARENT);
 
-            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
 
             Self {
                 hdc_mem,
@@ -288,7 +288,7 @@ impl Renderer {
                 0,
                 self.width,
                 self.height,
-                self.hdc_mem,
+                Some(self.hdc_mem),
                 0,
                 0,
                 SRCCOPY,
@@ -304,14 +304,14 @@ impl Renderer {
             let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
 
             // 1. 创建符合新大小的 Compatible Bitmap
-            let hdc_screen = GetWindowDC(HWND(std::ptr::null_mut()));
+            let hdc_screen = GetWindowDC(Some(HWND(std::ptr::null_mut())));
             let new_bitmap = CreateCompatibleBitmap(hdc_screen, width, height);
-            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
 
             // 2. 将新位图选入内存 DC，销毁旧位图
             if !new_bitmap.is_invalid() {
-                let old_bitmap = SelectObject(self.hdc_mem, new_bitmap);
-                let _ = DeleteObject(old_bitmap);
+                let old_bitmap = SelectObject(self.hdc_mem, new_bitmap.into());
+                let _ = DeleteObject(old_bitmap.into());
                 self.hbitmap = new_bitmap;
             }
 
@@ -319,8 +319,8 @@ impl Renderer {
             let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
             let new_font = create_font(font_size);
             if !new_font.is_invalid() {
-                let old_font = SelectObject(self.hdc_mem, new_font);
-                let _ = DeleteObject(old_font);
+                let old_font = SelectObject(self.hdc_mem, new_font.into());
+                let _ = DeleteObject(old_font.into());
                 self.hfont = new_font;
             }
 
@@ -338,9 +338,9 @@ impl Drop for Renderer {
             let _ = SelectObject(self.hdc_mem, self.old_bitmap);
             let _ = SelectObject(self.hdc_mem, self.old_font);
 
-            let _ = DeleteObject(self.hfont);
-            let _ = DeleteObject(self.hbitmap);
-            let _ = DeleteObject(self.hbrush);
+            let _ = DeleteObject(self.hfont.into());
+            let _ = DeleteObject(self.hbitmap.into());
+            let _ = DeleteObject(self.hbrush.into());
             let _ = DeleteDC(self.hdc_mem);
         }
     }
@@ -389,7 +389,7 @@ pub unsafe fn is_system_light_theme() -> bool {
     if RegOpenKeyExW(
         HKEY_CURRENT_USER,
         PCWSTR(key_path.as_ptr()),
-        0,
+        Some(0),
         KEY_READ,
         &mut hkey,
     )

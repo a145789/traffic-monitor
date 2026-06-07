@@ -162,7 +162,7 @@ fn mouse_worker_loop() {
                     let wparam = charging as usize;
                     let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                     let _ = PostMessageW(
-                        hwnd,
+                        Some(hwnd),
                         WM_USER_MOUSE_UPDATE,
                         WPARAM(wparam),
                         LPARAM(lparam as isize),
@@ -275,7 +275,7 @@ fn handle_mouse_offline() {
         unsafe {
             let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
             let _ = PostMessageW(
-                hwnd,
+                Some(hwnd),
                 WM_USER_MOUSE_STATUS,
                 WPARAM(0),
                 LPARAM(0),

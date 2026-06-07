@@ -59,8 +59,9 @@ pub fn create_main_window() -> Result<HWND, String> {
             DISPLAY_HEIGHT,
             None,
             None,
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .unwrap(),
+            Some(windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                .unwrap()
+                .into()),
             None,
         );
 
@@ -156,7 +157,7 @@ pub fn show_context_menu(hwnd: HWND) {
             TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
             point.x,
             point.y,
-            0,
+            Some(0),
             hwnd,
             None,
         );
@@ -171,7 +172,7 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
         MENU_ID_EXIT => {
             unsafe {
                 let _ = PostMessageW(
-                    hwnd,
+                    Some(hwnd),
                     WM_CLOSE,
                     windows::Win32::Foundation::WPARAM(0),
                     windows::Win32::Foundation::LPARAM(0),
@@ -197,7 +198,7 @@ fn is_autostart_enabled() -> bool {
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR(key_path.as_ptr()),
-            0,
+            Some(0),
             KEY_READ,
             &mut hkey,
         )
@@ -236,7 +237,7 @@ fn toggle_autostart() {
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR(key_path.as_ptr()),
-            0,
+            Some(0),
             KEY_WRITE,
             &mut hkey,
         )
@@ -252,7 +253,7 @@ fn toggle_autostart() {
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR(value_name.as_ptr()),
-                    0,
+                    Some(0),
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
                         path_wide.as_ptr() as *const u8,
