@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod collector;
 mod config;
 mod mouse_hid;
@@ -15,8 +17,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetShellWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer,
     MessageBoxW, PostQuitMessage, RegisterWindowMessageW, SetLayeredWindowAttributes,
     SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    HWND_TOP, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD,
+    HWND_TOP, GWL_EXSTYLE, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
+    SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE, SWP_FRAMECHANGED,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
     WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
@@ -131,8 +133,6 @@ fn main() {
 
         TASKBAR_CREATED_MSG = RegisterWindowMessageW(w!("TaskbarCreated"));
 
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(COLOR_KEY), 0, LWA_COLORKEY);
-
         if !embed_in_taskbar(hwnd) {
             show_error("Failed to embed in taskbar. Make sure explorer.exe is running.");
             return;
@@ -142,11 +142,14 @@ fn main() {
 
         RENDERER = Some(Renderer::new());
 
-        if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
-            if let Some(renderer) = &mut RENDERER {
+        if let Some(renderer) = &mut RENDERER {
+            renderer.update_dpi(hwnd);
+            if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
                 renderer.update_text_color(h_tray, h_taskbar);
             }
         }
+
+        let _ = InvalidateRect(hwnd, None, false);
 
         let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
         let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
@@ -183,23 +186,39 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
     let _ = GetWindowRect(h_tray, &mut rc_tray);
     let _ = GetWindowRect(h_taskbar, &mut rc_taskbar);
 
-    let display_x = rc_tray.left - GAP - DISPLAY_WIDTH;
-    let display_y = (rc_taskbar.bottom - rc_taskbar.top - DISPLAY_HEIGHT) / 2;
+    // 获取 DPI 并动态计算缩放后的宽高
+    let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+    let scale = dpi as f64 / 96.0;
+    let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
+    let display_height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
+    let gap = (GAP as f64 * scale).round() as i32;
+
+    let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
+    let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
 
     let _ = SetParent(hwnd, h_taskbar);
 
-    let current_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    SetWindowLongPtrW(hwnd, GWL_STYLE, current_style | (WS_CHILD.0 as isize));
+    // 覆盖 GWL_STYLE，强制去除所有顶级边框和标题栏样式，只保留 WS_CHILD 和 WS_VISIBLE
+    SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
 
+    let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current_ex_style | (WS_EX_LAYERED.0 as isize));
+
+    // 包含 SWP_FRAMECHANGED，以便让样式彻底生效
     let _ = SetWindowPos(
         hwnd,
         HWND_TOP,
         display_x,
         display_y,
-        DISPLAY_WIDTH,
-        DISPLAY_HEIGHT,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        display_width,
+        display_height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
     );
+
+    // 在样式生效后设置 Layered Window Attributes 透明键
+    if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(COLOR_KEY), 0, LWA_COLORKEY) {
+        show_error(&format!("Failed to set layered window attributes: {:?}", e));
+    }
 
     H_TASKBAR = Some(h_taskbar);
     H_TRAY = Some(h_tray);
@@ -220,6 +239,7 @@ pub unsafe extern "system" fn wnd_proc(
             create_tray_icon(hwnd);
             if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
                 if let Some(renderer) = &mut RENDERER {
+                    renderer.update_dpi(hwnd);
                     renderer.update_text_color(h_tray, h_taskbar);
                 }
             }
@@ -279,8 +299,9 @@ pub unsafe extern "system" fn wnd_proc(
 
         WM_DPICHANGED => {
             if let Some(renderer) = &mut RENDERER {
-                renderer.recreate_font(hwnd);
+                renderer.update_dpi(hwnd);
             }
+            let _ = embed_in_taskbar(hwnd);
             LRESULT(0)
         }
 

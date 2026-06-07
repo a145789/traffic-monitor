@@ -6,7 +6,7 @@ pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
 
 pub const DISPLAY_WIDTH: i32 = 220;
 pub const DISPLAY_HEIGHT: i32 = 32;
-pub const GAP: i32 = 8;
+pub const GAP: i32 = -3;
 
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
@@ -25,10 +25,10 @@ pub const DPI_SCALE_FACTOR: f64 = 1.173;
 pub const COLOR_KEY: u32 = 0x00FF00FF;
 pub const COLOR_DARK_TEXT: u32 = 0x00282828;
 pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;
-pub const COLOR_LOW_BATTERY: u32 = 0x000000FF;
+pub const COLOR_LOW_BATTERY: u32 = 0x00808080;
 pub const LUMINANCE_THRESHOLD: f64 = 125.0;
 
-pub const FONT_BASE_SIZE: i32 = 14;
+pub const FONT_BASE_SIZE: i32 = 13;
 
 pub static MOUSE_ONLINE: AtomicBool = AtomicBool::new(false);
 pub static SUSPENDED: AtomicBool = AtomicBool::new(false);

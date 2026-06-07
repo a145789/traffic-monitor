@@ -4,9 +4,9 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DestroyWindow, GetCursorPos, PostQuitMessage,
-    SetForegroundWindow, TrackPopupMenu, WM_USER, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
+    CreatePopupMenu, CreateWindowExW, DestroyWindow, GetCursorPos, LoadIconW, PostQuitMessage,
+    SetForegroundWindow, TrackPopupMenu, WM_USER, WNDCLASSEXW, IDI_APPLICATION,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE, WS_POPUP,
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MFS_CHECKED,
     MFS_UNCHECKED, InsertMenuItemW,
 };
@@ -52,7 +52,7 @@ pub fn create_main_window() -> Result<HWND, String> {
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name_pcw,
             window_name_pcw,
-            WS_VISIBLE,
+            WS_POPUP | WS_VISIBLE,
             0,
             0,
             DISPLAY_WIDTH,
@@ -73,12 +73,15 @@ pub fn create_main_window() -> Result<HWND, String> {
 
 pub fn create_tray_icon(hwnd: HWND) {
     unsafe {
+        let hicon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_APP_TRAY,
+            hIcon: hicon,
             ..Default::default()
         };
 

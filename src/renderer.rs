@@ -3,8 +3,9 @@ use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
     CreateSolidBrush, DeleteDC, DeleteObject, FillRect, GetWindowDC, GetPixel, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, TextOutW, HDC, HFONT, HBITMAP,
+    SetBkMode, SetTextColor, HDC, HFONT, HBITMAP,
     SRCCOPY, FONT_QUALITY, LOGFONTW, TRANSPARENT,
+    DrawTextW, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT
 };
 
 use crate::config::{
@@ -18,6 +19,9 @@ pub struct Renderer {
     hbitmap: HBITMAP,
     hfont: HFONT,
     text_color: COLORREF,
+    font_size: i32,
+    width: i32,
+    height: i32,
 }
 
 impl Renderer {
@@ -26,46 +30,34 @@ impl Renderer {
             let hdc_screen = GetWindowDC(HWND(std::ptr::null_mut()));
             let hdc_mem = CreateCompatibleDC(hdc_screen);
             let hbitmap = CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-            SelectObject(hdc_mem, hbitmap);
+            let _ = SelectObject(hdc_mem, hbitmap);
 
             let hfont = create_font(FONT_BASE_SIZE);
-            SelectObject(hdc_mem, hfont);
+            let _ = SelectObject(hdc_mem, hfont);
 
-            SetBkMode(hdc_mem, TRANSPARENT);
+            let _ = SetBkMode(hdc_mem, TRANSPARENT);
 
-            ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
 
             Self {
                 hdc_mem,
                 hbitmap,
                 hfont,
                 text_color: COLORREF(COLOR_LIGHT_TEXT),
+                font_size: FONT_BASE_SIZE,
+                width: DISPLAY_WIDTH,
+                height: DISPLAY_HEIGHT,
             }
         }
     }
 
-    pub fn update_text_color(&mut self, tray_hwnd: HWND, taskbar_hwnd: HWND) {
+    pub fn update_text_color(&mut self, _tray_hwnd: HWND, _taskbar_hwnd: HWND) {
         unsafe {
-            let hdc = GetWindowDC(taskbar_hwnd);
-            let mut tray_rc = RECT::default();
-            let mut taskbar_rc = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(tray_hwnd, &mut tray_rc);
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(taskbar_hwnd, &mut taskbar_rc);
-            let pixel_x = tray_rc.left - 10 - taskbar_rc.left;
-            let pixel_y = (taskbar_rc.bottom - taskbar_rc.top) / 2;
-            let color = GetPixel(hdc, pixel_x, pixel_y);
-            ReleaseDC(taskbar_hwnd, hdc);
-
-            let r = (color.0 & 0xFF) as f64;
-            let g = ((color.0 >> 8) & 0xFF) as f64;
-            let b = ((color.0 >> 16) & 0xFF) as f64;
-            let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-
-            self.text_color = if luminance > LUMINANCE_THRESHOLD {
-                COLORREF(COLOR_DARK_TEXT)
+            if is_system_light_theme() {
+                self.text_color = COLORREF(COLOR_DARK_TEXT);
             } else {
-                COLORREF(COLOR_LIGHT_TEXT)
-            };
+                self.text_color = COLORREF(COLOR_LIGHT_TEXT);
+            }
         }
     }
 
@@ -74,13 +66,13 @@ impl Renderer {
             let rect = RECT {
                 left: 0,
                 top: 0,
-                right: DISPLAY_WIDTH,
-                bottom: DISPLAY_HEIGHT,
+                right: self.width,
+                bottom: self.height,
             };
 
             let hbrush = CreateSolidBrush(COLORREF(COLOR_KEY));
-            FillRect(self.hdc_mem, &rect, hbrush);
-            DeleteObject(hbrush);
+            let _ = FillRect(self.hdc_mem, &rect, hbrush);
+            let _ = DeleteObject(hbrush);
 
             let speed_up = NET_SPEED_UP.load(Ordering::Relaxed);
             let speed_down = NET_SPEED_DOWN.load(Ordering::Relaxed);
@@ -101,41 +93,81 @@ impl Renderer {
             let line2 = if mouse_online {
                 if battery < 20 && !charging {
                     format!(
-                        "\u{2193} {}   --     DPI: {}",
+                        "\u{2193} {}   \u{1F5B1}       DPI: {}",
                         format_speed(speed_down),
                         dpi
                     )
                 } else {
                     format!(
-                        "\u{2193} {}   {}%     DPI: {}",
+                        "\u{2193} {}   \u{1F5B1} {}%    DPI: {}",
                         format_speed(speed_down),
                         battery,
                         dpi
                     )
                 }
             } else {
-                format!("\u{2193} {}   --     DPI: --", format_speed(speed_down))
+                format!("\u{2193} {}   \u{1F5B1} --    DPI: --", format_speed(speed_down))
             };
 
+            let half_height = self.height / 2;
+            let scale = self.width as f64 / DISPLAY_WIDTH as f64;
+
             SetTextColor(self.hdc_mem, self.text_color);
-            TextOutW(self.hdc_mem, 4, 2, &to_wide(&line1));
-            TextOutW(self.hdc_mem, 4, 16, &to_wide(&line2));
+            let mut rc1 = RECT {
+                left: 4,
+                top: 0,
+                right: self.width,
+                bottom: half_height,
+            };
+            let mut line1_wide = to_wide(&line1);
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut line1_wide,
+                &mut rc1,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+            );
+            
+            let mut rc2 = RECT {
+                left: 4,
+                top: half_height,
+                right: self.width,
+                bottom: self.height,
+            };
+            let mut line2_wide = to_wide(&line2);
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut line2_wide,
+                &mut rc2,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+            );
 
             if mouse_online && battery < 20 && !charging {
                 let battery_color = COLORREF(COLOR_LOW_BATTERY);
                 SetTextColor(self.hdc_mem, battery_color);
                 let battery_text = format!("{}%", battery);
-                TextOutW(self.hdc_mem, 110, 16, &to_wide(&battery_text));
+                let mut rc_bat = RECT {
+                    left: (122.0 * scale).round() as i32,
+                    top: half_height,
+                    right: self.width,
+                    bottom: self.height,
+                };
+                let mut battery_wide = to_wide(&battery_text);
+                let _ = DrawTextW(
+                    self.hdc_mem,
+                    &mut battery_wide,
+                    &mut rc_bat,
+                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                );
             }
 
             SetTextColor(self.hdc_mem, self.text_color);
 
-            BitBlt(
+            let _ = BitBlt(
                 hdc,
                 0,
                 0,
-                DISPLAY_WIDTH,
-                DISPLAY_HEIGHT,
+                self.width,
+                self.height,
                 self.hdc_mem,
                 0,
                 0,
@@ -144,14 +176,34 @@ impl Renderer {
         }
     }
 
-    pub fn recreate_font(&mut self, hwnd: HWND) {
+    pub fn update_dpi(&mut self, hwnd: HWND) {
         unsafe {
             let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
-            let font_size = (FONT_BASE_SIZE as f64 * dpi as f64 / 96.0).round() as i32;
+            let scale = dpi as f64 / 96.0;
+            let width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
+            let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
+
+            // 1. 创建符合新大小的 Compatible Bitmap
+            let hdc_screen = GetWindowDC(HWND(std::ptr::null_mut()));
+            let new_bitmap = CreateCompatibleBitmap(hdc_screen, width, height);
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+
+            // 2. 将新位图选入内存 DC，销毁旧位图
+            let old_bitmap = SelectObject(self.hdc_mem, new_bitmap);
+            let _ = DeleteObject(old_bitmap);
+            self.hbitmap = new_bitmap;
+
+            // 3. 重新创建并选择字体（不设上限）
+            let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
             let new_font = create_font(font_size);
-            SelectObject(self.hdc_mem, new_font);
-            DeleteObject(self.hfont);
+            let old_font = SelectObject(self.hdc_mem, new_font);
+            let _ = DeleteObject(old_font);
             self.hfont = new_font;
+
+            // 4. 更新相关属性
+            self.font_size = font_size;
+            self.width = width;
+            self.height = height;
         }
     }
 }
@@ -169,9 +221,9 @@ impl Drop for Renderer {
 fn create_font(size: i32) -> HFONT {
     unsafe {
         let mut lf = LOGFONTW {
-            lfHeight: size,
+            lfHeight: -size,
             lfWeight: 400,
-            lfQuality: FONT_QUALITY(4),
+            lfQuality: FONT_QUALITY(3), // NONANTIALIASED_QUALITY, 彻底斩断 Layered 窗口上 GDI 渲染的半透明粉红毛边
             ..Default::default()
         };
         let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
@@ -192,4 +244,43 @@ fn format_speed(bytes_per_sec: u32) -> String {
     } else {
         format!("{:.1} MB/s", bytes_per_sec as f64 / (1024.0 * 1024.0))
     }
+}
+
+pub unsafe fn is_system_light_theme() -> bool {
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
+    };
+    use windows::core::PCWSTR;
+
+    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect();
+    let value_name: Vec<u16> = "SystemUsesLightTheme\0".encode_utf16().collect();
+    let mut hkey = Default::default();
+
+    if RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        PCWSTR(key_path.as_ptr()),
+        0,
+        KEY_READ,
+        &mut hkey,
+    )
+    .is_ok()
+    {
+        let mut value: u32 = 0;
+        let mut value_size = std::mem::size_of::<u32>() as u32;
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            None,
+            Some(&mut value as *mut u32 as *mut u8),
+            Some(&mut value_size),
+        );
+        let _ = windows::Win32::System::Registry::RegCloseKey(hkey);
+        if result.is_ok() {
+            return value == 1;
+        }
+    }
+    false // 默认使用深色模式
 }
