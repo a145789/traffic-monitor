@@ -29,6 +29,10 @@ let iss = readFileSync("installer.iss", "utf-8");
 iss = iss.replace(/^AppVersion=.*/m, `AppVersion=${newVersion}`);
 writeFileSync("installer.iss", iss);
 
+// Update Cargo.lock to reflect the new version
+console.log("Updating Cargo.lock...");
+execSync("cargo update --workspace", { stdio: "inherit" });
+
 // Git commit and tag
 console.log("Creating git commit and tag...");
 execSync("git add Cargo.toml installer.iss Cargo.lock", { stdio: "inherit" });
