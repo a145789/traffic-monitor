@@ -8,6 +8,15 @@ if (!newVersion) {
   process.exit(1);
 }
 
+// Check current branch
+console.log("Checking current branch...");
+const currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf-8" }).trim();
+if (currentBranch !== "main") {
+  console.error(`Error: Release must be run on the main branch, but current branch is "${currentBranch}".`);
+  console.error("Please switch to main first: git checkout main");
+  process.exit(1);
+}
+
 // Check git status
 console.log("Checking git status...");
 const gitStatus = execSync("git status --porcelain", { encoding: "utf-8" }).trim();
