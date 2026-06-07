@@ -80,10 +80,13 @@ pub fn init(hwnd: HWND) {
 
 pub fn start_mouse_thread() -> thread::JoinHandle<()> {
     SHOULD_STOP.store(false, Ordering::Release);
-    thread::spawn(|| {
-        interruptible_sleep(Duration::from_secs(2));
-        mouse_worker_loop();
-    })
+    thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            interruptible_sleep(Duration::from_secs(2));
+            mouse_worker_loop();
+        })
+        .expect("Failed to spawn mouse thread")
 }
 
 pub fn stop_mouse_thread() {
@@ -111,8 +114,21 @@ fn interruptible_sleep(dur: Duration) {
     }
 }
 
+struct MouseData {
+    level: u32,
+    charging: bool,
+    dpi: u32,
+}
+
+fn poll_mouse() -> Result<MouseData, ()> {
+    let api = HidApi::new().map_err(|_| ())?;
+    let device = find_mouse_device(&api).ok_or(())?;
+    let (level, charging) = query_mouse_battery(&device)?;
+    let dpi = query_mouse_dpi(&device)?;
+    Ok(MouseData { level, charging, dpi })
+}
+
 fn mouse_worker_loop() {
-    let mut api_opt: Option<HidApi> = None;
     loop {
         if SHOULD_STOP.load(Ordering::Relaxed) {
             break;
@@ -123,46 +139,18 @@ fn mouse_worker_loop() {
             continue;
         }
 
-        let api = match &api_opt {
-            Some(api) => api,
-            None => {
-                match HidApi::new() {
-                    Ok(api) => {
-                        api_opt = Some(api);
-                        api_opt.as_ref().unwrap()
-                    }
-                    Err(_) => {
-                        interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let device = match find_mouse_device(api) {
-            Some(dev) => dev,
-            None => {
-                handle_mouse_offline();
-                interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
-                continue;
-            }
-        };
-
-        let battery_result = query_mouse_battery(&device);
-        let dpi_result = query_mouse_dpi(&device);
-
-        match (battery_result, dpi_result) {
-            (Ok((level, charging)), Ok(dpi)) => {
-                MOUSE_BATTERY_LEVEL.store(level, Ordering::Relaxed);
-                MOUSE_IS_CHARGING.store(charging, Ordering::Relaxed);
-                MOUSE_DPI_VALUE.store(dpi, Ordering::Relaxed);
+        match poll_mouse() {
+            Ok(data) => {
+                MOUSE_BATTERY_LEVEL.store(data.level, Ordering::Relaxed);
+                MOUSE_IS_CHARGING.store(data.charging, Ordering::Relaxed);
+                MOUSE_DPI_VALUE.store(data.dpi, Ordering::Relaxed);
 
                 FAIL_COUNT.store(0, Ordering::Relaxed);
                 MOUSE_ONLINE.store(true, Ordering::Relaxed);
 
                 unsafe {
-                    let lparam = ((level & 0xFF) << 16) | (dpi & 0xFFFF);
-                    let wparam = charging as usize;
+                    let lparam = ((data.level & 0xFF) << 16) | (data.dpi & 0xFFFF);
+                    let wparam = data.charging as usize;
                     let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                     let _ = PostMessageW(
                         Some(hwnd),
@@ -171,15 +159,14 @@ fn mouse_worker_loop() {
                         LPARAM(lparam as isize),
                     );
                 }
+
+                interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_ONLINE));
             }
-            _ => {
+            Err(()) => {
                 handle_mouse_offline();
                 interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
-                continue;
             }
         }
-
-        interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_ONLINE));
     }
 }
 
