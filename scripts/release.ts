@@ -33,6 +33,10 @@ writeFileSync("installer.iss", iss);
 console.log("Updating Cargo.lock...");
 execSync("cargo update --workspace", { stdio: "inherit" });
 
+// Build release to verify everything compiles
+console.log("Building release...");
+execSync("cargo build --release", { stdio: "inherit" });
+
 // Git commit and tag
 console.log("Creating git commit and tag...");
 execSync("git add Cargo.toml installer.iss Cargo.lock", { stdio: "inherit" });
