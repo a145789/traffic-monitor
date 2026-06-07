@@ -1,6 +1,6 @@
 [Setup]
 AppName=Traffic Monitor
-AppVersion=0.1.0
+AppVersion=0.1.1
 AppPublisher=Traffic Monitor
 DefaultDirName={autopf}\Traffic Monitor
 DefaultGroupName=Traffic Monitor
