@@ -52,12 +52,12 @@ Stop-Process -Name "traffic-monitor" -Force  # 停止进程
 
 ## 架构（6个文件）
 
-- `main.rs` - 窗口创建、消息循环、任务栏嵌入、wnd_proc
-- `config.rs` - 所有常量（尺寸、定时器、HID ID、颜色、原子变量）
-- `collector.rs` - CPU/内存用 `GetSystemTimes`/`GlobalMemoryStatusEx`，网速用 `GetIfTable`
-- `renderer.rs` - GDI 双缓冲渲染，`hdc_mem` → `BitBlt` 到窗口 hdc
-- `mouse_hid.rs` - HID 工作线程轮询 MLOONG MX302（有线 VID:0xA8A4 / 无线 VID:0xA8A5, PID:0x2255）
-- `tray.rs` - 系统托盘图标、右键菜单、`WM_COMMAND` 处理
+- `main.rs` - 窗口创建、消息循环、任务栏嵌入、wnd_proc、全局 Renderer 退出清理
+- `config.rs` - 所有常量（尺寸、定时器、HID ID、颜色、原子变量、低电量位置常量）
+- `collector.rs` - CPU/内存用 `GetSystemTimes`/`GlobalMemoryStatusEx`，网速用对齐安全且无溢出的 `GetIfTable2` 与 `FreeMibTable` 释放
+- `renderer.rs` - GDI 双缓冲渲染，容错检验新句柄，`hdc_mem` → `BitBlt` 到窗口 hdc
+- `mouse_hid.rs` - HID 工作线程轮询 MLOONG MX302（缓存 HidApi 避免重建，支持优雅停止与 Join）
+- `tray.rs` - 系统托盘图标（带 uVersion 4 版本控制）、右键菜单、加双引号的开机自启、`WM_COMMAND` 处理
 
 ## 关键实现细节
 
@@ -75,13 +75,14 @@ Stop-Process -Name "traffic-monitor" -Force  # 停止进程
 - 字体在创建时就选入 `hdc_mem`，不是在窗口 hdc 上
 - `LOGFONTW.lfHeight` 必须用**负值**（如 `-14`），按字符高度创建字体；正值按单元格高度，会导致字号偏大
 - 用 `DrawTextW` + `DT_VCENTER | DT_SINGLELINE` 绘制文字，比 `TextOutW` 能精确控制垂直居中
-- Renderer 初始化后立即调用 `recreate_font(hwnd)` 根据窗口 DPI 校正字号
-- 低电量文字放在 x=110 位置，避免与网速文字重叠
+- Renderer 初始化及 DPI 变化时调用 `update_dpi(hwnd)` 重新配置位图与字号，创建新句柄前进行有效性校验（如 `!new_bitmap.is_invalid()`）以防止异常失效
+- 低电量文字定位使用常量 `LOW_BATTERY_TEXT_X`（122.0）乘 DPI 比例，避免与网速文字重叠
 
-### 线程安全
+### 线程安全与生命周期同步
 
 - `SHOULD_STOP` 在 `start_mouse_thread()` 启动前必须重置为 `false`
-- 鼠标 HID 轮询：在线 3分钟，离线 5分钟，连续2次失败判定离线
+- 为了避免在全屏切换、系统休眠/唤醒、锁屏/解锁交错收到消息时造成的线程泄漏与 HID 设备冲突，在任何地方启动新鼠标线程前，都必须先调用 `stop_and_join_mouse_thread()` 阻塞等待旧线程完全 Join 销毁后再启动新线程
+- 鼠标 HID 轮询：在线 3分钟，离线 5分钟，连续2次失败判定离线，循环外部缓存 `HidApi` 对象
 - `SUSPENDED` 标志在全屏/锁屏时暂停所有采集
 
 ### 任务栏集成
@@ -94,7 +95,7 @@ Stop-Process -Name "traffic-monitor" -Force  # 停止进程
   3. `SetWindowLongPtrW(GWL_EXSTYLE, ... | WS_EX_LAYERED)` — 恢复被剥离的样式
   4. `SetWindowPos(..., SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED)` — `SWP_FRAMECHANGED` 让样式变更生效
   5. `SetLayeredWindowAttributes(hwnd, COLOR_KEY, 0, LWA_COLORKEY)` — 必须在样式生效之后调用
-- 位置计算用任务栏客户区坐标：`display_x = rc_tray.left - rc_taskbar.left - GAP - DISPLAY_WIDTH`
+- 位置计算用任务栏客户区坐标：`display_x = rc_tray.left - rc_taskbar.left - gap - display_width`
 
 ## Windows API 注意事项
 
