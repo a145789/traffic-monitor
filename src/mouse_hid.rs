@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 use hidapi::{HidApi, HidDevice};
@@ -16,7 +16,7 @@ pub const WM_USER_MOUSE_STATUS: u32 = WM_USER + 2;
 
 static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
 static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
-static mut MAIN_HWND: HWND = HWND(std::ptr::null_mut());
+static MAIN_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 const BATTERY_CMD: [u8; 64] = {
     let mut cmd = [0u8; 64];
@@ -75,9 +75,7 @@ fn find_base_offset(buf: &[u8]) -> Option<usize> {
 }
 
 pub fn init(hwnd: HWND) {
-    unsafe {
-        MAIN_HWND = hwnd;
-    }
+    MAIN_HWND.store(hwnd.0, Ordering::Relaxed);
 }
 
 pub fn start_mouse_thread() -> thread::JoinHandle<()> {
@@ -146,8 +144,9 @@ fn mouse_worker_loop() {
                 unsafe {
                     let lparam = ((level & 0xFF) << 16) | (dpi & 0xFFFF);
                     let wparam = charging as usize;
+                    let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                     let _ = PostMessageW(
-                        MAIN_HWND,
+                        hwnd,
                         WM_USER_MOUSE_UPDATE,
                         WPARAM(wparam),
                         LPARAM(lparam as isize),
@@ -258,8 +257,9 @@ fn handle_mouse_offline() {
         MOUSE_DPI_VALUE.store(0, Ordering::Relaxed);
 
         unsafe {
+            let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
             let _ = PostMessageW(
-                MAIN_HWND,
+                hwnd,
                 WM_USER_MOUSE_STATUS,
                 WPARAM(0),
                 LPARAM(0),

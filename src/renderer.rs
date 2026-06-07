@@ -2,15 +2,15 @@ use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
-    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, GetWindowDC, GetPixel, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, HDC, HFONT, HBITMAP,
+    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, GetWindowDC, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, HDC, HFONT, HBITMAP, HGDIOBJ, HBRUSH,
     SRCCOPY, FONT_QUALITY, LOGFONTW, TRANSPARENT,
-    DrawTextW, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT
+    DrawTextW, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER
 };
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE, LUMINANCE_THRESHOLD, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
     NET_SPEED_DOWN, NET_SPEED_UP, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_IS_CHARGING,
 };
 
@@ -18,6 +18,9 @@ pub struct Renderer {
     hdc_mem: HDC,
     hbitmap: HBITMAP,
     hfont: HFONT,
+    old_bitmap: HGDIOBJ,
+    old_font: HGDIOBJ,
+    hbrush: HBRUSH,
     text_color: COLORREF,
     font_size: i32,
     width: i32,
@@ -30,10 +33,12 @@ impl Renderer {
             let hdc_screen = GetWindowDC(HWND(std::ptr::null_mut()));
             let hdc_mem = CreateCompatibleDC(hdc_screen);
             let hbitmap = CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-            let _ = SelectObject(hdc_mem, hbitmap);
+            let old_bitmap = SelectObject(hdc_mem, hbitmap);
 
             let hfont = create_font(FONT_BASE_SIZE);
-            let _ = SelectObject(hdc_mem, hfont);
+            let old_font = SelectObject(hdc_mem, hfont);
+
+            let hbrush = CreateSolidBrush(COLORREF(COLOR_KEY));
 
             let _ = SetBkMode(hdc_mem, TRANSPARENT);
 
@@ -43,6 +48,9 @@ impl Renderer {
                 hdc_mem,
                 hbitmap,
                 hfont,
+                old_bitmap,
+                old_font,
+                hbrush,
                 text_color: COLORREF(COLOR_LIGHT_TEXT),
                 font_size: FONT_BASE_SIZE,
                 width: DISPLAY_WIDTH,
@@ -51,7 +59,7 @@ impl Renderer {
         }
     }
 
-    pub fn update_text_color(&mut self, _tray_hwnd: HWND, _taskbar_hwnd: HWND) {
+    pub fn update_text_color(&mut self) {
         unsafe {
             if is_system_light_theme() {
                 self.text_color = COLORREF(COLOR_DARK_TEXT);
@@ -70,9 +78,7 @@ impl Renderer {
                 bottom: self.height,
             };
 
-            let hbrush = CreateSolidBrush(COLORREF(COLOR_KEY));
-            let _ = FillRect(self.hdc_mem, &rect, hbrush);
-            let _ = DeleteObject(hbrush);
+            let _ = FillRect(self.hdc_mem, &rect, self.hbrush);
 
             let speed_up = NET_SPEED_UP.load(Ordering::Relaxed);
             let speed_down = NET_SPEED_DOWN.load(Ordering::Relaxed);
@@ -211,9 +217,13 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            DeleteObject(self.hfont);
-            DeleteObject(self.hbitmap);
-            DeleteDC(self.hdc_mem);
+            let _ = SelectObject(self.hdc_mem, self.old_bitmap);
+            let _ = SelectObject(self.hdc_mem, self.old_font);
+
+            let _ = DeleteObject(self.hfont);
+            let _ = DeleteObject(self.hbitmap);
+            let _ = DeleteObject(self.hbrush);
+            let _ = DeleteDC(self.hdc_mem);
         }
     }
 }

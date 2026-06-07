@@ -2,11 +2,43 @@
 
 ## 项目概述
 
-Windows 11 任务栏小组件，显示 CPU、内存、网速、鼠标电量/DPI。纯 Rust 实现，无配置文件。
+Windows 11 任务栏小组件，纯 Rust 实现，无配置文件。嵌入在任务栏系统托盘左侧，以双行文字展示 CPU、内存、网速、鼠标电量/DPI。
 
 ## 功能要求
 
-低内存、高性能、无闪烁。
+### 展示内容与格式
+
+- 双行文字，右对齐嵌入在 `Shell_TrayWnd` 内、`TrayNotifyWnd` 左侧
+- 第一行：`↑ 12.4 KB/s   CPU: 12%   MEM: 45%`
+- 第二行：`↓ 105.2 MB/s  🖱️ 75%    DPI: 1600`
+- 鼠标离线时第二行显示 `🖱️ --    DPI: --`，保持占位、避免布局抖动
+- 鼠标电量 <20% 且未充电时，电量部分文字变色为红色（#FF4444）提示
+
+### 暗色/亮色主题自适应
+
+- 读取注册表 `SystemUsesLightTheme` 判断系统主题，自动切换文字颜色（深灰/白色）
+- 监听 `WM_SETTINGCHANGE` + `ImmersiveColorSet` 实时响应主题变化
+
+### 系统托盘
+
+- `Shell_NotifyIconW` 创建托盘图标，右键菜单：**开机自启**（勾选/取消）/ **退出**
+- 开机自启通过 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册表实现
+
+### 智能挂起（省资源）
+
+以下情况停止所有定时器采集、停止鼠标轮询、`SetProcessWorkingSetSize` trim 内存：
+- **全屏检测**：前台窗口尺寸 == 屏幕分辨率（全屏游戏/视频）
+- **系统睡眠**：收到 `PBT_APMSUSPEND`
+- **锁屏**：收到 `WM_WTSSESSION_CHANGE` + `WTS_SESSION_LOCK`
+- 唤醒/退出全屏/解锁后自动恢复
+
+### 性能指标
+
+- 二进制体积 < 250KB（release, opt-level="z", lto, strip）
+- 稳定运行时物理内存 < 2.5MB
+- 挂起 trim 后物理内存 < 150KB
+- 所有参数硬编码在 `config.rs`，零磁盘 I/O
+- 仅主显示器、仅 Win11
 
 ## 构建与运行
 
@@ -23,7 +55,7 @@ Stop-Process -Name "traffic-monitor" -Force  # 停止进程
 - `config.rs` - 所有常量（尺寸、定时器、HID ID、颜色、原子变量）
 - `collector.rs` - CPU/内存用 `GetSystemTimes`/`GlobalMemoryStatusEx`，网速用 `GetIfTable`
 - `renderer.rs` - GDI 双缓冲渲染，`hdc_mem` → `BitBlt` 到窗口 hdc
-- `mouse_hid.rs` - HID 工作线程轮询 MLOONG MX302（VID:04D9 PID:A02A）
+- `mouse_hid.rs` - HID 工作线程轮询 MLOONG MX302（有线 VID:0xA8A4 / 无线 VID:0xA8A5, PID:0x2255）
 - `tray.rs` - 系统托盘图标、右键菜单、`WM_COMMAND` 处理
 
 ## 关键实现细节

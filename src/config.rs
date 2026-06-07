@@ -25,8 +25,7 @@ pub const DPI_SCALE_FACTOR: f64 = 1.173;
 pub const COLOR_KEY: u32 = 0x00FF00FF;
 pub const COLOR_DARK_TEXT: u32 = 0x00282828;
 pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;
-pub const COLOR_LOW_BATTERY: u32 = 0x00808080;
-pub const LUMINANCE_THRESHOLD: f64 = 125.0;
+pub const COLOR_LOW_BATTERY: u32 = 0x004444FF;
 
 pub const FONT_BASE_SIZE: i32 = 13;
 

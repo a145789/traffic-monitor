@@ -1,4 +1,5 @@
 #![windows_subsystem = "windows"]
+#![allow(static_mut_refs)]
 
 mod collector;
 mod config;
@@ -20,8 +21,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOP, GWL_EXSTYLE, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
     SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE, SWP_FRAMECHANGED,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
+};
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 
 use crate::collector::{collect_cpu, collect_memory, collect_network, trim_working_set};
@@ -144,9 +148,7 @@ fn main() {
 
         if let Some(renderer) = &mut RENDERER {
             renderer.update_dpi(hwnd);
-            if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
-                renderer.update_text_color(h_tray, h_taskbar);
-            }
+            renderer.update_text_color();
         }
 
         let _ = InvalidateRect(hwnd, None, false);
@@ -156,11 +158,15 @@ fn main() {
 
         MOUSE_THREAD = Some(start_mouse_thread());
 
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+
         let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
         while windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0).into() {
             let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
             windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
         }
+
+        let _ = WTSUnRegisterSessionNotification(hwnd);
     }
 }
 
@@ -226,6 +232,9 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
     true
 }
 
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+
 pub unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -237,11 +246,9 @@ pub unsafe extern "system" fn wnd_proc(
         let _ = ShowWindow(hwnd, SW_HIDE);
         if embed_in_taskbar(hwnd) {
             create_tray_icon(hwnd);
-            if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
-                if let Some(renderer) = &mut RENDERER {
-                    renderer.update_dpi(hwnd);
-                    renderer.update_text_color(h_tray, h_taskbar);
-                }
+            if let Some(renderer) = &mut RENDERER {
+                renderer.update_dpi(hwnd);
+                renderer.update_text_color();
             }
         }
         return LRESULT(0);
@@ -288,10 +295,8 @@ pub unsafe extern "system" fn wnd_proc(
 
         WM_SETTINGCHANGE => {
             if is_immersive_color_set(lparam) {
-                if let (Some(h_taskbar), Some(h_tray)) = (H_TASKBAR, H_TRAY) {
-                    if let Some(renderer) = &mut RENDERER {
-                        renderer.update_text_color(h_tray, h_taskbar);
-                    }
+                if let Some(renderer) = &mut RENDERER {
+                    renderer.update_text_color();
                 }
             }
             LRESULT(0)
@@ -318,6 +323,29 @@ pub unsafe extern "system" fn wnd_proc(
                     trim_working_set();
                 }
                 PBT_APMRESUMEAUTOMATIC => {
+                    SUSPENDED.store(false, Ordering::Relaxed);
+                    let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
+                    let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+                    MOUSE_THREAD = Some(start_mouse_thread());
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+
+        WM_WTSSESSION_CHANGE => {
+            match wparam.0 {
+                WTS_SESSION_LOCK => {
+                    SUSPENDED.store(true, Ordering::Relaxed);
+                    KillTimer(hwnd, TIMER_ID_NETWORK).ok();
+                    KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
+                    stop_mouse_thread();
+                    if let Some(handle) = MOUSE_THREAD.take() {
+                        let _ = handle.join();
+                    }
+                    trim_working_set();
+                }
+                WTS_SESSION_UNLOCK => {
                     SUSPENDED.store(false, Ordering::Relaxed);
                     let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
                     let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);

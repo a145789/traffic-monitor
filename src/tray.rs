@@ -4,11 +4,11 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DestroyWindow, GetCursorPos, LoadIconW, PostQuitMessage,
+    CreatePopupMenu, CreateWindowExW, GetCursorPos, LoadIconW,
     SetForegroundWindow, TrackPopupMenu, WM_USER, WNDCLASSEXW, IDI_APPLICATION,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE, WS_POPUP,
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MFS_CHECKED,
-    MFS_UNCHECKED, InsertMenuItemW,
+    MFS_UNCHECKED, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
 };
 
 use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT};
@@ -143,6 +143,8 @@ pub fn show_context_menu(hwnd: HWND) {
             hwnd,
             None,
         );
+
+        let _ = DestroyMenu(hmenu);
     }
 }
 
@@ -150,10 +152,13 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
     match item_id {
         MENU_ID_AUTOSTART => toggle_autostart(),
         MENU_ID_EXIT => {
-            remove_tray_icon();
             unsafe {
-                DestroyWindow(hwnd).ok();
-                PostQuitMessage(0);
+                let _ = PostMessageW(
+                    hwnd,
+                    WM_CLOSE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
             }
         }
         _ => {}
