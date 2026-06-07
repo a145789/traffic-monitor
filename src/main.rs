@@ -95,7 +95,6 @@ fn check_fullscreen(hwnd: HWND) {
             let was = FULLSCREEN.load(Ordering::Relaxed);
             if was {
                 FULLSCREEN.store(false, Ordering::Relaxed);
-                let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
                 if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
                     stop_and_join_mouse_thread();
@@ -118,12 +117,10 @@ fn check_fullscreen(hwnd: HWND) {
         FULLSCREEN.store(is_full, Ordering::Relaxed);
 
         if is_full && !was {
-            KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
             KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
             stop_and_join_mouse_thread();
             trim_working_set();
         } else if !is_full && was {
-            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
                 stop_and_join_mouse_thread();
