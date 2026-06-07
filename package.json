@@ -1,0 +1,7 @@
+{
+  "name": "traffic-monitor",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

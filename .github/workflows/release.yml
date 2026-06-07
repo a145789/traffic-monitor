@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Update version in Cargo.toml
+        shell: bash
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ steps.version.outputs.VERSION }}"/' Cargo.toml
+
+      - name: Update version in installer.iss
+        shell: bash
+        run: |
+          sed -i 's/^AppVersion=.*/AppVersion=${{ steps.version.outputs.VERSION }}/' installer.iss
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Compile installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 7\ISCC.exe" installer.iss
+
+      - name: Rename installer
+        shell: bash
+        run: |
+          mv Output/TrafficMonitor-Setup.exe Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.ref_name }} `
+            target/release/traffic-monitor.exe#traffic-monitor.exe `
+            Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe#TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe `
+            --clobber
