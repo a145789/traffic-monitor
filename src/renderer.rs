@@ -96,7 +96,7 @@ impl Renderer {
 
             // 1. 绘制第三列 (网速) - 最右列
             // 网速列宽度 76，右边距 4
-            let col_gap = (10.0 * scale).round() as i32;
+            let col_gap = (13.0 * scale).round() as i32;
             let speed_right = self.width - (4.0 * scale).round() as i32;
             let speed_left = speed_right - (76.0 * scale).round() as i32;
 
@@ -135,7 +135,7 @@ impl Renderer {
             // 宽度 52。右界与网速列左界相距 col_gap
             if show_mouse {
                 let mouse_right = speed_left - col_gap;
-                let mouse_left = mouse_right - (52.0 * scale).round() as i32;
+                let mouse_left = mouse_right - (62.0 * scale).round() as i32;
 
                 if mouse_online {
                     // 第一行：鼠标电量
@@ -248,7 +248,7 @@ impl Renderer {
             } else {
                 speed_left - col_gap
             };
-            let cpu_left = cpu_right - (54.0 * scale).round() as i32;
+            let cpu_left = cpu_right - (64.0 * scale).round() as i32;
 
             let cpu_text = format!("CPU: {}%", cpu);
             let mut rc_cpu = RECT {

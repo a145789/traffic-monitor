@@ -4,7 +4,7 @@ pub const APP_NAME: &str = "TrafficMonitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";
 pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
 
-pub const DISPLAY_WIDTH: i32 = 220;
+pub const DISPLAY_WIDTH: i32 = 240;
 pub const DISPLAY_HEIGHT: i32 = 32;
 pub const GAP: i32 = -3;
 
