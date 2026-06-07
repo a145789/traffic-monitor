@@ -22,29 +22,93 @@ jobs:
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Update version in Cargo.toml
-        shell: bash
         run: |
-          sed -i 's/^version = ".*"/version = "${{ steps.version.outputs.VERSION }}"/' Cargo.toml
+          (Get-Content Cargo.toml) -replace '^version = ".*"', 'version = "${{ steps.version.outputs.VERSION }}"' | Set-Content Cargo.toml
 
       - name: Update version in installer.iss
-        shell: bash
         run: |
-          sed -i 's/^AppVersion=.*/AppVersion=${{ steps.version.outputs.VERSION }}/' installer.iss
+          (Get-Content installer.iss) -replace '^AppVersion=.*', 'AppVersion=${{ steps.version.outputs.VERSION }}' | Set-Content installer.iss
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
       - name: Build release
         run: cargo build --release
 
+      - name: Cache Inno Setup
+        id: cache-is
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files\Inno Setup 7
+            C:\Program Files (x86)\Inno Setup 7
+            C:\Program Files (x86)\Inno Setup 6
+          key: innosetup-7-v1
+
       - name: Install Inno Setup
+        if: steps.cache-is.outputs.cache-hit != 'true'
         run: choco install innosetup -y
+
+      - name: Download Chinese language file
+        if: steps.cache-is.outputs.cache-hit != 'true'
+        run: |
+          $candidatePaths = @(
+            "C:\Program Files\Inno Setup 7",
+            "C:\Program Files (x86)\Inno Setup 7",
+            "C:\Program Files (x86)\Inno Setup 6"
+          )
+          $innoPath = ""
+          foreach ($path in $candidatePaths) {
+            if (Test-Path "$path\ISCC.exe") {
+              $innoPath = $path
+              break
+            }
+          }
+          if (-not $innoPath) {
+            $isccCmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($isccCmd) {
+              $innoPath = Split-Path -Parent $isccCmd.Source
+            }
+          }
+          if (-not $innoPath) {
+            Write-Error "Inno Setup not found!"
+            exit 1
+          }
+          $langDir = Join-Path $innoPath "Languages"
+          if (-not (Test-Path $langDir)) {
+            New-Item -ItemType Directory -Force -Path $langDir
+          }
+          $url = "https://raw.githubusercontent.com/jrsoftware/issrc/refs/heads/main/Files/Languages/Unofficial/ChineseSimplified.isl"
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $langDir "ChineseSimplified.isl") -UseBasicParsing
 
       - name: Compile installer
         run: |
-          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          $candidatePaths = @(
+            "C:\Program Files\Inno Setup 7",
+            "C:\Program Files (x86)\Inno Setup 7",
+            "C:\Program Files (x86)\Inno Setup 6"
+          )
+          $iscc = ""
+          foreach ($path in $candidatePaths) {
+            if (Test-Path "$path\ISCC.exe") {
+              $iscc = "$path\ISCC.exe"
+              break
+            }
+          }
           if (-not $iscc) {
-            $iscc = "C:\Program Files (x86)\Inno Setup 7\ISCC.exe"
+            $isccCmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($isccCmd) {
+              $iscc = $isccCmd.Source
+            }
+          }
+          if (-not $iscc) {
+            Write-Error "ISCC.exe not found!"
+            exit 1
           }
           & $iscc installer.iss
 
