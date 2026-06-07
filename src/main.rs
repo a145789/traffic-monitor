@@ -56,6 +56,13 @@ fn show_error(msg: &str) {
     }
 }
 
+unsafe fn stop_and_join_mouse_thread() {
+    stop_mouse_thread();
+    if let Some(handle) = MOUSE_THREAD.take() {
+        let _ = handle.join();
+    }
+}
+
 fn is_immersive_color_set(lparam: LPARAM) -> bool {
     let ptr = lparam.0 as *const u16;
     if ptr.is_null() {
@@ -82,14 +89,15 @@ fn check_fullscreen(hwnd: HWND) {
             || GetShellWindow() == foreground
             || foreground == hwnd
         {
-            let was = FULLSCREEN.load(Ordering::Relaxed);
-            if was {
-                FULLSCREEN.store(false, Ordering::Relaxed);
-                let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
-                let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
-                MOUSE_THREAD = Some(start_mouse_thread());
-            }
-            return;
+        let was = FULLSCREEN.load(Ordering::Relaxed);
+        if was {
+            FULLSCREEN.store(false, Ordering::Relaxed);
+            let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
+            let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+            stop_and_join_mouse_thread();
+            MOUSE_THREAD = Some(start_mouse_thread());
+        }
+        return;
         }
 
         let mut rect = RECT::default();
@@ -105,14 +113,12 @@ fn check_fullscreen(hwnd: HWND) {
         if is_full && !was {
             KillTimer(hwnd, TIMER_ID_NETWORK).ok();
             KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
-            stop_mouse_thread();
-            if let Some(handle) = MOUSE_THREAD.take() {
-                let _ = handle.join();
-            }
+            stop_and_join_mouse_thread();
             trim_working_set();
         } else if !is_full && was {
             let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
             let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+            stop_and_join_mouse_thread();
             MOUSE_THREAD = Some(start_mouse_thread());
         }
     }
@@ -167,6 +173,7 @@ fn main() {
         }
 
         let _ = WTSUnRegisterSessionNotification(hwnd);
+        let _ = RENDERER.take();
     }
 }
 
@@ -316,16 +323,14 @@ pub unsafe extern "system" fn wnd_proc(
                     SUSPENDED.store(true, Ordering::Relaxed);
                     KillTimer(hwnd, TIMER_ID_NETWORK).ok();
                     KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
-                    stop_mouse_thread();
-                    if let Some(handle) = MOUSE_THREAD.take() {
-                        let _ = handle.join();
-                    }
+                    stop_and_join_mouse_thread();
                     trim_working_set();
                 }
                 PBT_APMRESUMEAUTOMATIC => {
                     SUSPENDED.store(false, Ordering::Relaxed);
                     let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
                     let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+                    stop_and_join_mouse_thread();
                     MOUSE_THREAD = Some(start_mouse_thread());
                 }
                 _ => {}
@@ -339,16 +344,14 @@ pub unsafe extern "system" fn wnd_proc(
                     SUSPENDED.store(true, Ordering::Relaxed);
                     KillTimer(hwnd, TIMER_ID_NETWORK).ok();
                     KillTimer(hwnd, TIMER_ID_CPU_MEM).ok();
-                    stop_mouse_thread();
-                    if let Some(handle) = MOUSE_THREAD.take() {
-                        let _ = handle.join();
-                    }
+                    stop_and_join_mouse_thread();
                     trim_working_set();
                 }
                 WTS_SESSION_UNLOCK => {
                     SUSPENDED.store(false, Ordering::Relaxed);
                     let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
                     let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
+                    stop_and_join_mouse_thread();
                     MOUSE_THREAD = Some(start_mouse_thread());
                 }
                 _ => {}

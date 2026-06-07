@@ -1,7 +1,8 @@
 use std::sync::atomic::Ordering;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetIfTable, MIB_IFROW, MIB_IFTABLE,
+    GetIfTable2, FreeMibTable, MIB_IF_TABLE2, MIB_IF_ROW2,
 };
+use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::System::SystemInformation::{
     GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
@@ -74,21 +75,12 @@ pub fn collect_memory() {
 
 pub fn collect_network() {
     unsafe {
-        let mut buf_size: u32 = 0;
-        GetIfTable(None, &mut buf_size, false);
-
-        if buf_size == 0 {
-            return;
-        }
-
-        let mut buf = vec![0u8; buf_size as usize];
-        let table = buf.as_mut_ptr() as *mut MIB_IFTABLE;
-
-        let result = GetIfTable(Some(table), &mut buf_size, false);
-        if result == 0 {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        let result = GetIfTable2(&mut table);
+        if result.0 == 0 && !table.is_null() {
             let table_ref = &*table;
-            let num_entries = table_ref.dwNumEntries as usize;
-            let row_ptr = table_ref.table.as_ptr();
+            let num_entries = table_ref.NumEntries as usize;
+            let row_ptr = table_ref.Table.as_ptr();
 
             let mut total_in: u64 = 0;
             let mut total_out: u64 = 0;
@@ -100,48 +92,43 @@ pub fn collect_network() {
                     continue;
                 }
 
-                if row.dwOperStatus != windows::Win32::NetworkManagement::IpHelper::INTERNAL_IF_OPER_STATUS(1) {
+                if row.OperStatus != IfOperStatusUp {
                     continue;
                 }
 
-                total_in += row.dwInOctets as u64;
-                total_out += row.dwOutOctets as u64;
+                total_in += row.InOctets;
+                total_out += row.OutOctets;
             }
 
             if !NET_INITIALIZED {
                 PREV_NET_IN = total_in;
                 PREV_NET_OUT = total_out;
                 NET_INITIALIZED = true;
+                FreeMibTable(table as *const _);
                 return;
             }
 
-            if total_in >= PREV_NET_IN {
-                let speed_down = (total_in - PREV_NET_IN) as u32;
-                NET_SPEED_DOWN.store(speed_down, Ordering::Relaxed);
-            } else {
-                NET_SPEED_DOWN.store(0, Ordering::Relaxed);
-            }
+            let speed_down = total_in.saturating_sub(PREV_NET_IN) as u32;
+            let speed_up = total_out.saturating_sub(PREV_NET_OUT) as u32;
 
-            if total_out >= PREV_NET_OUT {
-                let speed_up = (total_out - PREV_NET_OUT) as u32;
-                NET_SPEED_UP.store(speed_up, Ordering::Relaxed);
-            } else {
-                NET_SPEED_UP.store(0, Ordering::Relaxed);
-            }
+            NET_SPEED_DOWN.store(speed_down, Ordering::Relaxed);
+            NET_SPEED_UP.store(speed_up, Ordering::Relaxed);
 
             PREV_NET_IN = total_in;
             PREV_NET_OUT = total_out;
+
+            FreeMibTable(table as *const _);
         }
     }
 }
 
-fn is_physical_interface(row: &MIB_IFROW) -> bool {
-    let if_type = row.dwType;
+fn is_physical_interface(row: &MIB_IF_ROW2) -> bool {
+    let if_type = row.Type;
     if if_type != IF_TYPE_ETHERNET_CSMACD && if_type != IF_TYPE_IEEE80211 {
         return false;
     }
 
-    if row.dwPhysAddrLen == 0 {
+    if row.PhysicalAddressLength == 0 {
         return false;
     }
 

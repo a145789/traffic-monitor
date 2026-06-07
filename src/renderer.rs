@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, LOW_BATTERY_TEXT_X, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
     NET_SPEED_DOWN, NET_SPEED_UP, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_IS_CHARGING,
 };
 
@@ -152,7 +152,7 @@ impl Renderer {
                 SetTextColor(self.hdc_mem, battery_color);
                 let battery_text = format!("{}%", battery);
                 let mut rc_bat = RECT {
-                    left: (122.0 * scale).round() as i32,
+                    left: (LOW_BATTERY_TEXT_X * scale).round() as i32,
                     top: half_height,
                     right: self.width,
                     bottom: self.height,
@@ -195,16 +195,20 @@ impl Renderer {
             let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
 
             // 2. 将新位图选入内存 DC，销毁旧位图
-            let old_bitmap = SelectObject(self.hdc_mem, new_bitmap);
-            let _ = DeleteObject(old_bitmap);
-            self.hbitmap = new_bitmap;
+            if !new_bitmap.is_invalid() {
+                let old_bitmap = SelectObject(self.hdc_mem, new_bitmap);
+                let _ = DeleteObject(old_bitmap);
+                self.hbitmap = new_bitmap;
+            }
 
             // 3. 重新创建并选择字体（不设上限）
             let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
             let new_font = create_font(font_size);
-            let old_font = SelectObject(self.hdc_mem, new_font);
-            let _ = DeleteObject(old_font);
-            self.hfont = new_font;
+            if !new_font.is_invalid() {
+                let old_font = SelectObject(self.hdc_mem, new_font);
+                let _ = DeleteObject(old_font);
+                self.hfont = new_font;
+            }
 
             // 4. 更新相关属性
             self.font_size = font_size;

@@ -84,18 +84,20 @@ pub fn create_tray_icon(hwnd: HWND) {
             hIcon: hicon,
             ..Default::default()
         };
+        nid.Anonymous.uVersion = windows::Win32::UI::Shell::NOTIFYICON_VERSION_4;
 
         let tip: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
         nid.szTip[..tip.len()].copy_from_slice(&tip);
 
-        Shell_NotifyIconW(NIM_ADD, &nid);
+        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        let _ = Shell_NotifyIconW(windows::Win32::UI::Shell::NIM_SETVERSION, &nid);
         TRAY_DATA = nid;
     }
 }
 
 pub fn remove_tray_icon() {
     unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &TRAY_DATA);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &TRAY_DATA);
     }
 }
 
@@ -230,7 +232,8 @@ fn toggle_autostart() {
             } else {
                 let exe_path = std::env::current_exe().unwrap();
                 let path_str = exe_path.to_string_lossy().to_string();
-                let path_wide: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let path_quoted = format!("\"{}\"", path_str);
+                let path_wide: Vec<u16> = path_quoted.encode_utf16().chain(std::iter::once(0)).collect();
                 RegSetValueExW(
                     hkey,
                     PCWSTR(value_name.as_ptr()),

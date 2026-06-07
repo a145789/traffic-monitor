@@ -27,6 +27,7 @@ Windows 11 任务栏小组件，纯 Rust 实现，无配置文件。嵌入在任
 ### 智能挂起（省资源）
 
 以下情况停止所有定时器采集、停止鼠标轮询、`SetProcessWorkingSetSize` trim 内存：
+
 - **全屏检测**：前台窗口尺寸 == 屏幕分辨率（全屏游戏/视频）
 - **系统睡眠**：收到 `PBT_APMSUSPEND`
 - **锁屏**：收到 `WM_WTSSESSION_CHANGE` + `WTS_SESSION_LOCK`
@@ -117,3 +118,7 @@ lto = true         # 链接时优化
 codegen-units = 1  # 更好的优化
 strip = true       # 去除符号
 ```
+
+## 要求
+
+- 如无特殊要求，不要阅读 `docs/` 下的任何文档

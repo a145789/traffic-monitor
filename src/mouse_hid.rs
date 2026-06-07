@@ -102,6 +102,7 @@ fn interruptible_sleep(dur: Duration) {
 }
 
 fn mouse_worker_loop() {
+    let mut api_opt: Option<HidApi> = None;
     loop {
         if SHOULD_STOP.load(Ordering::Relaxed) {
             break;
@@ -112,15 +113,23 @@ fn mouse_worker_loop() {
             continue;
         }
 
-        let api = match HidApi::new() {
-            Ok(api) => api,
-            Err(_) => {
-                interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
-                continue;
+        let api = match &api_opt {
+            Some(api) => api,
+            None => {
+                match HidApi::new() {
+                    Ok(api) => {
+                        api_opt = Some(api);
+                        api_opt.as_ref().unwrap()
+                    }
+                    Err(_) => {
+                        interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
+                        continue;
+                    }
+                }
             }
         };
 
-        let device = match find_mouse_device(&api) {
+        let device = match find_mouse_device(api) {
             Some(dev) => dev,
             None => {
                 handle_mouse_offline();
