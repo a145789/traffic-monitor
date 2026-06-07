@@ -90,6 +90,13 @@ pub fn stop_mouse_thread() {
     SHOULD_STOP.store(true, Ordering::Release);
 }
 
+pub fn check_mouse_available() -> bool {
+    match HidApi::new() {
+        Ok(api) => find_mouse_device(&api).is_some(),
+        Err(_) => false,
+    }
+}
+
 fn interruptible_sleep(dur: Duration) {
     let start = std::time::Instant::now();
     while start.elapsed() < dur {

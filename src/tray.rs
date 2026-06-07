@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MFS_UNCHECKED, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
 };
 
-use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT};
+use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE};
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 pub const MENU_ID_AUTOSTART: u32 = 1001;
@@ -123,6 +123,21 @@ pub fn show_context_menu(hwnd: HWND) {
         autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
         InsertMenuItemW(hmenu, 0, true, &autostart_item);
 
+        let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
+        let mut mouse_item = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+            fState: if SHOW_MOUSE_INFO.load(std::sync::atomic::Ordering::Relaxed) {
+                MFS_CHECKED
+            } else {
+                MFS_UNCHECKED
+            },
+            wID: MENU_ID_SHOW_MOUSE,
+            ..Default::default()
+        };
+        mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
+        InsertMenuItemW(hmenu, 1, true, &mouse_item);
+
         let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
         let mut exit_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -132,7 +147,7 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
-        InsertMenuItemW(hmenu, 1, true, &exit_item);
+        InsertMenuItemW(hmenu, 2, true, &exit_item);
 
         SetForegroundWindow(hwnd);
 

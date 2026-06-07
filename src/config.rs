@@ -28,11 +28,13 @@ pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;
 pub const COLOR_LOW_BATTERY: u32 = 0x004444FF;
 
 pub const FONT_BASE_SIZE: i32 = 13;
-pub const LOW_BATTERY_TEXT_X: f64 = 122.0;
 
 pub static MOUSE_ONLINE: AtomicBool = AtomicBool::new(false);
 pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
 pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+pub static SHOW_MOUSE_INFO: AtomicBool = AtomicBool::new(false);
+
+pub const MENU_ID_SHOW_MOUSE: u32 = 1003;
 
 pub static MOUSE_BATTERY_LEVEL: AtomicU32 = AtomicU32::new(0);
 pub static MOUSE_IS_CHARGING: AtomicBool = AtomicBool::new(false);

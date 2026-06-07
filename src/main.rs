@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOP, GWL_EXSTYLE, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
     SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE, SWP_FRAMECHANGED,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WM_CONTEXTMENU, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
 };
 use windows::Win32::System::RemoteDesktop::{
@@ -31,9 +31,9 @@ use windows::Win32::System::RemoteDesktop::{
 use crate::collector::{collect_cpu, collect_memory, collect_network, trim_working_set};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, FULLSCREEN, GAP, SUSPENDED,
-    TIMER_ID_CPU_MEM, TIMER_ID_NETWORK,
+    TIMER_ID_CPU_MEM, TIMER_ID_NETWORK, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MOUSE_ONLINE,
 };
-use crate::mouse_hid::{start_mouse_thread, stop_mouse_thread, WM_USER_MOUSE_UPDATE, WM_USER_MOUSE_STATUS};
+use crate::mouse_hid::{start_mouse_thread, stop_mouse_thread, check_mouse_available, WM_USER_MOUSE_UPDATE, WM_USER_MOUSE_STATUS};
 use crate::renderer::Renderer;
 use crate::tray::{create_main_window, create_tray_icon, register_window_class, remove_tray_icon, WM_APP_TRAY};
 
@@ -94,8 +94,10 @@ fn check_fullscreen(hwnd: HWND) {
             FULLSCREEN.store(false, Ordering::Relaxed);
             let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
             let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
-            stop_and_join_mouse_thread();
-            MOUSE_THREAD = Some(start_mouse_thread());
+            if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                stop_and_join_mouse_thread();
+                MOUSE_THREAD = Some(start_mouse_thread());
+            }
         }
         return;
         }
@@ -118,8 +120,10 @@ fn check_fullscreen(hwnd: HWND) {
         } else if !is_full && was {
             let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
             let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
-            stop_and_join_mouse_thread();
-            MOUSE_THREAD = Some(start_mouse_thread());
+            if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                stop_and_join_mouse_thread();
+                MOUSE_THREAD = Some(start_mouse_thread());
+            }
         }
     }
 }
@@ -162,7 +166,9 @@ fn main() {
         let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
         let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
 
-        MOUSE_THREAD = Some(start_mouse_thread());
+        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+            MOUSE_THREAD = Some(start_mouse_thread());
+        }
 
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
 
@@ -330,8 +336,10 @@ pub unsafe extern "system" fn wnd_proc(
                     SUSPENDED.store(false, Ordering::Relaxed);
                     let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
                     let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
-                    stop_and_join_mouse_thread();
-                    MOUSE_THREAD = Some(start_mouse_thread());
+                    if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                        stop_and_join_mouse_thread();
+                        MOUSE_THREAD = Some(start_mouse_thread());
+                    }
                 }
                 _ => {}
             }
@@ -351,8 +359,10 @@ pub unsafe extern "system" fn wnd_proc(
                     SUSPENDED.store(false, Ordering::Relaxed);
                     let _ = SetTimer(hwnd, TIMER_ID_NETWORK, 1000, None);
                     let _ = SetTimer(hwnd, TIMER_ID_CPU_MEM, 5000, None);
-                    stop_and_join_mouse_thread();
-                    MOUSE_THREAD = Some(start_mouse_thread());
+                    if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                        stop_and_join_mouse_thread();
+                        MOUSE_THREAD = Some(start_mouse_thread());
+                    }
                 }
                 _ => {}
             }
@@ -368,12 +378,32 @@ pub unsafe extern "system" fn wnd_proc(
 
         WM_COMMAND => {
             let menu_id = (wparam.0 & 0xFFFF) as u32;
-            tray::handle_menu_command(hwnd, menu_id);
+            if menu_id == MENU_ID_SHOW_MOUSE {
+                let current_state = SHOW_MOUSE_INFO.load(Ordering::Relaxed);
+                if !current_state {
+                    if check_mouse_available() {
+                        SHOW_MOUSE_INFO.store(true, Ordering::Relaxed);
+                        stop_and_join_mouse_thread();
+                        MOUSE_THREAD = Some(start_mouse_thread());
+                        let _ = InvalidateRect(hwnd, None, false);
+                    } else {
+                        show_error("未检测到物理鼠标或鼠标不支持");
+                    }
+                } else {
+                    SHOW_MOUSE_INFO.store(false, Ordering::Relaxed);
+                    stop_and_join_mouse_thread();
+                    MOUSE_ONLINE.store(false, Ordering::Relaxed);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            } else {
+                tray::handle_menu_command(hwnd, menu_id);
+            }
             LRESULT(0)
         }
 
         x if x == WM_APP_TRAY => {
-            if lparam.0 as u32 == WM_RBUTTONUP {
+            let event = (lparam.0 & 0xFFFF) as u32;
+            if event == WM_CONTEXTMENU {
                 tray::show_context_menu(hwnd);
             }
             LRESULT(0)

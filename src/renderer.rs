@@ -10,8 +10,9 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE, LOW_BATTERY_TEXT_X, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
     NET_SPEED_DOWN, NET_SPEED_UP, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_IS_CHARGING,
+    SHOW_MOUSE_INFO,
 };
 
 pub struct Renderer {
@@ -84,87 +85,200 @@ impl Renderer {
             let speed_down = NET_SPEED_DOWN.load(Ordering::Relaxed);
             let cpu = CPU_USAGE.load(Ordering::Relaxed);
             let mem = MEM_USAGE.load(Ordering::Relaxed);
+            let show_mouse = SHOW_MOUSE_INFO.load(Ordering::Relaxed);
             let mouse_online = MOUSE_ONLINE.load(Ordering::Relaxed);
             let battery = MOUSE_BATTERY_LEVEL.load(Ordering::Relaxed);
             let charging = MOUSE_IS_CHARGING.load(Ordering::Relaxed);
             let dpi = MOUSE_DPI_VALUE.load(Ordering::Relaxed);
 
-            let line1 = format!(
-                "\u{2191} {}   CPU: {}%   MEM: {}%",
-                format_speed(speed_up),
-                cpu,
-                mem
-            );
-
-            let line2 = if mouse_online {
-                if battery < 20 && !charging {
-                    format!(
-                        "\u{2193} {}   \u{1F5B1}       DPI: {}",
-                        format_speed(speed_down),
-                        dpi
-                    )
-                } else {
-                    format!(
-                        "\u{2193} {}   \u{1F5B1} {}%    DPI: {}",
-                        format_speed(speed_down),
-                        battery,
-                        dpi
-                    )
-                }
-            } else {
-                format!("\u{2193} {}   \u{1F5B1} --    DPI: --", format_speed(speed_down))
-            };
-
             let half_height = self.height / 2;
             let scale = self.width as f64 / DISPLAY_WIDTH as f64;
 
+            // 1. 绘制第三列 (网速) - 最右列
+            // 网速列宽度 76，右边距 4
+            let col_gap = (10.0 * scale).round() as i32;
+            let speed_right = self.width - (4.0 * scale).round() as i32;
+            let speed_left = speed_right - (76.0 * scale).round() as i32;
+
             SetTextColor(self.hdc_mem, self.text_color);
-            let mut rc1 = RECT {
-                left: 4,
+            let speed_up_text = format!("\u{2191} {}", format_speed(speed_up));
+            let mut rc_speed_up = RECT {
+                left: speed_left,
                 top: 0,
-                right: self.width,
+                right: speed_right,
                 bottom: half_height,
             };
-            let mut line1_wide = to_wide(&line1);
+            let mut speed_up_wide = to_wide(&speed_up_text);
             let _ = DrawTextW(
                 self.hdc_mem,
-                &mut line1_wide,
-                &mut rc1,
-                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
-            );
-            
-            let mut rc2 = RECT {
-                left: 4,
-                top: half_height,
-                right: self.width,
-                bottom: self.height,
-            };
-            let mut line2_wide = to_wide(&line2);
-            let _ = DrawTextW(
-                self.hdc_mem,
-                &mut line2_wide,
-                &mut rc2,
+                &mut speed_up_wide,
+                &mut rc_speed_up,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
             );
 
-            if mouse_online && battery < 20 && !charging {
-                let battery_color = COLORREF(COLOR_LOW_BATTERY);
-                SetTextColor(self.hdc_mem, battery_color);
-                let battery_text = format!("{}%", battery);
-                let mut rc_bat = RECT {
-                    left: (LOW_BATTERY_TEXT_X * scale).round() as i32,
-                    top: half_height,
-                    right: self.width,
-                    bottom: self.height,
-                };
-                let mut battery_wide = to_wide(&battery_text);
-                let _ = DrawTextW(
-                    self.hdc_mem,
-                    &mut battery_wide,
-                    &mut rc_bat,
-                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
-                );
+            let speed_down_text = format!("\u{2193} {}", format_speed(speed_down));
+            let mut rc_speed_down = RECT {
+                left: speed_left,
+                top: half_height,
+                right: speed_right,
+                bottom: self.height,
+            };
+            let mut speed_down_wide = to_wide(&speed_down_text);
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut speed_down_wide,
+                &mut rc_speed_down,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+            );
+
+            // 2. 绘制第二列 (鼠标信息) - 中列
+            // 宽度 52。右界与网速列左界相距 col_gap
+            if show_mouse {
+                let mouse_right = speed_left - col_gap;
+                let mouse_left = mouse_right - (52.0 * scale).round() as i32;
+
+                if mouse_online {
+                    // 第一行：鼠标电量
+                    if battery < 20 && !charging {
+                        // 画图标 🖱️
+                        let mut rc_mouse = RECT {
+                            left: mouse_left,
+                            top: 0,
+                            right: mouse_right,
+                            bottom: half_height,
+                        };
+                        let mut mouse_wide = to_wide("\u{1F5B1}");
+                        let _ = DrawTextW(
+                            self.hdc_mem,
+                            &mut mouse_wide,
+                            &mut rc_mouse,
+                            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                        );
+
+                        // 用红色画电量数字，左侧相对偏移 16 像素
+                        let battery_color = COLORREF(COLOR_LOW_BATTERY);
+                        SetTextColor(self.hdc_mem, battery_color);
+                        let battery_text = format!("{}%", battery);
+                        let mut rc_bat = RECT {
+                            left: mouse_left + (16.0 * scale).round() as i32,
+                            top: 0,
+                            right: mouse_right,
+                            bottom: half_height,
+                        };
+                        let mut battery_wide = to_wide(&battery_text);
+                        let _ = DrawTextW(
+                            self.hdc_mem,
+                            &mut battery_wide,
+                            &mut rc_bat,
+                            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                        );
+
+                        // 恢复颜色
+                        SetTextColor(self.hdc_mem, self.text_color);
+                    } else {
+                        let mouse_text = format!("\u{1F5B1} {}%", battery);
+                        let mut rc_mouse = RECT {
+                            left: mouse_left,
+                            top: 0,
+                            right: mouse_right,
+                            bottom: half_height,
+                        };
+                        let mut mouse_wide = to_wide(&mouse_text);
+                        let _ = DrawTextW(
+                            self.hdc_mem,
+                            &mut mouse_wide,
+                            &mut rc_mouse,
+                            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                        );
+                    }
+
+                    // 第二行：DPI
+                    let dpi_text = format!("DPI: {}", dpi);
+                    let mut rc_dpi = RECT {
+                        left: mouse_left,
+                        top: half_height,
+                        right: mouse_right,
+                        bottom: self.height,
+                    };
+                    let mut dpi_wide = to_wide(&dpi_text);
+                    let _ = DrawTextW(
+                        self.hdc_mem,
+                        &mut dpi_wide,
+                        &mut rc_dpi,
+                        DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                    );
+                } else {
+                    // 鼠标离线，画 --
+                    let mouse_text = "\u{1F5B1} --";
+                    let mut rc_mouse = RECT {
+                        left: mouse_left,
+                        top: 0,
+                        right: mouse_right,
+                        bottom: half_height,
+                    };
+                    let mut mouse_wide = to_wide(mouse_text);
+                    let _ = DrawTextW(
+                        self.hdc_mem,
+                        &mut mouse_wide,
+                        &mut rc_mouse,
+                        DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                    );
+
+                    let dpi_text = "DPI: --";
+                    let mut rc_dpi = RECT {
+                        left: mouse_left,
+                        top: half_height,
+                        right: mouse_right,
+                        bottom: self.height,
+                    };
+                    let mut dpi_wide = to_wide(dpi_text);
+                    let _ = DrawTextW(
+                        self.hdc_mem,
+                        &mut dpi_wide,
+                        &mut rc_dpi,
+                        DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                    );
+                }
             }
+
+            // 3. 绘制第一列 (CPU & MEM) - 最左列
+            // 宽度 54。右界与下一列相距 col_gap
+            let cpu_right = if show_mouse {
+                speed_left - col_gap - (52.0 * scale).round() as i32 - col_gap
+            } else {
+                speed_left - col_gap
+            };
+            let cpu_left = cpu_right - (54.0 * scale).round() as i32;
+
+            let cpu_text = format!("CPU: {}%", cpu);
+            let mut rc_cpu = RECT {
+                left: cpu_left,
+                top: 0,
+                right: cpu_right,
+                bottom: half_height,
+            };
+            let mut cpu_wide = to_wide(&cpu_text);
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut cpu_wide,
+                &mut rc_cpu,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+            );
+
+            let mem_text = format!("MEM: {}%", mem);
+            let mut rc_mem = RECT {
+                left: cpu_left,
+                top: half_height,
+                right: cpu_right,
+                bottom: self.height,
+            };
+            let mut mem_wide = to_wide(&mem_text);
+            let _ = DrawTextW(
+                self.hdc_mem,
+                &mut mem_wide,
+                &mut rc_mem,
+                DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+            );
 
             SetTextColor(self.hdc_mem, self.text_color);
 
