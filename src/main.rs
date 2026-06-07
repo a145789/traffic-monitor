@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetLayeredWindowAttributes,
     SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     HWND_TOP, GWL_EXSTYLE, GWL_STYLE, LWA_COLORKEY, MB_ICONERROR, MB_OK, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE, SWP_FRAMECHANGED,
+    SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE, SWP_FRAMECHANGED,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
     WM_CONTEXTMENU, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
@@ -256,28 +256,25 @@ fn main() {
     }
 }
 
-unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
+fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     unsafe {
         let h_taskbar = match FindWindowW(w!("Shell_TrayWnd"), w!("")) {
             Ok(h) => h,
-            Err(_) => {
-                show_error("Cannot find Shell_TrayWnd");
-                return false;
-            }
+            Err(_) => return None,
         };
-
         let h_tray = match FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")) {
             Ok(h) => h,
-            Err(_) => {
-                show_error("Cannot find TrayNotifyWnd");
-                return false;
-            }
+            Err(_) => return None,
         };
 
         let mut rc_tray = RECT::default();
         let mut rc_taskbar = RECT::default();
-        let _ = GetWindowRect(h_tray, &mut rc_tray);
-        let _ = GetWindowRect(h_taskbar, &mut rc_taskbar);
+        if GetWindowRect(h_tray, &mut rc_tray).is_err() {
+            return None;
+        }
+        if GetWindowRect(h_taskbar, &mut rc_taskbar).is_err() {
+            return None;
+        }
 
         let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
         let scale = dpi as f64 / 96.0;
@@ -288,6 +285,28 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
         let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
         let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
 
+        Some((display_x, display_y, display_width, display_height))
+    }
+}
+
+unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
+    unsafe {
+        let (display_x, display_y, display_width, display_height) = match calc_widget_rect(hwnd) {
+            Some(rect) => rect,
+            None => {
+                show_error("Cannot find Shell_TrayWnd or TrayNotifyWnd");
+                return false;
+            }
+        };
+
+        let h_taskbar = match FindWindowW(w!("Shell_TrayWnd"), w!("")) {
+            Ok(h) => h,
+            Err(_) => {
+                show_error("Cannot find Shell_TrayWnd");
+                return false;
+            }
+        };
+
         let _ = SetParent(hwnd, Some(h_taskbar));
 
         SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
@@ -295,6 +314,7 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
         let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current_ex_style | (WS_EX_LAYERED.0 as isize));
 
+        // SWP_SHOWWINDOW: window may be newly created or after explorer restart
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOP),
@@ -314,39 +334,43 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
 }
 
 fn update_taskbar_position(hwnd: HWND) {
-    unsafe {
-        let h_taskbar = match FindWindowW(w!("Shell_TrayWnd"), w!("")) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let h_tray = match FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
+    thread_local! {
+        static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = std::cell::Cell::new(None);
+    }
 
-        let mut rc_tray = RECT::default();
-        let mut rc_taskbar = RECT::default();
-        let _ = GetWindowRect(h_tray, &mut rc_tray);
-        let _ = GetWindowRect(h_taskbar, &mut rc_taskbar);
+    let Some((display_x, display_y, display_width, display_height)) = calc_widget_rect(hwnd) else {
+        return;
+    };
 
-        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
-        let scale = dpi as f64 / 96.0;
-        let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
-        let display_height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
-        let gap = (GAP as f64 * scale).round() as i32;
+    let changed = LAST_RECT.with(|lp| {
+        match lp.get() {
+            Some((lx, ly, lw, lh))
+                if lx == display_x
+                    && ly == display_y
+                    && lw == display_width
+                    && lh == display_height =>
+            {
+                false
+            }
+            _ => {
+                lp.set(Some((display_x, display_y, display_width, display_height)));
+                true
+            }
+        }
+    });
 
-        let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
-        let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
-
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOP),
-            display_x,
-            display_y,
-            display_width,
-            display_height,
-            SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
+    if changed {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                display_x,
+                display_y,
+                display_width,
+                display_height,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER,
+            );
+        }
     }
 }
 
@@ -408,8 +432,8 @@ pub unsafe extern "system" fn wnd_proc(
                 match wparam.0 {
                     TIMER_ID_NETWORK => {
                         check_fullscreen(hwnd);
-                        update_taskbar_position(hwnd);
                         if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
+                            update_taskbar_position(hwnd);
                             collect_network();
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
