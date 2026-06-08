@@ -18,6 +18,21 @@ static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
 static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
 static MAIN_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+const RESP_BATTERY: u8 = 0x30;
+const RESP_DPI_MODE1: u8 = 0x61;
+const RESP_DPI_MODE2: u8 = 0x60;
+
+const OFFSET_RESPONSE_TYPE: usize = 1;
+const OFFSET_BATTERY_LEVEL: usize = 8;
+const OFFSET_BATTERY_CHARGING: usize = 9;
+const OFFSET_DPI_ACTIVE_MODE: usize = 8;
+const OFFSET_DPI_ACTIVE_STAGE: usize = 10;
+const DPI_MODE1_OFFSET: usize = 11;
+const DPI_MODE2_OFFSET: usize = 23;
+
+const ACTIVE_MODE_1: u32 = 1;
+const ACTIVE_MODE_2: u32 = 2;
+
 const BATTERY_CMD: [u8; 64] = {
     let mut cmd = [0u8; 64];
     cmd[0] = 0x55;
@@ -206,11 +221,11 @@ fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
     match device.read_timeout(&mut buf, 500) {
         Ok(n) if n >= 10 => {
             let base = find_base_offset(&buf[..n]).ok_or(())?;
-            if buf.len() < base + 10 || buf[base + 1] != 0x30 {
+            if buf.len() < base + 10 || buf[base + OFFSET_RESPONSE_TYPE] != RESP_BATTERY {
                 return Err(());
             }
-            let level = buf[base + 8] as u32;
-            let charging = buf[base + 9] != 0;
+            let level = buf[base + OFFSET_BATTERY_LEVEL] as u32;
+            let charging = buf[base + OFFSET_BATTERY_CHARGING] != 0;
             Ok((level.min(100), charging))
         }
         _ => Err(()),
@@ -235,24 +250,30 @@ fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
             }
             let d = &buf[base..];
 
-            if d[1] != 0x61 && d[1] != 0x60 {
+            if d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE1
+                && d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE2
+            {
                 return Err(());
             }
 
-            let active_mode: u32 = if d[8] == 0 { 2 } else { 1 };
-            let active_stage = (d[10] as usize).saturating_sub(1);
+            let active_mode: u32 = if d[OFFSET_DPI_ACTIVE_MODE] == 0 {
+                ACTIVE_MODE_2
+            } else {
+                ACTIVE_MODE_1
+            };
+            let active_stage = (d[OFFSET_DPI_ACTIVE_STAGE] as usize).saturating_sub(1);
 
-            let raw_dpi = if active_mode == 1 {
-                let offset = 11 + active_stage * 2;
+            let raw_dpi = if active_mode == ACTIVE_MODE_1 {
+                let offset = DPI_MODE1_OFFSET + active_stage * 2;
                 (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
             } else {
-                let offset = 23 + active_stage * 2;
+                let offset = DPI_MODE2_OFFSET + active_stage * 2;
                 (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
             };
 
             let mut dpi = (raw_dpi as f64 / DPI_SCALE_FACTOR).round() as u32;
 
-            if active_mode == 2 {
+            if active_mode == ACTIVE_MODE_2 {
                 dpi = ((dpi as f64 / 100.0).round() as u32) * 100;
             }
 
