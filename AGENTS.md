@@ -134,7 +134,7 @@ bun scripts/release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 
 
 - CPU：`GetSystemTimes`，首次调用初始化基线，后续计算差值，结果 `min(100)` 封顶
 - 内存：`GlobalMemoryStatusEx` 取 `dwMemoryLoad`
-- 网速：`GetIfTable2` + `FreeMibTable`，`is_physical_interface` 过滤 Ethernet（type 6）和 Wi-Fi（type 71）且 `PhysicalAddressLength > 0` 且 `HardwareInterface` 标志位（bit 0）为 true 且 `OperStatusUp` 的接口，速度差值 `min(u32::MAX)` 防溢出
+- 网速：`GetIfTable2` + `FreeMibTable`，`is_valid_interface` 过滤 Ethernet（type 6）和 Wi-Fi（type 71）且 `PhysicalAddressLength > 0` 且 `OperStatusUp` 的接口，速度差值 `min(u32::MAX)` 防溢出
 - `trim_working_set`：`SetProcessWorkingSetSize(usize::MAX, usize::MAX)`
 
 ## 共享状态
