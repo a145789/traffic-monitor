@@ -80,6 +80,7 @@ pub fn init(hwnd: HWND) {
 
 pub fn start_mouse_thread() -> thread::JoinHandle<()> {
     SHOULD_STOP.store(false, Ordering::Release);
+    FAIL_COUNT.store(0, Ordering::Relaxed);
     thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(|| {

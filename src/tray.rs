@@ -12,7 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use std::cell::RefCell;
-use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE};
+use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MENU_ID_RESTART_HID};
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 pub const MENU_ID_AUTOSTART: u32 = 1001;
@@ -159,11 +159,12 @@ pub fn show_context_menu(hwnd: HWND) {
         let _ = InsertMenuItemW(hmenu, 2, true, &autostart_item);
 
         // 4. Show mouse info
+        let show_mouse = SHOW_MOUSE_INFO.load(std::sync::atomic::Ordering::Relaxed);
         let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
         let mut mouse_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
             fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-            fState: if SHOW_MOUSE_INFO.load(std::sync::atomic::Ordering::Relaxed) {
+            fState: if show_mouse {
                 MFS_CHECKED
             } else {
                 MFS_UNCHECKED
@@ -174,7 +175,23 @@ pub fn show_context_menu(hwnd: HWND) {
         mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
         let _ = InsertMenuItemW(hmenu, 3, true, &mouse_item);
 
-        // 5. Exit
+        // 5. Restart HID (only visible when mouse info is shown)
+        let mut exit_pos = 4;
+        if show_mouse {
+            let restart_text: Vec<u16> = "重置鼠标\0".encode_utf16().collect();
+            let mut restart_item = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+                fState: MFS_UNCHECKED,
+                wID: MENU_ID_RESTART_HID,
+                ..Default::default()
+            };
+            restart_item.dwTypeData = PWSTR(restart_text.as_ptr() as *mut u16);
+            let _ = InsertMenuItemW(hmenu, 4, true, &restart_item);
+            exit_pos = 5;
+        }
+
+        // 6. Exit
         let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
         let mut exit_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -184,7 +201,7 @@ pub fn show_context_menu(hwnd: HWND) {
             ..Default::default()
         };
         exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
-        let _ = InsertMenuItemW(hmenu, 4, true, &exit_item);
+        let _ = InsertMenuItemW(hmenu, exit_pos, true, &exit_item);
 
         let _ = SetForegroundWindow(hwnd);
 
