@@ -26,7 +26,7 @@ pub const MENU_ID_EXIT: u32 = 1002;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 thread_local! {
-    static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = RefCell::new(None);
+    static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) };
 }
 
 pub fn register_window_class() -> Result<(), String> {
@@ -91,7 +91,7 @@ pub fn create_tray_icon(hwnd: HWND) {
     let hicon = unsafe {
         LoadIconW(
             Some(GetModuleHandleW(None).unwrap().into()),
-            PCWSTR(1 as *const u16),
+            PCWSTR(std::ptr::dangling::<u16>()),
         )
         .or_else(|_| LoadIconW(None, IDI_APPLICATION))
         .unwrap_or_default()

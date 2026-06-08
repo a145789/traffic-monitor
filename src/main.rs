@@ -75,8 +75,8 @@ struct POWERBROADCAST_SETTING {
 }
 
 thread_local! {
-    static RENDERER: RefCell<Option<Renderer>> = RefCell::new(None);
-    static MOUSE_THREAD: RefCell<Option<std::thread::JoinHandle<()>>> = RefCell::new(None);
+    static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
+    static MOUSE_THREAD: RefCell<Option<std::thread::JoinHandle<()>>> = const { RefCell::new(None) };
 }
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
@@ -260,24 +260,24 @@ fn quit_existing_instance() {
         )
     };
 
-    if let Ok(h) = hwnd {
-        if !h.is_invalid() {
-            // SAFETY: h 有效，PostMessageW 异步投递 WM_CLOSE 是线程安全的。
-            unsafe {
-                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                // SAFETY: class_name 仍在作用域内。
-                let exist = unsafe {
-                    FindWindowW(
-                        windows::core::PCWSTR(class_name.as_ptr()),
-                        windows::core::PCWSTR(std::ptr::null()),
-                    )
-                };
-                if exist.is_err() {
-                    break;
-                }
+    if let Ok(h) = hwnd
+        && !h.is_invalid()
+    {
+        // SAFETY: h 有效，PostMessageW 异步投递 WM_CLOSE 是线程安全的。
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: class_name 仍在作用域内。
+            let exist = unsafe {
+                FindWindowW(
+                    windows::core::PCWSTR(class_name.as_ptr()),
+                    windows::core::PCWSTR(std::ptr::null()),
+                )
+            };
+            if exist.is_err() {
+                break;
             }
         }
     }
@@ -491,7 +491,7 @@ fn embed_in_taskbar(hwnd: HWND) -> bool {
 
 fn update_taskbar_position(hwnd: HWND) {
     thread_local! {
-        static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = std::cell::Cell::new(None);
+        static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
     }
 
     let Some((display_x, display_y, display_width, display_height)) = calc_widget_rect(hwnd) else {
