@@ -10,6 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MIIM_FTYPE,
     MFS_CHECKED, MFS_UNCHECKED, MFS_DISABLED, MFT_SEPARATOR, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
 use std::cell::RefCell;
 use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MENU_ID_RESTART_HID};
@@ -79,7 +80,9 @@ pub fn create_main_window() -> Result<HWND, String> {
 
 pub fn create_tray_icon(hwnd: HWND) {
     unsafe {
-        let hicon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        let hicon = LoadIconW(Some(GetModuleHandleW(None).unwrap().into()), PCWSTR(1 as *const u16))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default();
 
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
