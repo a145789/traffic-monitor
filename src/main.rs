@@ -580,7 +580,7 @@ pub unsafe extern "system" fn wnd_proc(
                             if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1 {
                                 let monitor_on = setting_ref.Data[0] != 0;
                                 if monitor_on {
-                                    resume_system(hwnd, false);
+                                    resume_system(hwnd, true);
                                 } else {
                                     suspend_system(hwnd);
                                 }
