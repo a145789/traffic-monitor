@@ -386,3 +386,91 @@ fn toggle_autostart() {
         }
     }
 }
+
+pub fn load_show_mouse_info() -> bool {
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
+    };
+
+    let key_path: Vec<u16> = "Software\\Traffic Monitor\0".encode_utf16().collect();
+    let value_name: Vec<u16> = "ShowMouseInfo\0".encode_utf16().collect();
+    let mut hkey = Default::default();
+
+    let open_ok = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_ok()
+    };
+
+    if open_ok {
+        let _key_guard = RegKey::new(hkey);
+        let mut dword: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        let result = unsafe {
+            RegQueryValueExW(
+                hkey,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                None,
+                Some(&mut dword as *mut u32 as *mut u8),
+                Some(&mut size),
+            )
+        };
+        if result.is_ok() {
+            return dword != 0;
+        }
+    }
+
+    false
+}
+
+pub fn save_show_mouse_info(show: bool) {
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, RegCreateKeyExW,
+        RegSetValueExW,
+    };
+
+    let key_path: Vec<u16> = "Software\\Traffic Monitor\0".encode_utf16().collect();
+    let value_name: Vec<u16> = "ShowMouseInfo\0".encode_utf16().collect();
+    let mut hkey = Default::default();
+    let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
+
+    let open_ok = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            None,
+            Default::default(),
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            Some(&mut disposition),
+        )
+        .is_ok()
+    };
+
+    if open_ok {
+        let _key_guard = RegKey::new(hkey);
+        let dword: u32 = if show { 1 } else { 0 };
+
+        unsafe {
+            let _ = RegSetValueExW(
+                hkey,
+                PCWSTR(value_name.as_ptr()),
+                Some(0),
+                REG_DWORD,
+                Some(std::slice::from_raw_parts(
+                    &dword as *const u32 as *const u8,
+                    std::mem::size_of::<u32>(),
+                )),
+            );
+        }
+    }
+}
