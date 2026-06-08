@@ -14,6 +14,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
 use std::cell::RefCell;
 use crate::config::{APP_NAME, WINDOW_CLASS, WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MENU_ID_RESTART_HID};
+use crate::ffi_guard::{RegKey, MenuGuard};
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 pub const MENU_ID_AUTOSTART: u32 = 1001;
@@ -23,28 +24,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 thread_local! {
     static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = RefCell::new(None);
-}
-
-struct RegKey(windows::Win32::System::Registry::HKEY);
-
-impl Drop for RegKey {
-    fn drop(&mut self) {
-        // SAFETY: self.0 是有效注册表句柄，退出作用域时安全关闭。
-        unsafe {
-            let _ = windows::Win32::System::Registry::RegCloseKey(self.0);
-        }
-    }
-}
-
-struct MenuGuard(windows::Win32::UI::WindowsAndMessaging::HMENU);
-
-impl Drop for MenuGuard {
-    fn drop(&mut self) {
-        // SAFETY: self.0 是有效的菜单句柄，销毁它防止内存泄漏。
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(self.0);
-        }
-    }
 }
 
 pub fn register_window_class() -> Result<(), String> {
@@ -112,7 +91,9 @@ pub fn create_main_window() -> Result<HWND, String> {
 
 pub fn create_tray_icon(hwnd: HWND) {
     // SAFETY:
-    // 获取当前实例模块句柄，尝试加载资源 ID 为 1 的图标，若无则回退加载系统默认图标。
+    // 1. GetModuleHandleW(None) 在当前运行进程中总是能成功返回有效的 HMODULE 实例。
+    // 2. 1 as *const u16 是有效的资源标识常数。如果应用资源中不存在此图标，
+    //    则 LoadIconW 将返回错误，并能被 or_else 分支捕获，回退到安全的系统默认图标 IDI_APPLICATION，确保 hicon 的合法性。
     let hicon = unsafe {
         LoadIconW(Some(GetModuleHandleW(None).unwrap().into()), PCWSTR(1 as *const u16))
             .or_else(|_| LoadIconW(None, IDI_APPLICATION))
@@ -134,7 +115,8 @@ pub fn create_tray_icon(hwnd: HWND) {
     nid.szTip[..tip.len()].copy_from_slice(&tip);
 
     // SAFETY:
-    // nid 已被正确初始化。Shell_NotifyIconW 安全地添加系统托盘图标并设置其版本。
+    // nid 结构体的所有必要字段（包括 cbSize、hWnd、hIcon 等）在此前已经在当前作用域被完全初始化，
+    // 其生命周期在此函数调用期间仍然存在，因此将其引用传给 Shell_NotifyIconW 不会导致野指针或内存越界。
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         let _ = Shell_NotifyIconW(windows::Win32::UI::Shell::NIM_SETVERSION, &nid);
@@ -147,7 +129,9 @@ pub fn create_tray_icon(hwnd: HWND) {
 pub fn remove_tray_icon() {
     TRAY_DATA.with(|t| {
         if let Some(nid) = t.borrow().as_ref() {
-            // SAFETY: nid 为此前由主线程创建并管理的合法托盘图标信息结构体，在此安全删除。
+            // SAFETY:
+            // nid 为先前由 create_tray_icon 成功添加且在 TRAY_DATA 静态变量中合法持有的托盘数据。
+            // 它的生存周期依然存在，将它的引用传递给 Shell_NotifyIconW 执行 NIM_DELETE 操作是完全安全的。
             unsafe {
                 let _ = Shell_NotifyIconW(NIM_DELETE, nid);
             }
@@ -157,12 +141,12 @@ pub fn remove_tray_icon() {
 
 pub fn show_context_menu(hwnd: HWND) {
     let mut point = POINT::default();
-    // SAFETY: 获取当前鼠标坐标并存入 point 中。
+    // SAFETY: 传入指向栈上分配的 POINT 结构体可变指针，GetCursorPos 保证写入有效的鼠标屏幕坐标，不会发生越界或写入未初始化内存。
     unsafe {
         let _ = GetCursorPos(&mut point);
     }
 
-    // SAFETY: 创建一个弹出菜单。
+    // SAFETY: CreatePopupMenu 在不需要特殊参数的情况下请求操作系统分配一个空菜单资源，其句柄在成功时被 wrap 并通过 MenuGuard 自动生命周期释放，保证无悬空指针或资源泄漏。
     let hmenu = unsafe { CreatePopupMenu().unwrap() };
     let _menu_guard = MenuGuard(hmenu);
 
@@ -178,7 +162,7 @@ pub fn show_context_menu(hwnd: HWND) {
     };
     version_item.dwTypeData = PWSTR(version_text.as_ptr() as *mut u16);
     
-    // SAFETY: 插入版本菜单项。
+    // SAFETY: hmenu 是有效的弹出菜单句柄。version_item 已被正确初始化，其中 dwTypeData 指向在栈上生存周期内（此函数内）有效的 version_text 缓冲区的常数指针，符合 InsertMenuItemW 的生存期要求。
     unsafe {
         let _ = InsertMenuItemW(hmenu, 0, true, &version_item);
     }
@@ -191,7 +175,7 @@ pub fn show_context_menu(hwnd: HWND) {
         ..Default::default()
     };
     
-    // SAFETY: 插入分隔线项。
+    // SAFETY: sep_item 结构体 cbSize 已设置正确，且只指定了分隔线类型，不需要其他的缓冲区资源，将其传给 InsertMenuItemW 是完全安全的。
     unsafe {
         let _ = InsertMenuItemW(hmenu, 1, true, &sep_item);
     }
@@ -211,7 +195,7 @@ pub fn show_context_menu(hwnd: HWND) {
     };
     autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
     
-    // SAFETY: 插入自启项。
+    // SAFETY: autostart_item 结构体已成功填充，且 dwTypeData 指向在本函数周期内有效的 autostart_text 缓冲区，调用 InsertMenuItemW 安全。
     unsafe {
         let _ = InsertMenuItemW(hmenu, 2, true, &autostart_item);
     }
@@ -232,7 +216,7 @@ pub fn show_context_menu(hwnd: HWND) {
     };
     mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
     
-    // SAFETY: 插入显示鼠标信息项。
+    // SAFETY: mouse_item 结构体已成功填充，dwTypeData 指向在当前作用域有效的 mouse_text 缓冲区，调用 InsertMenuItemW 安全。
     unsafe {
         let _ = InsertMenuItemW(hmenu, 3, true, &mouse_item);
     }
@@ -250,7 +234,7 @@ pub fn show_context_menu(hwnd: HWND) {
         };
         restart_item.dwTypeData = PWSTR(restart_text.as_ptr() as *mut u16);
         
-        // SAFETY: 插入重置鼠标项。
+        // SAFETY: restart_item 已成功填充，dwTypeData 指向在当前作用域内有效且以 NUL 结尾的 restart_text 缓冲区。
         unsafe {
             let _ = InsertMenuItemW(hmenu, 4, true, &restart_item);
         }
@@ -268,14 +252,16 @@ pub fn show_context_menu(hwnd: HWND) {
     };
     exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
     
-    // SAFETY: 插入退出项。
+    // SAFETY: exit_item 结构体初始化正确，dwTypeData 指向有效的 exit_text 缓冲区，符合 InsertMenuItemW 的规范。
     unsafe {
         let _ = InsertMenuItemW(hmenu, exit_pos, true, &exit_item);
     }
 
     // SAFETY:
-    // 将指定窗口设为前台活动窗口。
-    // 在指定位置跟踪托盘菜单并捕获用户的点击，hmenu 已通过 MenuGuard 实现 RAII 自动释放。
+    // 1. hwnd 是有效的窗口句柄。
+    // 2. point 是 GetCursorPos 初始化的有效屏幕坐标。
+    // 3. hmenu 是成功创建的有效菜单句柄。
+    // 该函数在调用 TrackPopupMenu 前调用 SetForegroundWindow 确保菜单弹出后能正常处理键盘/鼠标焦点消息。
     unsafe {
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(
@@ -288,15 +274,15 @@ pub fn show_context_menu(hwnd: HWND) {
             None,
         );
     }
+    
+    drop(_menu_guard);
 }
 
 pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
     match item_id {
         MENU_ID_AUTOSTART => toggle_autostart(),
         MENU_ID_EXIT => {
-            // SAFETY:
-            // hwnd 是由主窗口实例传递过来的有效窗口句柄。
-            // PostMessageW 发送 WM_CLOSE 消息是安全的。
+            // SAFETY: hwnd 是从主窗口传来的有效 HWND 句柄，使用 PostMessageW 异步发送 WM_CLOSE 消息是线程安全的，操作系统会将该消息排入对应的消息队列。
             unsafe {
                 let _ = PostMessageW(
                     Some(hwnd),
@@ -322,9 +308,9 @@ fn is_autostart_enabled() -> bool {
     let mut hkey = Default::default();
 
     // SAFETY:
-    // HKEY_CURRENT_USER 是预定义的根键。
-    // key_path 是以 NUL 结尾的宽字符数组。
-    // 打开的注册表项句柄将被存入 hkey 并通过 RegKey 自动进行生命周期释放（RAII）。
+    // 1. HKEY_CURRENT_USER 是有效的系统注册表根键。
+    // 2. key_path 是已处理且以 NUL 结尾的宽字符指针，保证 Windows API 正确读取子键路径。
+    // 3. 将栈上分配的 hkey 变量的可变地址传给 RegOpenKeyExW，一旦成功，其句柄被 RegKey 管理，确保即使发生异常也能 RAII 清理句柄。
     let open_ok = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -342,8 +328,9 @@ fn is_autostart_enabled() -> bool {
         let mut buf_size = buf.len() as u32;
         
         // SAFETY:
-        // hkey 是成功打开的键句柄，value_name 是以 NUL 结尾的宽字符数组。
-        // 缓冲区 buf 的指针和长度变量均合法，操作系统向其填充值，在该调用期间是安全的。
+        // 1. hkey 是先前成功打开的合法注册表键句柄。
+        // 2. value_name 是以 NUL 结尾的有效宽字符串指针。
+        // 3. buf 和 buf_size 设置合理，RegQueryValueExW 写入数据的字节数不会超过 buf 的固定容量 512，防止溢出。
         let result = unsafe {
             RegQueryValueExW(
                 hkey,
@@ -372,8 +359,9 @@ fn toggle_autostart() {
     let mut hkey = Default::default();
 
     // SAFETY:
-    // 使用有效的预定义根键和以 NUL 结尾的子键名称路径打开注册表键。
-    // 成功打开后将其句柄保存在 hkey 并通过 RegKey 进行 RAII 自动关闭。
+    // 1. HKEY_CURRENT_USER 为预定义的合法根键。
+    // 2. key_path 已转换为以 NUL 结尾的宽字符串，确保传入 RegOpenKeyExW 的路径有效。
+    // 3. 栈上的 hkey 在此函数中保持有效，成功后由 RegKey 管理其 RAII 生命周期，防止句柄泄露。
     let open_ok = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,

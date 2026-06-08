@@ -15,6 +15,7 @@ use crate::config::{
     NET_SPEED_DOWN, NET_SPEED_UP, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_IS_CHARGING,
     SHOW_MOUSE_INFO,
 };
+use crate::ffi_guard::RegKey;
 
 pub struct Renderer {
     hdc_mem: HDC,
@@ -41,7 +42,7 @@ impl Renderer {
         let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
         
         // SAFETY:
-        // hdc_screen 是有效句柄。创建与其格式兼容 of HBITMAP 资源。
+        // hdc_screen 是有效句柄。创建与 hdc_screen 格式兼容的 HBITMAP 资源。
         let hbitmap = unsafe { CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT) };
         
         // SAFETY:
@@ -371,29 +372,29 @@ impl Renderer {
     }
 
     pub fn update_dpi(&mut self, hwnd: HWND) {
-        // SAFETY: GetDpiForWindow 获取特定有效窗口的 DPI 数值。
+        // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用 GetDpiForWindow 是安全的，无跨进程非法访问问题。
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
         let scale = dpi as f64 / 96.0;
         let width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
         let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
 
         // 1. 创建符合新大小的 Compatible Bitmap
-        // SAFETY: null_mut 句柄用于获取主屏幕上下文句柄。
+        // SAFETY: 传入 NULL 句柄给 GetWindowDC 用于临时获取整个主屏幕屏幕设备的 HDC 上下文，这在 GDI 绘图中是标准且安全的常规操作。
         let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
         
-        // SAFETY: hdc_screen 为有效句柄，创建兼容的位图资源。
+        // SAFETY: hdc_screen 是先前成功获取的屏幕设备有效 HDC，使用其兼容格式和合理宽高参数创建位图，不会引发越界分配。
         let new_bitmap = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
         
-        // SAFETY: 释放临时获取的屏幕上下文。
+        // SAFETY: 临时获取的屏幕 hdc_screen 不再需要使用，调用 ReleaseDC 归还系统资源以防止 HDC 资源泄露。
         unsafe {
             let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
         }
 
         // 2. 将新位图选入内存 DC，销毁旧位图
         if !new_bitmap.is_invalid() {
-            // SAFETY: self.hdc_mem 和 new_bitmap 均有效。
+            // SAFETY: self.hdc_mem 是在 Renderer 初始化时成功创建的内存设备上下文，new_bitmap 是通过 CreateCompatibleBitmap 分配成功的有效句柄，在此将新位图选入设备上下文是内存安全的。
             let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.into()) };
-            // SAFETY: 销毁原有的旧位图 GDI 对象。
+            // SAFETY: 选出内存上下文的旧位图 old_bitmap 不再需要使用，调用 DeleteObject 释放其底层 GDI 资源是内存安全的。
             unsafe {
                 let _ = DeleteObject(old_bitmap.into());
             }
@@ -404,9 +405,9 @@ impl Renderer {
         let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
         let new_font = create_font(font_size);
         if !new_font.is_invalid() {
-            // SAFETY: 将新创建的有效字体选入内存设备上下文。
+            // SAFETY: new_font 是新分配的合法字体对象，选入当前内存设备上下文 self.hdc_mem 不会发生资源冲突。
             let old_font = unsafe { SelectObject(self.hdc_mem, new_font.into()) };
-            // SAFETY: 销毁旧字体 GDI 对象。
+            // SAFETY: 替换出的旧字体对象已无其他地方引用，在此销毁它以防止内存和 GDI 资源泄漏。
             unsafe {
                 let _ = DeleteObject(old_font.into());
             }
@@ -418,7 +419,7 @@ impl Renderer {
         self.width = width;
         self.height = height;
 
-        // SAFETY: 设置背景透明模式。
+        // SAFETY: self.hdc_mem 为当前实例中持有的有效内存设备上下文，设置其背景模式为 TRANSPARENT 可使得 TextOut 等绘制不填充背景，是无副作用的安全调用。
         unsafe {
             let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
         }
@@ -441,8 +442,8 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         // SAFETY:
-        // 在销毁内存上下文和位图前，必须还原最初选入上下文的 GDI 备用对象以防止泄露。
-        // 调用 DeleteObject 和 DeleteDC 安全释放被结构体持有的 GDI 资源。
+        // 1. self.hdc_mem 是有效持有的内存设备上下文，还原最初选入上下文的备用 GDI 对象 self.old_bitmap 和 self.old_font 能避免还原默认 GDI 对象时的泄露。
+        // 2. 所持有的 HFONT、HBITMAP、HBRUSH 句柄均由当前结构体独占，使用 DeleteObject 和 DeleteDC 销毁它们可安全归还系统图形资源。
         unsafe {
             let _ = SelectObject(self.hdc_mem, self.old_bitmap);
             let _ = SelectObject(self.hdc_mem, self.old_font);
@@ -465,8 +466,8 @@ fn create_font(size: i32) -> HFONT {
     let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
     lf.lfFaceName[..font_name.len()].copy_from_slice(&font_name);
     // SAFETY:
-    // lf 结构体已由 safe 代码完整地被初始化并复制了以 NUL 结尾的字体名称。
-    // 调用 CreateFontIndirectW 从逻辑上返回一个有效的字体句柄或包含无效句柄。
+    // 1. lf 已经过完整的零初始化且 lfFaceName 被安全地写入了以 NUL 结尾的 "Segoe UI" 宽字符序列，避免了非法内存溢出。
+    // 2. 传入 LOGFONTW 结构体的指针给 CreateFontIndirectW 调用是内存安全的，返回的 HFONT 句柄所有权将被返回并交由外部进行清理。
     unsafe { CreateFontIndirectW(&lf) }
 }
 
@@ -484,16 +485,6 @@ fn format_speed(bytes_per_sec: u32) -> String {
     }
 }
 
-struct RegKey(windows::Win32::System::Registry::HKEY);
-
-impl Drop for RegKey {
-    fn drop(&mut self) {
-        // SAFETY: self.0 是由 RegOpenKeyExW 成功打开的有效注册表句柄，在析构时安全关闭。
-        unsafe {
-            let _ = windows::Win32::System::Registry::RegCloseKey(self.0);
-        }
-    }
-}
 
 pub fn is_system_light_theme() -> bool {
     use windows::Win32::System::Registry::{
@@ -508,8 +499,9 @@ pub fn is_system_light_theme() -> bool {
     let mut hkey = Default::default();
 
     // SAFETY:
-    // HKEY_CURRENT_USER 是预定义的有效注册表根键。
-    // key_path 指向以 NUL 结尾的宽字符数组，RegOpenKeyExW 会安全地打开子键并把句柄存入 hkey 中。
+    // 1. HKEY_CURRENT_USER 是预定义且系统保证有效的注册表根键。
+    // 2. key_path 已转换为以 NUL 结尾的 UTF-16 宽字符数组，确保传入 RegOpenKeyExW 的路径在调用期间内存合法。
+    // 3. 栈上 hkey 变量的地址合法，成功打开的句柄将通过 RegKey 进行 RAII 自动生命周期释放。
     let open_ok = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -527,9 +519,9 @@ pub fn is_system_light_theme() -> bool {
         let mut value_size = std::mem::size_of::<u32>() as u32;
 
         // SAFETY:
-        // hkey 是已成功打开的注册表子键句柄。
-        // value_name 指向有效的以 NUL 结尾的宽字符数组。
-        // value_size 和 value 的内存地址均有效且对齐，在调用期间由系统写入数值，在生命周期上是安全的。
+        // 1. hkey 是先前成功打开的合法键句柄。
+        // 2. value_name 指向以 NUL 结尾的合法宽字符数组指针。
+        // 3. value_size 初始化为 value (u32) 的大小 4 字节，系统在写入时不会发生缓冲区溢出，内存访问是完全合法的。
         let query_ok = unsafe {
             RegQueryValueExW(
                 hkey,

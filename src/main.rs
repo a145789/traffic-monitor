@@ -2,6 +2,7 @@
 
 mod collector;
 mod config;
+mod ffi_guard;
 mod mouse_hid;
 mod renderer;
 mod tray;
@@ -9,7 +10,7 @@ mod tray;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM, GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::Power::{
     RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
@@ -69,17 +70,7 @@ thread_local! {
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
-struct MutexGuard(windows::Win32::Foundation::HANDLE);
-impl Drop for MutexGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            // SAFETY: self.0 是由 CreateMutexW 成功创建的有效互斥量句柄，在生命周期结束时自动关闭。
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(self.0);
-            }
-        }
-    }
-}
+// MutexGuard 定义已提取至 ffi_guard 模块中进行共用。
 
 fn show_error(msg: &str) {
     let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
@@ -183,7 +174,7 @@ fn check_fullscreen(hwnd: HWND) {
         let was = FULLSCREEN.load(Ordering::Acquire);
         if was {
             FULLSCREEN.store(false, Ordering::Release);
-            // SAFETY: 重新启动 CPU/内存监测定时器。
+            // SAFETY: hwnd 是当前进程所持有并处于活动状态的有效主窗口句柄，重新启动此线程关联的定时器不会引发未定义行为。
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             }
@@ -198,10 +189,10 @@ fn check_fullscreen(hwnd: HWND) {
     }
 
     let mut rect = RECT::default();
-    // SAFETY: foreground 是有效的窗口句柄，GetWindowRect 能够安全地获取其屏幕矩形。
+    // SAFETY: foreground 是经过有效性校验的非空 HWND 句柄，传入栈上分配的可变 RECT 引用，GetWindowRect 会安全地填充矩形坐标，不存在溢出或越界写入风险。
     let _ = unsafe { GetWindowRect(foreground, &mut rect) };
     
-    // SAFETY: 获取系统主显示器分辨率参数。
+    // SAFETY: GetSystemMetrics 查询系统分辨率常量，在任何状态下均是线程安全且无副作用的。
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let is_full = (rect.right - rect.left) == screen_w
@@ -211,13 +202,13 @@ fn check_fullscreen(hwnd: HWND) {
     FULLSCREEN.store(is_full, Ordering::Release);
 
     if is_full && !was {
-        // SAFETY: 前台程序全屏，安全暂停定时器与鼠标轮询。
+        // SAFETY: hwnd 是有效的窗口句柄，在此安全销毁与该窗口及当前线程关联的 CPU/内存定时器以节省 CPU 资源。
         unsafe {
             KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         }
         stop_and_join_mouse_thread();
     } else if !is_full && was {
-        // SAFETY: 恢复定时器。
+        // SAFETY: hwnd 是有效的主窗口句柄，在此重新创建与当前消息队列关联的定时器是内存安全的。
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
         }
@@ -232,7 +223,7 @@ fn check_fullscreen(hwnd: HWND) {
 
 fn quit_existing_instance() {
     let class_name: Vec<u16> = crate::config::WINDOW_CLASS.encode_utf16().collect();
-    // SAFETY: 查找先前已经创建且运行着的实例窗口句柄。
+    // SAFETY: class_name 宽字符向量已正确分配且在当前作用域内有效。调用 FindWindowW 查询同名类窗口不会修改系统状态或导致非法内存访问。
     let hwnd = unsafe {
         FindWindowW(
             windows::core::PCWSTR(class_name.as_ptr()),
@@ -242,13 +233,13 @@ fn quit_existing_instance() {
 
     if let Ok(h) = hwnd {
         if !h.is_invalid() {
-            // SAFETY: 发送 WM_CLOSE 消息退出之前的进程实例。
+            // SAFETY: h 是已验证非空的有效窗口句柄，调用 PostMessageW 异步投递退出消息是线程安全的。
             unsafe {
                 let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
             for _ in 0..50 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                // SAFETY: 检测原先窗口是否已经被注销。
+                // SAFETY: class_name 宽字符向量依然在当前生命周期内，重复查找窗口无内存安全隐患。
                 let exist = unsafe {
                     FindWindowW(
                         windows::core::PCWSTR(class_name.as_ptr()),
@@ -273,21 +264,20 @@ fn main() {
     let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
     
     // SAFETY:
-    // 创建全局命名的进程互斥体，用于单例模式运行检测。
+    // 1. mutex_name 已经在栈上被合法初始化且以 NUL 结尾。
+    // 2. CreateMutexW 将返回一个合法的句柄或错误，该句柄被安全地交由 ffi_guard::MutexGuard 进行 RAII 生命周期管理。
     let mutex_handle = unsafe {
         CreateMutexW(None, true, windows::core::PCWSTR(mutex_name.as_ptr()))
     };
     
     let _mutex_guard = match mutex_handle {
         Ok(handle) => {
-            // SAFETY: 如果互斥量已存在，关闭句柄并立即退出。
+            let guard = crate::ffi_guard::MutexGuard(handle);
+            // SAFETY: 如果互斥量已存在，直接返回，退出时由 guard 的 Drop 自动释放该句柄（RAII）。
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
                 return;
             }
-            MutexGuard(handle)
+            guard
         }
         Err(_) => {
             show_error("Failed to create mutex");
@@ -311,11 +301,11 @@ fn main() {
     mouse_hid::init(hwnd);
     init_network_listener(hwnd);
 
-    // SAFETY: 注册 explorer 重启的系统全局窗口消息。
+    // SAFETY: "TaskbarCreated" 是 Windows 系统约定俗成的常量字符串，调用 RegisterWindowMessageW 注册消息在进程生命周期内是安全且无副作用的。
     let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::Release);
 
-    // SAFETY: 注册系统电源电源通知。
+    // SAFETY: hwnd 是已创建的主窗口句柄，GUID_MONITOR_POWER_ON 引用系统自带的静态 GUID。此处安全注册通知以响应系统休眠/恢复唤醒等事件。
     let power_notify = unsafe {
         RegisterPowerSettingNotification(
             HANDLE(hwnd.0),
@@ -345,12 +335,12 @@ fn main() {
         }
     });
 
-    // SAFETY: 使窗口矩形失效以触发 WM_PAINT 绘制。
+    // SAFETY: hwnd 为当前活动的主窗口句柄，InvalidateRect 会通知 OS 将该窗口区域标记为待重绘，属于安全的 UI 刷新行为。
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
-    // SAFETY: 设置定时器。
+    // SAFETY: hwnd 是有效的 HWND，在此安全创建与该窗口生命周期和消息循环绑定的周期性定时器，不会导致越界或竞争。
     unsafe {
         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
@@ -362,14 +352,14 @@ fn main() {
         });
     }
 
-    // SAFETY: 注册当前窗口的终端会话锁定/解锁通知。
+    // SAFETY: hwnd 为有效的主窗口句柄，注册此通知让窗口能合法地接收 WTS 锁定/解锁消息，是进程安全的。
     unsafe {
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
     }
 
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     
-    // SAFETY: 运行标准的 Windows 消息循环。
+    // SAFETY: msg 已经过默认分配。GetMessageW 会阻塞等待消息，由 TranslateMessage 和 DispatchMessageW 调度派发，消息队列由操作系统管理，不违反内存安全。
     unsafe {
         while windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0).into() {
             let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
@@ -379,14 +369,14 @@ fn main() {
 
     stop_and_join_mouse_thread();
     
-    // SAFETY: 注销会话锁通知。
+    // SAFETY: hwnd 是当前正在注销的主窗口句柄，在其生命周期内注销此前成功注册的通知是完全安全的。
     unsafe {
         let _ = WTSUnRegisterSessionNotification(hwnd);
     }
 
     let power_handle = POWER_NOTIFY_HANDLE.load(Ordering::Acquire);
     if power_handle != 0 {
-        // SAFETY: 注销电源广播通知。
+        // SAFETY: 注销先前通过 RegisterPowerSettingNotification 成功创建的电源通知句柄，属于正常的系统资源回收。
         unsafe {
             let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(power_handle));
         }
@@ -398,19 +388,19 @@ fn main() {
 }
 
 fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
-    // SAFETY: 寻找任务栏的 Shell 窗口和 TrayNotify 窗口。
+    // SAFETY: FindWindowW 和 FindWindowExW 传入系统内置约定的宽字符常量（"Shell_TrayWnd" 和 "TrayNotifyWnd"）以寻找桌面任务栏窗口，调用本身不会危害系统内存安全，如窗口不存在则安全返回 None。
     let h_taskbar = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok()? };
     let h_tray = unsafe { FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")).ok()? };
 
     let mut rc_tray = RECT::default();
     let mut rc_taskbar = RECT::default();
-    // SAFETY: 获取相应窗口的屏幕坐标矩形。
+    // SAFETY: h_tray 和 h_taskbar 已在上面被校验成功，传入的 RECT 变量在当前栈帧内分配，由 GetWindowRect 安全填充，无越界读取。
     unsafe {
         GetWindowRect(h_tray, &mut rc_tray).ok()?;
         GetWindowRect(h_taskbar, &mut rc_taskbar).ok()?;
     }
 
-    // SAFETY: 获取当前窗口的 DPI 参数。
+    // SAFETY: hwnd 是当前进程内创建的合法窗口，调用 GetDpiForWindow 能安全地返回对应的 DPI，无跨进程非法访问问题。
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
     let scale = dpi as f64 / 96.0;
     let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
@@ -432,7 +422,7 @@ fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     };
 
-    // SAFETY: 寻找 Shell_TrayWnd。
+    // SAFETY: 传入系统约定的宽字符类名 "Shell_TrayWnd" 获取系统任务栏句柄，如果不存在会安全地返回错误，不影响内存安全性。
     let h_taskbar = match unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")) } {
         Ok(h) => h,
         Err(_) => {
@@ -506,7 +496,7 @@ fn update_taskbar_position(hwnd: HWND) {
     });
 
     if changed {
-        // SAFETY: 当检测到任务栏图标被增减或分辨率变化导致坐标需要修正时，安全移动窗口。
+        // SAFETY: hwnd 为当前主窗口句柄，SWP_NOZORDER 避免调整窗口层级，新计算的位置 display_x / display_y 分辨率兼容且正确，在此安全调整窗口尺寸和坐标。
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -533,7 +523,7 @@ pub extern "system" fn wnd_proc(
     let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
     if msg == tcm && tcm != 0 {
         remove_tray_icon();
-        // SAFETY: 隐藏当前窗口。
+        // SAFETY: hwnd 为当前主窗口，使用 SW_HIDE 改变其可见性，属于常规无副作用的 UI 控件状态调整。
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -546,12 +536,12 @@ pub extern "system" fn wnd_proc(
                 }
             });
             
-            // SAFETY: 设置定时器。
+            // SAFETY: hwnd 是已创建并在此线程运行的有效 HWND 句柄，安全重新启动其消息循环关联的网络定时器。
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
             }
             if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
-                // SAFETY: 设置硬件读取定时器。
+                // SAFETY: hwnd 是有效主窗口，在此重新启动 CPU/内存定时器。
                 unsafe {
                     let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
                 }
@@ -574,14 +564,14 @@ pub extern "system" fn wnd_proc(
 
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            // SAFETY: 传入 hwnd 获得该窗口绘图上下文并将其传给 renderer 进行双缓冲绘制。
+            // SAFETY: hwnd 是当前线程所拥有的主窗口句柄，ps 在栈上分配，由 BeginPaint 返回与当前绘图关联的有效 HDC。
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             RENDERER.with(|r| {
                 if let Some(renderer) = r.borrow().as_ref() {
                     renderer.render(hdc);
                 }
             });
-            // SAFETY: 安全终止绘制过程。
+            // SAFETY: hwnd 与 ps 已在前文中进行有效关联，调用 EndPaint 结束当前的绘图操作并归还 HDC。
             unsafe {
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -595,7 +585,7 @@ pub extern "system" fn wnd_proc(
                     if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
                         update_taskbar_position(hwnd);
                         collect_network();
-                        // SAFETY: 触发窗口重绘刷新网速数值。
+                        // SAFETY: hwnd 是有效主窗口，通过 InvalidateRect 投递 WM_PAINT 以在下一帧渲染中刷新网速的文本。
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -605,7 +595,7 @@ pub extern "system" fn wnd_proc(
                     if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
                         collect_cpu();
                         collect_memory();
-                        // SAFETY: 触发窗口重绘刷新硬件数值。
+                        // SAFETY: hwnd 是有效主窗口，InvalidateRect 安全促使窗口区域失效以重新绘制更新后的 CPU/内存等硬件数值。
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -617,7 +607,7 @@ pub extern "system" fn wnd_proc(
         }
 
         WM_USER_MOUSE_UPDATE | WM_USER_MOUSE_STATUS => {
-            // SAFETY: 触发主窗口重绘以显示更新后或下线的鼠标 DPI/电量。
+            // SAFETY: hwnd 是有效主窗口，InvalidateRect 会通知系统区域失效，以便重绘显示最新的鼠标 DPI / 电量等参数。
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -626,7 +616,7 @@ pub extern "system" fn wnd_proc(
 
         WM_USER_NETWORK_DISCONNECTED => {
             if !SUSPENDED.load(Ordering::Acquire) {
-                // SAFETY: 发生零流量退避，定时器降频为 backoff 时间间隔。
+                // SAFETY: hwnd 是本线程管理的有效主窗口句柄，重新配置 TIMER_ID_NETWORK 以应用较长的退避时间间隔，属于正常的定时器周期修改。
                 unsafe {
                     let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF, None);
                 }
@@ -638,7 +628,7 @@ pub extern "system" fn wnd_proc(
             NETWORK_BACKOFF.store(false, Ordering::Release);
             CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
             if !SUSPENDED.load(Ordering::Acquire) {
-                // SAFETY: 流量恢复，设置定时器为原本的 1000ms 默认间隔。
+                // SAFETY: hwnd 是本线程管理的有效主窗口句柄，重新配置 TIMER_ID_NETWORK 为默认网速采集频度以恢复采集速率。
                 unsafe {
                     let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
                 }
@@ -679,8 +669,9 @@ pub extern "system" fn wnd_proc(
                     let setting = lparam.0 as *const POWERBROADCAST_SETTING;
                     if !setting.is_null() {
                         // SAFETY:
-                        // 当 wparam 为 PBT_POWERSETTINGCHANGE 时，OS 保证其 lparam 为有效的
-                        // POWERBROADCAST_SETTING 指针。检测 DataLength 长度后解引用 Data 数据是安全的。
+                        // 当 msg 为 WM_POWERBROADCAST 且 wparam 为 PBT_POWERSETTINGCHANGE 时，
+                        // 操作系统在 LPARAM 参数中传递合法的、只读的 POWERBROADCAST_SETTING 结构体指针。
+                        // 对该指针进行非空检查后解引用，并限定 DataLength 范围，是内存安全的。
                         let setting_ref = unsafe { &*setting };
                         if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1 {
                             let monitor_on = setting_ref.Data[0] != 0;
@@ -713,7 +704,7 @@ pub extern "system" fn wnd_proc(
         WM_CLOSE => {
             remove_tray_icon();
             stop_mouse_thread();
-            // SAFETY: 发送退出信号终止 GetMessageW 消息泵。
+            // SAFETY: PostQuitMessage(0) 属于常规线程退出信号投递，向当前线程投递 WM_QUIT 消息，由操作系统负责后续清理，调用安全。
             unsafe {
                 PostQuitMessage(0);
             }
@@ -731,7 +722,7 @@ pub extern "system" fn wnd_proc(
                         MOUSE_THREAD.with(|m| {
                             *m.borrow_mut() = Some(start_mouse_thread());
                         });
-                        // SAFETY: 触发重画。
+                        // SAFETY: hwnd 为当前主窗口句柄，InvalidateRect 重新渲染以展现新的鼠标信息展示栏。
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -742,7 +733,7 @@ pub extern "system" fn wnd_proc(
                     SHOW_MOUSE_INFO.store(false, Ordering::Release);
                     stop_and_join_mouse_thread();
                     MOUSE_ONLINE.store(false, Ordering::Release);
-                    // SAFETY: 触发重画。
+                    // SAFETY: hwnd 为当前主窗口，InvalidateRect 清理鼠标展示区域。
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -756,7 +747,7 @@ pub extern "system" fn wnd_proc(
                     MOUSE_THREAD.with(|m| {
                         *m.borrow_mut() = Some(start_mouse_thread());
                     });
-                    // SAFETY: 触发重画。
+                    // SAFETY: hwnd 为当前主窗口，通过 InvalidateRect 在重新启动 HID 线程后刷新界面。
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -775,7 +766,7 @@ pub extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
-        // SAFETY: 交由默认过程处理消息。
+        // SAFETY: 将未处理的常规消息转发给 DefWindowProcW 进行系统默认生命周期处理，不会导致内存泄露或未定义行为。
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
