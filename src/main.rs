@@ -7,10 +7,15 @@ mod renderer;
 mod tray;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Power::{
+    RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+    HPOWERNOTIFY,
+};
+use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT,
 };
@@ -29,15 +34,30 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 
-use crate::collector::{collect_cpu, collect_memory, collect_network, trim_working_set};
+use crate::collector::{collect_cpu, collect_memory, collect_network, init_network_listener, trim_working_set,
+    WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, FULLSCREEN, GAP, SUSPENDED,
-    TIMER_ID_CPU_MEM, TIMER_ID_NETWORK, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MENU_ID_RESTART_HID, MOUSE_ONLINE,
-    MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
+    TIMER_ID_CPU_MEM, TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
+    SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MENU_ID_RESTART_HID, MOUSE_ONLINE,
+    MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, NETWORK_BACKOFF, CONSECUTIVE_ZERO_COUNT,
 };
 use crate::mouse_hid::{start_mouse_thread, stop_mouse_thread, check_mouse_available, WM_USER_MOUSE_UPDATE, WM_USER_MOUSE_STATUS};
 use crate::renderer::Renderer;
 use crate::tray::{create_main_window, create_tray_icon, register_window_class, remove_tray_icon, WM_APP_TRAY};
+
+const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
+const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 1;
+
+const GUID_MONITOR_POWER_ON: windows::core::GUID = windows::core::GUID::from_u128(0x0273b28b2d604396a078d5f143136a7e);
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct POWERBROADCAST_SETTING {
+    PowerSetting: windows::core::GUID,
+    DataLength: u32,
+    Data: [u8; 1],
+}
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = RefCell::new(None);
@@ -45,6 +65,7 @@ thread_local! {
 }
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 fn show_error(msg: &str) {
     unsafe {
@@ -67,6 +88,31 @@ fn stop_and_join_mouse_thread() {
         }
     });
     trim_working_set();
+}
+
+fn suspend_system(hwnd: HWND) {
+    SUSPENDED.store(true, Ordering::Relaxed);
+    unsafe {
+        KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
+        KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
+    }
+    stop_and_join_mouse_thread();
+}
+
+fn resume_system(hwnd: HWND) {
+    SUSPENDED.store(false, Ordering::Relaxed);
+    CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
+    NETWORK_BACKOFF.store(false, Ordering::Relaxed);
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
+        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+    }
+    if SHOW_MOUSE_INFO.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
+        stop_and_join_mouse_thread();
+        MOUSE_THREAD.with(|m| {
+            *m.borrow_mut() = Some(start_mouse_thread());
+        });
+    }
 }
 
 fn is_immersive_color_set(lparam: LPARAM) -> bool {
@@ -169,7 +215,6 @@ fn main() {
     }
 
     unsafe {
-        // Enforce single instance via named Mutex
         let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
         let mutex_handle = CreateMutexW(None, true, windows::core::PCWSTR(mutex_name.as_ptr()));
         if let Ok(handle) = mutex_handle {
@@ -202,8 +247,17 @@ fn main() {
         };
 
         mouse_hid::init(hwnd);
+        init_network_listener(hwnd);
 
         TASKBAR_CREATED_MSG.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+
+        if let Ok(handle) = RegisterPowerSettingNotification(
+            HANDLE(hwnd.0),
+            &GUID_MONITOR_POWER_ON,
+            REGISTER_NOTIFICATION_FLAGS(DEVICE_NOTIFY_WINDOW_HANDLE),
+        ) {
+            POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Relaxed);
+        }
 
         if !embed_in_taskbar(hwnd) {
             show_error("Failed to embed in taskbar. Make sure explorer.exe is running.");
@@ -228,7 +282,7 @@ fn main() {
 
         let _ = InvalidateRect(Some(hwnd), None, false);
 
-        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
 
         if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
@@ -247,6 +301,12 @@ fn main() {
 
         stop_and_join_mouse_thread();
         let _ = WTSUnRegisterSessionNotification(hwnd);
+
+        let power_handle = POWER_NOTIFY_HANDLE.load(Ordering::Relaxed);
+        if power_handle != 0 {
+            let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(power_handle));
+        }
+
         RENDERER.with(|r| {
             let _ = r.borrow_mut().take();
         });
@@ -315,7 +375,6 @@ unsafe fn embed_in_taskbar(hwnd: HWND) -> bool {
         let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current_ex_style | (WS_EX_LAYERED.0 as isize));
 
-        // SWP_SHOWWINDOW: window may be newly created or after explorer restart
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOP),
@@ -397,7 +456,7 @@ pub unsafe extern "system" fn wnd_proc(
                         renderer.update_text_color();
                     }
                 });
-                let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
+                let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
                 if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
                     let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
                 }
@@ -456,6 +515,22 @@ pub unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
 
+            WM_USER_NETWORK_DISCONNECTED => {
+                if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF, None);
+                }
+                LRESULT(0)
+            }
+
+            WM_USER_NETWORK_RECONNECTED => {
+                NETWORK_BACKOFF.store(false, Ordering::Relaxed);
+                CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
+                if !SUSPENDED.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
+                    let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
+                }
+                LRESULT(0)
+            }
+
             WM_SETTINGCHANGE => {
                 if is_immersive_color_set(lparam) {
                     RENDERER.with(|r| {
@@ -480,20 +555,23 @@ pub unsafe extern "system" fn wnd_proc(
             WM_POWERBROADCAST => {
                 match wparam.0 as u32 {
                     PBT_APMSUSPEND => {
-                        SUSPENDED.store(true, Ordering::Relaxed);
-                        KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
-                        KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
-                        stop_and_join_mouse_thread();
+                        suspend_system(hwnd);
                     }
                     PBT_APMRESUMEAUTOMATIC => {
-                        SUSPENDED.store(false, Ordering::Relaxed);
-                        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
-                        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-                        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
-                            stop_and_join_mouse_thread();
-                            MOUSE_THREAD.with(|m| {
-                                *m.borrow_mut() = Some(start_mouse_thread());
-                            });
+                        resume_system(hwnd);
+                    }
+                    PBT_POWERSETTINGCHANGE => {
+                        let setting = lparam.0 as *const POWERBROADCAST_SETTING;
+                        if !setting.is_null() {
+                            let setting_ref = &*setting;
+                            if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1 {
+                                let monitor_on = setting_ref.Data[0] != 0;
+                                if monitor_on {
+                                    resume_system(hwnd);
+                                } else {
+                                    suspend_system(hwnd);
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -504,21 +582,10 @@ pub unsafe extern "system" fn wnd_proc(
             WM_WTSSESSION_CHANGE => {
                 match wparam.0 {
                     WTS_SESSION_LOCK => {
-                        SUSPENDED.store(true, Ordering::Relaxed);
-                        KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
-                        KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
-                        stop_and_join_mouse_thread();
+                        suspend_system(hwnd);
                     }
                     WTS_SESSION_UNLOCK => {
-                        SUSPENDED.store(false, Ordering::Relaxed);
-                        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, 1000, None);
-                        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-                        if SHOW_MOUSE_INFO.load(Ordering::Relaxed) && !FULLSCREEN.load(Ordering::Relaxed) {
-                            stop_and_join_mouse_thread();
-                            MOUSE_THREAD.with(|m| {
-                                *m.borrow_mut() = Some(start_mouse_thread());
-                            });
-                        }
+                        resume_system(hwnd);
                     }
                     _ => {}
                 }
