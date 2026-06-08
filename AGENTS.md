@@ -20,8 +20,8 @@ Stop-Process -Name "traffic-monitor" -Force
 修改代码后必须执行以下命令确认无误：
 
 ```bash
-cargo fmt
 cargo build --release 2>&1
+cargo fmt
 ```
 
 ## 安装包

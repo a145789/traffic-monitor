@@ -53,6 +53,7 @@ use crate::mouse_hid::{
 use crate::renderer::Renderer;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
+    save_show_mouse_info,
 };
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
@@ -348,6 +349,9 @@ fn main() {
         return;
     }
 
+    let persisted = tray::load_show_mouse_info();
+    SHOW_MOUSE_INFO.store(persisted, Ordering::Release);
+
     create_tray_icon(hwnd);
 
     RENDERER.with(|r| {
@@ -528,38 +532,158 @@ fn update_taskbar_position(hwnd: HWND) {
 const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 
+fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
+    remove_tray_icon();
+    // SAFETY: hwnd 有效，隐藏窗口。
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    if embed_in_taskbar(hwnd) {
+        create_tray_icon(hwnd);
+        RENDERER.with(|r| {
+            if let Some(renderer) = r.borrow_mut().as_mut() {
+                renderer.update_dpi(hwnd);
+                renderer.update_text_color();
+            }
+        });
+
+        let network_interval = if NETWORK_BACKOFF.load(Ordering::Acquire) {
+            TIMER_INTERVAL_NETWORK_BACKOFF
+        } else {
+            TIMER_INTERVAL_NETWORK
+        };
+        // SAFETY: hwnd 有效，重建网络定时器。
+        unsafe {
+            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
+        }
+        if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+            // SAFETY: hwnd 有效，重建 CPU/内存定时器。
+            unsafe {
+                let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+            }
+            restart_mouse_thread();
+        }
+    }
+    LRESULT(0)
+}
+
+fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    match wparam.0 {
+        TIMER_ID_NETWORK => {
+            check_fullscreen(hwnd);
+            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+                update_taskbar_position(hwnd);
+                collect_network();
+                // SAFETY: hwnd 有效，刷新网速显示。
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+        TIMER_ID_CPU_MEM => {
+            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+                collect_cpu();
+                collect_memory();
+                // SAFETY: hwnd 有效，刷新 CPU/内存显示。
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match wparam.0 as u32 {
+        PBT_APMSUSPEND => {
+            suspend_system(hwnd);
+        }
+        PBT_APMRESUMEAUTOMATIC => {
+            resume_system(hwnd, true);
+        }
+        PBT_POWERSETTINGCHANGE => {
+            let setting = lparam.0 as *const POWERBROADCAST_SETTING;
+            if !setting.is_null() {
+                // SAFETY: PBT_POWERSETTINGCHANGE 时 OS 保证 lparam 指向有效的 POWERBROADCAST_SETTING。
+                let setting_ref = unsafe { &*setting };
+                if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1
+                {
+                    let monitor_on = setting_ref.Data[0] != 0;
+                    if monitor_on {
+                        resume_system(hwnd, true);
+                    } else {
+                        suspend_system(hwnd);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    match wparam.0 {
+        WTS_SESSION_LOCK => {
+            suspend_system(hwnd);
+        }
+        WTS_SESSION_UNLOCK => {
+            resume_system(hwnd, true);
+        }
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+fn handle_command(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    let menu_id = (wparam.0 & 0xFFFF) as u32;
+    if menu_id == MENU_ID_SHOW_MOUSE {
+        let current_state = SHOW_MOUSE_INFO.load(Ordering::Acquire);
+        if !current_state {
+            if check_mouse_available() {
+                SHOW_MOUSE_INFO.store(true, Ordering::Release);
+                save_show_mouse_info(true);
+                restart_mouse_thread();
+                // SAFETY: hwnd 有效，刷新鼠标列显示。
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            } else {
+                show_error("未检测到物理鼠标或鼠标不支持");
+            }
+        } else {
+            SHOW_MOUSE_INFO.store(false, Ordering::Release);
+            save_show_mouse_info(false);
+            stop_and_join_mouse_thread();
+            MOUSE_ONLINE.store(false, Ordering::Release);
+            // SAFETY: hwnd 有效，清除鼠标列。
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    } else if menu_id == MENU_ID_RESTART_HID {
+        if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
+            MOUSE_ONLINE.store(false, Ordering::Release);
+            MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
+            MOUSE_DPI_VALUE.store(0, Ordering::Release);
+            restart_mouse_thread();
+            // SAFETY: hwnd 有效，重启 HID 后刷新界面。
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    } else {
+        tray::handle_menu_command(hwnd, menu_id);
+    }
+    LRESULT(0)
+}
+
 pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
     if msg == tcm && tcm != 0 {
-        remove_tray_icon();
-        // SAFETY: hwnd 有效，隐藏窗口。
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-        if embed_in_taskbar(hwnd) {
-            create_tray_icon(hwnd);
-            RENDERER.with(|r| {
-                if let Some(renderer) = r.borrow_mut().as_mut() {
-                    renderer.update_dpi(hwnd);
-                    renderer.update_text_color();
-                }
-            });
-
-            // SAFETY: hwnd 有效，重建网络定时器。
-            unsafe {
-                let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
-            }
-            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
-                // SAFETY: hwnd 有效，重建 CPU/内存定时器。
-                unsafe {
-                    let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-                }
-            }
-            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
-                restart_mouse_thread();
-            }
-        }
-        return LRESULT(0);
+        return handle_taskbar_created(hwnd);
     }
 
     match msg {
@@ -581,33 +705,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        WM_TIMER => {
-            match wparam.0 {
-                TIMER_ID_NETWORK => {
-                    check_fullscreen(hwnd);
-                    if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
-                        update_taskbar_position(hwnd);
-                        collect_network();
-                        // SAFETY: hwnd 有效，刷新网速显示。
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                }
-                TIMER_ID_CPU_MEM => {
-                    if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
-                        collect_cpu();
-                        collect_memory();
-                        // SAFETY: hwnd 有效，刷新 CPU/内存显示。
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
+        WM_TIMER => handle_timer(hwnd, wparam),
 
         WM_USER_MOUSE_UPDATE | WM_USER_MOUSE_STATUS => {
             // SAFETY: hwnd 有效，刷新鼠标信息显示。
@@ -666,48 +764,9 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        WM_POWERBROADCAST => {
-            match wparam.0 as u32 {
-                PBT_APMSUSPEND => {
-                    suspend_system(hwnd);
-                }
-                PBT_APMRESUMEAUTOMATIC => {
-                    resume_system(hwnd, true);
-                }
-                PBT_POWERSETTINGCHANGE => {
-                    let setting = lparam.0 as *const POWERBROADCAST_SETTING;
-                    if !setting.is_null() {
-                        // SAFETY: PBT_POWERSETTINGCHANGE 时 OS 保证 lparam 指向有效的 POWERBROADCAST_SETTING。
-                        let setting_ref = unsafe { &*setting };
-                        if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON
-                            && setting_ref.DataLength >= 1
-                        {
-                            let monitor_on = setting_ref.Data[0] != 0;
-                            if monitor_on {
-                                resume_system(hwnd, true);
-                            } else {
-                                suspend_system(hwnd);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
+        WM_POWERBROADCAST => handle_power_broadcast(hwnd, wparam, lparam),
 
-        WM_WTSSESSION_CHANGE => {
-            match wparam.0 {
-                WTS_SESSION_LOCK => {
-                    suspend_system(hwnd);
-                }
-                WTS_SESSION_UNLOCK => {
-                    resume_system(hwnd, true);
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
+        WM_WTSSESSION_CHANGE => handle_session_change(hwnd, wparam),
 
         WM_CLOSE => {
             remove_tray_icon();
@@ -719,46 +778,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        WM_COMMAND => {
-            let menu_id = (wparam.0 & 0xFFFF) as u32;
-            if menu_id == MENU_ID_SHOW_MOUSE {
-                let current_state = SHOW_MOUSE_INFO.load(Ordering::Acquire);
-                if !current_state {
-                    if check_mouse_available() {
-                        SHOW_MOUSE_INFO.store(true, Ordering::Release);
-                        restart_mouse_thread();
-                        // SAFETY: hwnd 有效，刷新鼠标列显示。
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    } else {
-                        show_error("未检测到物理鼠标或鼠标不支持");
-                    }
-                } else {
-                    SHOW_MOUSE_INFO.store(false, Ordering::Release);
-                    stop_and_join_mouse_thread();
-                    MOUSE_ONLINE.store(false, Ordering::Release);
-                    // SAFETY: hwnd 有效，清除鼠标列。
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                }
-            } else if menu_id == MENU_ID_RESTART_HID {
-                if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-                    MOUSE_ONLINE.store(false, Ordering::Release);
-                    MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
-                    MOUSE_DPI_VALUE.store(0, Ordering::Release);
-                    restart_mouse_thread();
-                    // SAFETY: hwnd 有效，重启 HID 后刷新界面。
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                }
-            } else {
-                tray::handle_menu_command(hwnd, menu_id);
-            }
-            LRESULT(0)
-        }
+        WM_COMMAND => handle_command(hwnd, wparam),
 
         x if x == WM_APP_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
