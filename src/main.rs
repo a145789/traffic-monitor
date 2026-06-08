@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
     COLORREF, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITORINFOEXW, MonitorFromWindow, PAINTSTRUCT,
+};
 use windows::Win32::System::Power::{
     HPOWERNOTIFY, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
 };
@@ -23,13 +26,13 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetDesktopWindow,
-    GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    HWND_TOP, KillTimer, LWA_COLORKEY, MB_ICONERROR, MB_OK, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SM_CXSCREEN,
-    SM_CYSCREEN, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetLayeredWindowAttributes, SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
-    WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE,
+    GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP, KillTimer,
+    LWA_COLORKEY, MB_ICONERROR, MB_OK, MessageBoxW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
+    WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WS_CHILD, WS_EX_LAYERED, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -103,7 +106,15 @@ fn stop_and_join_mouse_thread() {
             let _ = handle.join();
         }
     });
-    trim_working_set();
+}
+
+fn restart_mouse_thread() {
+    stop_and_join_mouse_thread();
+    if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
+        MOUSE_THREAD.with(|m| {
+            *m.borrow_mut() = Some(start_mouse_thread());
+        });
+    }
 }
 
 fn suspend_system(hwnd: HWND) {
@@ -116,6 +127,7 @@ fn suspend_system(hwnd: HWND) {
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
     }
     stop_and_join_mouse_thread();
+    trim_working_set();
 }
 
 fn resume_system(hwnd: HWND, reset_backoff: bool) {
@@ -138,12 +150,7 @@ fn resume_system(hwnd: HWND, reset_backoff: bool) {
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
         }
-        if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-            stop_and_join_mouse_thread();
-            MOUSE_THREAD.with(|m| {
-                *m.borrow_mut() = Some(start_mouse_thread());
-            });
-        }
+        restart_mouse_thread();
     }
 }
 
@@ -185,12 +192,7 @@ fn check_fullscreen(hwnd: HWND) {
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             }
-            if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-                stop_and_join_mouse_thread();
-                MOUSE_THREAD.with(|m| {
-                    *m.borrow_mut() = Some(start_mouse_thread());
-                });
-            }
+            restart_mouse_thread();
         }
         return;
     }
@@ -199,30 +201,50 @@ fn check_fullscreen(hwnd: HWND) {
     // SAFETY: foreground 非空，rect 在栈上分配。
     let _ = unsafe { GetWindowRect(foreground, &mut rect) };
 
-    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let is_full = (rect.right - rect.left) == screen_w && (rect.bottom - rect.top) == screen_h;
+    // 使用 MonitorFromWindow 获取前台窗口所在显示器
+    // SAFETY: foreground 有效，MONITOR_DEFAULTTONEAREST 是合法标志。
+    let hmon_fg = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
+    let mut mi_fg = MONITORINFOEXW::default();
+    mi_fg.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    // SAFETY: hmon_fg 有效，mi_fg 在栈上分配且 cbSize 已初始化。
+    let fg_ok = unsafe { GetMonitorInfoW(hmon_fg, &mut mi_fg as *mut MONITORINFOEXW as *mut _) };
+
+    if !fg_ok.as_bool() {
+        return;
+    }
+
+    let mon_rect = mi_fg.monitorInfo.rcMonitor;
+    let is_full = rect.left == mon_rect.left
+        && rect.top == mon_rect.top
+        && rect.right == mon_rect.right
+        && rect.bottom == mon_rect.bottom;
+
+    // 检查前台窗口是否覆盖任务栏所在显示器
+    // SAFETY: 系统窗口类名，不存在时安全返回。
+    let h_taskbar = match unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")) } {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    // SAFETY: h_taskbar 有效。
+    let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
+    let same_monitor = hmon_fg == hmon_tb;
 
     let was = FULLSCREEN.load(Ordering::Acquire);
-    FULLSCREEN.store(is_full, Ordering::Release);
+    let should_suspend = is_full && same_monitor;
+    FULLSCREEN.store(should_suspend, Ordering::Release);
 
-    if is_full && !was {
+    if should_suspend && !was {
         // SAFETY: hwnd 有效，销毁定时器。
         unsafe {
             KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         }
         stop_and_join_mouse_thread();
-    } else if !is_full && was {
+    } else if !should_suspend && was {
         // SAFETY: hwnd 有效，重建定时器。
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
         }
-        if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-            stop_and_join_mouse_thread();
-            MOUSE_THREAD.with(|m| {
-                *m.borrow_mut() = Some(start_mouse_thread());
-            });
-        }
+        restart_mouse_thread();
     }
 }
 
@@ -532,14 +554,8 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
                 }
             }
-            if SHOW_MOUSE_INFO.load(Ordering::Acquire)
-                && !SUSPENDED.load(Ordering::Acquire)
-                && !FULLSCREEN.load(Ordering::Acquire)
-            {
-                stop_and_join_mouse_thread();
-                MOUSE_THREAD.with(|m| {
-                    *m.borrow_mut() = Some(start_mouse_thread());
-                });
+            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+                restart_mouse_thread();
             }
         }
         return LRESULT(0);
@@ -553,7 +569,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             // SAFETY: hwnd 有效，BeginPaint/EndPaint 配对使用。
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             RENDERER.with(|r| {
-                if let Some(renderer) = r.borrow().as_ref() {
+                if let Some(renderer) = r.borrow_mut().as_mut() {
                     renderer.render(hdc);
                 }
             });
@@ -709,10 +725,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 if !current_state {
                     if check_mouse_available() {
                         SHOW_MOUSE_INFO.store(true, Ordering::Release);
-                        stop_and_join_mouse_thread();
-                        MOUSE_THREAD.with(|m| {
-                            *m.borrow_mut() = Some(start_mouse_thread());
-                        });
+                        restart_mouse_thread();
                         // SAFETY: hwnd 有效，刷新鼠标列显示。
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -731,13 +744,10 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 }
             } else if menu_id == MENU_ID_RESTART_HID {
                 if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-                    stop_and_join_mouse_thread();
                     MOUSE_ONLINE.store(false, Ordering::Release);
                     MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
                     MOUSE_DPI_VALUE.store(0, Ordering::Release);
-                    MOUSE_THREAD.with(|m| {
-                        *m.borrow_mut() = Some(start_mouse_thread());
-                    });
+                    restart_mouse_thread();
                     // SAFETY: hwnd 有效，重启 HID 后刷新界面。
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);

@@ -255,7 +255,7 @@ fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
 }
 
 fn is_virtual_friendly_name(name: &str) -> bool {
-    let name_lower = name.to_lowercase();
+    let name_lower = name.to_ascii_lowercase();
     name_lower.contains("virtual")
         || name_lower.contains("vbox")
         || name_lower.contains("vmware")
