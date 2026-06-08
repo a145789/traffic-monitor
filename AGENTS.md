@@ -21,6 +21,8 @@ Stop-Process -Name "traffic-monitor" -Force
 
 ```bash
 bun scripts/release.ts 0.3.0    # 更新版本号 → 编译 → git tag → GitHub Release（CI 自动打包安装包）
+bun scripts/package.ts          # 本地构建编译 + 打包安装包（版本号取自 Cargo.toml）
+bun scripts/package.ts nightly  # 补丁版本号（如 0.3.4-nightlyxxxxxx）后构建打包
 ```
 
 - 安装路径：`Program Files\Traffic Monitor`
