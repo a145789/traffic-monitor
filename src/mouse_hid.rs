@@ -221,7 +221,7 @@ fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
     match device.read_timeout(&mut buf, 500) {
         Ok(n) if n >= 10 => {
             let base = find_base_offset(&buf[..n]).ok_or(())?;
-            if buf.len() < base + 10 || buf[base + OFFSET_RESPONSE_TYPE] != RESP_BATTERY {
+            if n < base + 10 || buf[base + OFFSET_RESPONSE_TYPE] != RESP_BATTERY {
                 return Err(());
             }
             let level = buf[base + OFFSET_BATTERY_LEVEL] as u32;
@@ -245,10 +245,10 @@ fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
     match device.read_timeout(&mut buf, 3000) {
         Ok(n) if n >= 35 => {
             let base = find_base_offset(&buf[..n]).ok_or(())?;
-            if buf.len() < base + 35 {
+            if n < base + 35 {
                 return Err(());
             }
-            let d = &buf[base..];
+            let d = &buf[base..n];
 
             if d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE1
                 && d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE2
@@ -261,13 +261,23 @@ fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
             } else {
                 ACTIVE_MODE_1
             };
-            let active_stage = (d[OFFSET_DPI_ACTIVE_STAGE] as usize).saturating_sub(1);
+            let stage_raw = d[OFFSET_DPI_ACTIVE_STAGE];
+            if stage_raw == 0 {
+                return Err(());
+            }
+            let active_stage = stage_raw as usize - 1;
 
             let raw_dpi = if active_mode == ACTIVE_MODE_1 {
                 let offset = DPI_MODE1_OFFSET + active_stage * 2;
+                if d.len() <= offset + 1 {
+                    return Err(());
+                }
                 (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
             } else {
                 let offset = DPI_MODE2_OFFSET + active_stage * 2;
+                if d.len() <= offset + 1 {
+                    return Err(());
+                }
                 (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
             };
 

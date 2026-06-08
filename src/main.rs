@@ -547,17 +547,20 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
             }
         });
 
+        let network_interval = if NETWORK_BACKOFF.load(Ordering::Acquire) {
+            TIMER_INTERVAL_NETWORK_BACKOFF
+        } else {
+            TIMER_INTERVAL_NETWORK
+        };
         // SAFETY: hwnd 有效，重建网络定时器。
         unsafe {
-            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
+            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
         }
         if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
             // SAFETY: hwnd 有效，重建 CPU/内存定时器。
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             }
-        }
-        if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
             restart_mouse_thread();
         }
     }
