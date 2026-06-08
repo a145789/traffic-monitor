@@ -36,6 +36,7 @@ pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 pub static SHOW_MOUSE_INFO: AtomicBool = AtomicBool::new(false);
 
 pub const MENU_ID_SHOW_MOUSE: u32 = 1003;
+pub const MENU_ID_RESTART_HID: u32 = 1004;
 
 pub static MOUSE_BATTERY_LEVEL: AtomicU32 = AtomicU32::new(0);
 pub static MOUSE_IS_CHARGING: AtomicBool = AtomicBool::new(false);

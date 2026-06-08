@@ -32,7 +32,8 @@ use windows::Win32::System::RemoteDesktop::{
 use crate::collector::{collect_cpu, collect_memory, collect_network, trim_working_set};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, FULLSCREEN, GAP, SUSPENDED,
-    TIMER_ID_CPU_MEM, TIMER_ID_NETWORK, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MOUSE_ONLINE,
+    TIMER_ID_CPU_MEM, TIMER_ID_NETWORK, SHOW_MOUSE_INFO, MENU_ID_SHOW_MOUSE, MENU_ID_RESTART_HID, MOUSE_ONLINE,
+    MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
 };
 use crate::mouse_hid::{start_mouse_thread, stop_mouse_thread, check_mouse_available, WM_USER_MOUSE_UPDATE, WM_USER_MOUSE_STATUS};
 use crate::renderer::Renderer;
@@ -550,6 +551,17 @@ pub unsafe extern "system" fn wnd_proc(
                         SHOW_MOUSE_INFO.store(false, Ordering::Relaxed);
                         stop_and_join_mouse_thread();
                         MOUSE_ONLINE.store(false, Ordering::Relaxed);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                } else if menu_id == MENU_ID_RESTART_HID {
+                    if SHOW_MOUSE_INFO.load(Ordering::Relaxed) {
+                        stop_and_join_mouse_thread();
+                        MOUSE_ONLINE.store(false, Ordering::Relaxed);
+                        MOUSE_BATTERY_LEVEL.store(0, Ordering::Relaxed);
+                        MOUSE_DPI_VALUE.store(0, Ordering::Relaxed);
+                        MOUSE_THREAD.with(|m| {
+                            *m.borrow_mut() = Some(start_mouse_thread());
+                        });
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else {
