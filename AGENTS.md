@@ -20,7 +20,7 @@ Stop-Process -Name "traffic-monitor" -Force
 使用 Inno Setup 7 构建，脚本 `installer.iss`，输出到 `Output/`。
 
 ```bash
-bun scripts/release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 打包 → git tag
+bun scripts/release.ts 0.3.0    # 更新版本号 → 编译 → git tag → GitHub Release（CI 自动打包安装包）
 ```
 
 - 安装路径：`Program Files\Traffic Monitor`
