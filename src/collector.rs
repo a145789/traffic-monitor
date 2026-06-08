@@ -246,7 +246,7 @@ unsafe fn build_virtual_blacklist() -> Option<Vec<u64>> {
             return None;
         }
 
-        let mut buf: Vec<u64> = vec![0u64; (buf_size as usize + 7) / 8];
+        let mut buf: Vec<u64> = vec![0u64; (buf_size as usize).div_ceil(8)];
         let adapter_ptr = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
 
         let ret = GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, Some(adapter_ptr), &mut buf_size);
