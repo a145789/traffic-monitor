@@ -26,6 +26,7 @@ pub struct Renderer {
     width: i32,
     height: i32,
     arrow_width: i32,
+    wide_buf: Vec<u16>,
 }
 
 impl Renderer {
@@ -83,6 +84,7 @@ impl Renderer {
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
             arrow_width,
+            wide_buf: Vec::with_capacity(32),
         }
     }
 
@@ -94,7 +96,31 @@ impl Renderer {
         }
     }
 
-    pub fn render(&self, hdc: HDC) {
+    #[inline]
+    fn wide(&mut self, s: &str) -> &mut [u16] {
+        self.wide_buf.clear();
+        self.wide_buf.extend(s.encode_utf16());
+        self.wide_buf.push(0);
+        &mut self.wide_buf
+    }
+
+    fn format_speed_wide(&mut self, bytes_per_sec: u32) -> &mut [u16] {
+        self.wide_buf.clear();
+        if bytes_per_sec < 1024 {
+            write_u32(&mut self.wide_buf, bytes_per_sec);
+            push_ascii(&mut self.wide_buf, " B/s");
+        } else if bytes_per_sec < 1024 * 1024 {
+            write_fixed1(&mut self.wide_buf, bytes_per_sec as f64 / 1024.0);
+            push_ascii(&mut self.wide_buf, " KB/s");
+        } else {
+            write_fixed1(&mut self.wide_buf, bytes_per_sec as f64 / (1024.0 * 1024.0));
+            push_ascii(&mut self.wide_buf, " MB/s");
+        }
+        self.wide_buf.push(0);
+        &mut self.wide_buf
+    }
+
+    pub fn render(&mut self, hdc: HDC) {
         let rect = RECT {
             left: 0,
             top: 0,
@@ -126,6 +152,7 @@ impl Renderer {
         unsafe {
             let _ = FillRect(self.hdc_mem, &rect, self.hbrush);
             SetTextColor(self.hdc_mem, self.text_color);
+            let hdc_mem = self.hdc_mem;
 
             // 上行箭头
             let mut rc_up_arrow = RECT {
@@ -134,26 +161,25 @@ impl Renderer {
                 right: arrow_right,
                 bottom: half_height,
             };
-            let mut up_arrow = to_wide("\u{2191}");
+            let up_arrow = self.wide("\u{2191}");
             let _ = DrawTextW(
-                self.hdc_mem,
-                &mut up_arrow,
+                hdc_mem,
+                up_arrow,
                 &mut rc_up_arrow,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
             );
 
             // 上行数值
-            let speed_up_text = format_speed(speed_up);
             let mut rc_up_val = RECT {
                 left: arrow_right,
                 top: 0,
                 right: speed_right,
                 bottom: half_height,
             };
-            let mut up_val = to_wide(&speed_up_text);
+            let up_val = self.format_speed_wide(speed_up);
             let _ = DrawTextW(
-                self.hdc_mem,
-                &mut up_val,
+                hdc_mem,
+                up_val,
                 &mut rc_up_val,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
@@ -165,26 +191,25 @@ impl Renderer {
                 right: arrow_right,
                 bottom: self.height,
             };
-            let mut down_arrow = to_wide("\u{2193}");
+            let down_arrow = self.wide("\u{2193}");
             let _ = DrawTextW(
-                self.hdc_mem,
-                &mut down_arrow,
+                hdc_mem,
+                down_arrow,
                 &mut rc_down_arrow,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
             );
 
             // 下行数值
-            let speed_down_text = format_speed(speed_down);
             let mut rc_down_val = RECT {
                 left: arrow_right,
                 top: half_height,
                 right: speed_right,
                 bottom: self.height,
             };
-            let mut down_val = to_wide(&speed_down_text);
+            let down_val = self.format_speed_wide(speed_down);
             let _ = DrawTextW(
-                self.hdc_mem,
-                &mut down_val,
+                hdc_mem,
+                down_val,
                 &mut rc_down_val,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
@@ -205,17 +230,17 @@ impl Renderer {
                             right: mouse_right,
                             bottom: half_height,
                         };
-                        let mut mouse_wide = to_wide("\u{1F5B1}");
+                        let mouse_wide = self.wide("\u{1F5B1}");
                         let _ = DrawTextW(
-                            self.hdc_mem,
-                            &mut mouse_wide,
+                            hdc_mem,
+                            mouse_wide,
                             &mut rc_mouse,
                             DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
                         );
 
                         // 用红色画电量数字，左侧相对偏移 16 像素
                         let battery_color = COLORREF(COLOR_LOW_BATTERY);
-                        SetTextColor(self.hdc_mem, battery_color);
+                        SetTextColor(hdc_mem, battery_color);
                         let battery_text = format!("{}%", battery);
                         let mut rc_bat = RECT {
                             left: mouse_left + (16.0 * scale).round() as i32,
@@ -223,16 +248,16 @@ impl Renderer {
                             right: mouse_right,
                             bottom: half_height,
                         };
-                        let mut battery_wide = to_wide(&battery_text);
+                        let battery_wide = self.wide(&battery_text);
                         let _ = DrawTextW(
-                            self.hdc_mem,
-                            &mut battery_wide,
+                            hdc_mem,
+                            battery_wide,
                             &mut rc_bat,
                             DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
                         );
 
                         // 恢复颜色
-                        SetTextColor(self.hdc_mem, self.text_color);
+                        SetTextColor(hdc_mem, self.text_color);
                     } else {
                         let mouse_text = format!("\u{1F5B1} {}%", battery);
                         let mut rc_mouse = RECT {
@@ -241,10 +266,10 @@ impl Renderer {
                             right: mouse_right,
                             bottom: half_height,
                         };
-                        let mut mouse_wide = to_wide(&mouse_text);
+                        let mouse_wide = self.wide(&mouse_text);
                         let _ = DrawTextW(
-                            self.hdc_mem,
-                            &mut mouse_wide,
+                            hdc_mem,
+                            mouse_wide,
                             &mut rc_mouse,
                             DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
                         );
@@ -258,10 +283,10 @@ impl Renderer {
                         right: mouse_right,
                         bottom: self.height,
                     };
-                    let mut dpi_wide = to_wide(&dpi_text);
+                    let dpi_wide = self.wide(&dpi_text);
                     let _ = DrawTextW(
-                        self.hdc_mem,
-                        &mut dpi_wide,
+                        hdc_mem,
+                        dpi_wide,
                         &mut rc_dpi,
                         DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
                     );
@@ -274,10 +299,10 @@ impl Renderer {
                         right: mouse_right,
                         bottom: half_height,
                     };
-                    let mut mouse_wide = to_wide(mouse_text);
+                    let mouse_wide = self.wide(mouse_text);
                     let _ = DrawTextW(
-                        self.hdc_mem,
-                        &mut mouse_wide,
+                        hdc_mem,
+                        mouse_wide,
                         &mut rc_mouse,
                         DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
                     );
@@ -289,10 +314,10 @@ impl Renderer {
                         right: mouse_right,
                         bottom: self.height,
                     };
-                    let mut dpi_wide = to_wide(dpi_text);
+                    let dpi_wide = self.wide(dpi_text);
                     let _ = DrawTextW(
-                        self.hdc_mem,
-                        &mut dpi_wide,
+                        hdc_mem,
+                        dpi_wide,
                         &mut rc_dpi,
                         DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
                     );
@@ -315,10 +340,10 @@ impl Renderer {
                 right: cpu_right,
                 bottom: half_height,
             };
-            let mut cpu_wide = to_wide(&cpu_text);
+            let cpu_wide = self.wide(&cpu_text);
             let _ = DrawTextW(
-                self.hdc_mem,
-                &mut cpu_wide,
+                hdc_mem,
+                cpu_wide,
                 &mut rc_cpu,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
@@ -330,15 +355,15 @@ impl Renderer {
                 right: cpu_right,
                 bottom: self.height,
             };
-            let mut mem_wide = to_wide(&mem_text);
+            let mem_wide = self.wide(&mem_text);
             let _ = DrawTextW(
-                self.hdc_mem,
-                &mut mem_wide,
+                hdc_mem,
+                mem_wide,
                 &mut rc_mem,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
 
-            SetTextColor(self.hdc_mem, self.text_color);
+            SetTextColor(hdc_mem, self.text_color);
 
             let _ = BitBlt(
                 hdc,
@@ -346,7 +371,7 @@ impl Renderer {
                 0,
                 self.width,
                 self.height,
-                Some(self.hdc_mem),
+                Some(hdc_mem),
                 0,
                 0,
                 SRCCOPY,
@@ -406,15 +431,13 @@ impl Renderer {
         }
 
         let arrow_width = {
-            let arrow_text = to_wide("\u{2191} ");
+            let hdc_mem = self.hdc_mem;
+            let arrow_text = self.wide("\u{2191} ");
+            let arrow_len = arrow_text.len() - 1;
             let mut size = SIZE::default();
             // SAFETY: hdc_mem 有效，arrow_text 以 NUL 结尾，size 在栈上。
             unsafe {
-                let _ = GetTextExtentPoint32W(
-                    self.hdc_mem,
-                    &arrow_text[..arrow_text.len() - 1],
-                    &mut size,
-                );
+                let _ = GetTextExtentPoint32W(hdc_mem, &arrow_text[..arrow_len], &mut size);
             }
             size.cx
         };
@@ -456,16 +479,6 @@ fn create_font(size: i32) -> HFONT {
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn format_speed(bytes_per_sec: u32) -> String {
-    if bytes_per_sec < 1024 {
-        format!("{} B/s", bytes_per_sec)
-    } else if bytes_per_sec < 1024 * 1024 {
-        format!("{:.1} KB/s", bytes_per_sec as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB/s", bytes_per_sec as f64 / (1024.0 * 1024.0))
-    }
 }
 
 pub fn is_system_light_theme() -> bool {
@@ -521,4 +534,35 @@ pub fn is_system_light_theme() -> bool {
         }
     }
     false
+}
+
+fn push_ascii(buf: &mut Vec<u16>, s: &str) {
+    for b in s.bytes() {
+        buf.push(b as u16);
+    }
+}
+
+fn write_u32(buf: &mut Vec<u16>, mut n: u32) {
+    if n == 0 {
+        buf.push(b'0' as u16);
+        return;
+    }
+    let start = buf.len();
+    while n > 0 {
+        buf.push((b'0' + (n % 10) as u8) as u16);
+        n /= 10;
+    }
+    buf[start..].reverse();
+}
+
+fn write_fixed1(buf: &mut Vec<u16>, val: f64) {
+    let mut int_part = val as u32;
+    let mut frac = ((val - int_part as f64) * 10.0).round() as u32;
+    if frac >= 10 {
+        int_part += 1;
+        frac = 0;
+    }
+    write_u32(buf, int_part);
+    buf.push(b'.' as u16);
+    buf.push((b'0' + frac as u8) as u16);
 }
