@@ -28,28 +28,29 @@ bun scripts/release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 
 - 依赖：[Inno Setup 7](https://jrsoftware.org/isinfo.php)、[Bun](https://bun.sh)
 - 版本号需同步更新 `Cargo.toml` 和 `installer.iss`，详见 `VERSIONING.md`
 
-## 架构（6 个源文件，约 1814 行）
+## 架构（6 个源文件，约 1855 行）
 
 | 文件           | 行数 | 职责                                     |
 | -------------- | ---- | ---------------------------------------- |
-| `main.rs`      | 572  | 窗口创建、消息循环、任务栏嵌入、wnd_proc、单例互斥锁、位置动态更新 |
-| `config.rs`    | 48   | 常量定义、原子变量、单例 Mutex 名称        |
-| `collector.rs` | 143  | CPU/内存/网速采集                        |
-| `renderer.rs`  | 470  | GDI 双缓冲渲染                           |
-| `mouse_hid.rs` | 275  | HID 鼠标轮询线程                         |
-| `tray.rs`      | 306  | 系统托盘、菜单、开机自启                 |
+| `main.rs`      | 592  | 窗口创建、消息循环、任务栏嵌入、wnd_proc、单例互斥锁、位置动态更新 |
+| `config.rs`    | 56   | 常量定义、原子变量、单例 Mutex 名称        |
+| `collector.rs` | 257  | CPU/内存/网速采集、虚拟网卡过滤、活跃网卡锁定 |
+| `renderer.rs`  | 424  | GDI 双缓冲渲染                           |
+| `mouse_hid.rs` | 238  | HID 鼠标轮询线程                         |
+| `tray.rs`      | 288  | 系统托盘、菜单、开机自启                 |
 
 ## config.rs 常量
 
 - 窗口应用：`APP_NAME`, `WINDOW_CLASS`, `WINDOW_TITLE`, `MUTEX_NAME`
 - 窗口：`DISPLAY_WIDTH=240`, `DISPLAY_HEIGHT=32`, `GAP=-3`
-- 定时器：`TIMER_ID_NETWORK=1`（1000ms）, `TIMER_ID_CPU_MEM=2`（5000ms）
+- 定时器：`TIMER_ID_NETWORK=1`（1000ms，退避时 15000ms）, `TIMER_ID_CPU_MEM=2`（5000ms）
+- 退避：连续 5 次零速触发退避，退避间隔 `TIMER_INTERVAL_NETWORK_BACKOFF=15000`
 - 鼠标 HID：VID `[0xA8A4, 0xA8A5]`（MLOONG）, PID `0x2255`（MX302）, usage page `0xFF01`, usage `0x0010`
 - 轮询：在线 180s，离线 300s，连续 2 次失败判定离线
 - 字体：Segoe UI, `FONT_BASE_SIZE=13`, `DPI_SCALE_FACTOR=1.173`
 - 颜色：`COLOR_KEY=0x00FF00FF`（透明色）, 暗色文字 `0x00282828`, 亮色文字 `0x00FFFFFF`, 低电量 `0x004444FF`（BGR 的 #FF4444）
-- 菜单：`MENU_ID_SHOW_MOUSE=1003`
-- 原子变量：`CPU_USAGE`/`MEM_USAGE`/`NET_SPEED_UP`/`NET_SPEED_DOWN`（AtomicU32），`MOUSE_BATTERY_LEVEL`/`MOUSE_DPI_VALUE`（AtomicU32），`MOUSE_ONLINE`/`SUSPENDED`/`FULLSCREEN`/`SHOW_MOUSE_INFO`/`MOUSE_IS_CHARGING`（AtomicBool）
+- 菜单：`MENU_ID_SHOW_MOUSE=1003`, `MENU_ID_RESTART_HID=1004`
+- 原子变量：`CPU_USAGE`/`MEM_USAGE`/`NET_SPEED_UP`/`NET_SPEED_DOWN`（AtomicU32），`MOUSE_BATTERY_LEVEL`/`MOUSE_DPI_VALUE`（AtomicU32），`MOUSE_ONLINE`/`SUSPENDED`/`FULLSCREEN`/`SHOW_MOUSE_INFO`/`MOUSE_IS_CHARGING`（AtomicBool），`NETWORK_BACKOFF`/`CONSECUTIVE_ZERO_COUNT`（AtomicBool/AtomicU32）
 
 ## 功能行为
 
@@ -67,9 +68,9 @@ bun scripts/release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 
 
 ### 托盘菜单
 
-五个菜单项：版本号展示（0，禁用状态）、分隔线、开机自启（1001）、显示鼠标信息（1003）、退出（1002）。右键菜单用 `InsertMenuItemW` 创建。托盘回调消息为 `WM_APP_TRAY`（`WM_USER + 100`），使用 `NOTIFYICON_VERSION_4`。
+菜单项：版本号展示（0，禁用状态）、分隔线、开机自启（1001）、显示鼠标信息（1003）、重启 HID（1004，仅鼠标显示时可见）、退出（1002）。右键菜单用 `InsertMenuItemW` 创建。托盘回调消息为 `WM_APP_TRAY`（`WM_USER + 100`），使用 `NOTIFYICON_VERSION_4`。
 
-`WM_COMMAND` 处理：`MENU_ID_SHOW_MOUSE` 由 `wnd_proc` 直接处理（切换 `SHOW_MOUSE_INFO`、启停鼠标线程），其余菜单项委托给 `tray::handle_menu_command`。`WM_APP_TRAY` 收到 `WM_CONTEXTMENU` 时调用 `tray::show_context_menu`。
+`WM_COMMAND` 处理：`MENU_ID_SHOW_MOUSE` 和 `MENU_ID_RESTART_HID` 由 `wnd_proc` 直接处理（切换 `SHOW_MOUSE_INFO`、启停鼠标线程），其余菜单项委托给 `tray::handle_menu_command`。`WM_APP_TRAY` 收到 `WM_CONTEXTMENU` 时调用 `tray::show_context_menu`。
 
 开机自启通过 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写入带双引号的 exe 路径。
 
@@ -83,8 +84,9 @@ bun scripts/release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 
 
 - 全屏：`check_fullscreen` 在 `TIMER_ID_NETWORK` 回调中调用，前台窗口尺寸 == 主显示器分辨率（`GetForegroundWindow` + `GetWindowRect` vs `SM_CXSCREEN`/`SM_CYSCREEN`），排除桌面和 Shell 窗口
 - 睡眠：`PBT_APMSUSPEND`
+- 显示器关闭（Modern Standby）：`PBT_POWERSETTINGCHANGE` + `GUID_MONITOR_POWER_ON`
 - 锁屏：`WM_WTSSESSION_CHANGE` 的 `WTS_SESSION_LOCK`（0x7）
-- 恢复对应 `PBT_APMRESUMEAUTOMATIC` 和 `WTS_SESSION_UNLOCK`（0x8），恢复时若 `SHOW_MOUSE_INFO` 为 true 则重启鼠标线程
+- 恢复对应 `PBT_APMRESUMEAUTOMATIC`、`GUID_MONITOR_POWER_ON` 的 Data[0] != 0 和 `WTS_SESSION_UNLOCK`（0x8），恢复时若 `SHOW_MOUSE_INFO` 为 true 则重启鼠标线程
 
 ### 单例模式与退出
 
@@ -134,7 +136,8 @@ bun scripts/release.ts 0.2.0    # 一键发布：更新版本号 → 编译 → 
 
 - CPU：`GetSystemTimes`，首次调用初始化基线，后续计算差值，结果 `min(100)` 封顶
 - 内存：`GlobalMemoryStatusEx` 取 `dwMemoryLoad`
-- 网速：`GetIfTable2` + `FreeMibTable`，`is_valid_interface` 过滤 Ethernet（type 6）和 Wi-Fi（type 71）且 `PhysicalAddressLength > 0` 且 `OperStatusUp` 的接口，速度差值 `min(u32::MAX)` 防溢出
+- 网速：`GetIfTable2` + `FreeMibTable`，`is_valid_interface` 过滤 Ethernet（type 6）和 Wi-Fi（type 71）且 `PhysicalAddressLength > 0` 的接口，通过 `GetAdaptersAddresses` 构建虚拟适配器 LUID 黑名单（关键字：virtual/vbox/vmware/hyper-v/wsl/tap/vpn/loopback/teredo/isatap/6to4/ppp/kvm/xen）并 30s 缓存刷新，每周期按 LUID 独立计算速率并选取流量最大的单一网卡（非累加），速度差值 `min(u32::MAX)` 防溢出
+- 断网退避：连续 5 次零速触发 `NETWORK_BACKOFF`，定时器间隔退至 15000ms，恢复时自动切回 1000ms
 - `trim_working_set`：`SetProcessWorkingSetSize(usize::MAX, usize::MAX)`
 
 ## 共享状态
