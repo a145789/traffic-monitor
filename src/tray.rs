@@ -8,7 +8,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, TrackPopupMenu, WM_USER, WNDCLASSEXW, IDI_APPLICATION,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE, WS_POPUP,
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, MENUITEMINFOW, MIIM_STRING, MIIM_STATE, MIIM_ID, MIIM_FTYPE,
-    MFS_CHECKED, MFS_UNCHECKED, MFS_DISABLED, MFT_SEPARATOR, InsertMenuItemW, DestroyMenu, PostMessageW, WM_CLOSE,
+    MFS_CHECKED, MFS_UNCHECKED, MFS_DISABLED, MFT_SEPARATOR, InsertMenuItemW, PostMessageW, WM_CLOSE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
@@ -25,36 +25,70 @@ thread_local! {
     static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = RefCell::new(None);
 }
 
-pub fn register_window_class() -> Result<(), String> {
-    unsafe {
-        let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
-        let class_name_pcw = PCWSTR(class_name.as_ptr());
-        let wnd_class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(crate::wnd_proc),
-            hInstance: windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .unwrap()
-                .into(),
-            lpszClassName: class_name_pcw,
-            ..Default::default()
-        };
+struct RegKey(windows::Win32::System::Registry::HKEY);
 
-        if windows::Win32::UI::WindowsAndMessaging::RegisterClassExW(&wnd_class) == 0 {
-            return Err("Failed to register window class".to_string());
+impl Drop for RegKey {
+    fn drop(&mut self) {
+        // SAFETY: self.0 是有效注册表句柄，退出作用域时安全关闭。
+        unsafe {
+            let _ = windows::Win32::System::Registry::RegCloseKey(self.0);
         }
-
-        Ok(())
     }
 }
 
-pub fn create_main_window() -> Result<HWND, String> {
-    unsafe {
-        let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
-        let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
-        let class_name_pcw = PCWSTR(class_name.as_ptr());
-        let window_name_pcw = PCWSTR(window_name.as_ptr());
+struct MenuGuard(windows::Win32::UI::WindowsAndMessaging::HMENU);
 
-        let hwnd = CreateWindowExW(
+impl Drop for MenuGuard {
+    fn drop(&mut self) {
+        // SAFETY: self.0 是有效的菜单句柄，销毁它防止内存泄漏。
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(self.0);
+        }
+    }
+}
+
+pub fn register_window_class() -> Result<(), String> {
+    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
+    let class_name_pcw = PCWSTR(class_name.as_ptr());
+    
+    // SAFETY:
+    // GetModuleHandleW 获取当前执行实例的句柄，在当前进程内有效。
+    let hinstance = unsafe { GetModuleHandleW(None).unwrap().into() };
+    
+    let wnd_class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(crate::wnd_proc),
+        hInstance: hinstance,
+        lpszClassName: class_name_pcw,
+        ..Default::default()
+    };
+
+    // SAFETY:
+    // wnd_class 结构体已由 safe 代码完整地被初始化且 class_name_pcw 具有合理生命周期。
+    // 调用 RegisterClassExW 是安全的。
+    let atom = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterClassExW(&wnd_class) };
+    if atom == 0 {
+        return Err("Failed to register window class".to_string());
+    }
+
+    Ok(())
+}
+
+pub fn create_main_window() -> Result<HWND, String> {
+    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
+    let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
+    let class_name_pcw = PCWSTR(class_name.as_ptr());
+    let window_name_pcw = PCWSTR(window_name.as_ptr());
+
+    // SAFETY:
+    // GetModuleHandleW 获取当前进程句柄。
+    let hinstance = unsafe { GetModuleHandleW(None).unwrap().into() };
+
+    // SAFETY:
+    // 传入的 PCWSTR 具有长生命周期。
+    // CreateWindowExW 会创建此窗口并返回其有效的 HWND 句柄，如果不成功则返回 Err。
+    let hwnd = unsafe {
+        CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name_pcw,
             window_name_pcw,
@@ -65,149 +99,185 @@ pub fn create_main_window() -> Result<HWND, String> {
             DISPLAY_HEIGHT,
             None,
             None,
-            Some(windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .unwrap()
-                .into()),
+            Some(hinstance),
             None,
-        );
+        )
+    };
 
-        match hwnd {
-            Ok(h) => Ok(h),
-            Err(e) => Err(format!("Failed to create window: {:?}", e)),
-        }
+    match hwnd {
+        Ok(h) => Ok(h),
+        Err(e) => Err(format!("Failed to create window: {:?}", e)),
     }
 }
 
 pub fn create_tray_icon(hwnd: HWND) {
-    unsafe {
-        let hicon = LoadIconW(Some(GetModuleHandleW(None).unwrap().into()), PCWSTR(1 as *const u16))
+    // SAFETY:
+    // 获取当前实例模块句柄，尝试加载资源 ID 为 1 的图标，若无则回退加载系统默认图标。
+    let hicon = unsafe {
+        LoadIconW(Some(GetModuleHandleW(None).unwrap().into()), PCWSTR(1 as *const u16))
             .or_else(|_| LoadIconW(None, IDI_APPLICATION))
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
 
-        let mut nid = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: 1,
-            uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
-            uCallbackMessage: WM_APP_TRAY,
-            hIcon: hicon,
-            ..Default::default()
-        };
-        nid.Anonymous.uVersion = windows::Win32::UI::Shell::NOTIFYICON_VERSION_4;
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+        uCallbackMessage: WM_APP_TRAY,
+        hIcon: hicon,
+        ..Default::default()
+    };
+    nid.Anonymous.uVersion = windows::Win32::UI::Shell::NOTIFYICON_VERSION_4;
 
-        let tip: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
-        nid.szTip[..tip.len()].copy_from_slice(&tip);
+    let tip: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
+    nid.szTip[..tip.len()].copy_from_slice(&tip);
 
+    // SAFETY:
+    // nid 已被正确初始化。Shell_NotifyIconW 安全地添加系统托盘图标并设置其版本。
+    unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         let _ = Shell_NotifyIconW(windows::Win32::UI::Shell::NIM_SETVERSION, &nid);
-        TRAY_DATA.with(|t| {
-            *t.borrow_mut() = Some(nid);
-        });
     }
+    TRAY_DATA.with(|t| {
+        *t.borrow_mut() = Some(nid);
+    });
 }
 
 pub fn remove_tray_icon() {
-    unsafe {
-        TRAY_DATA.with(|t| {
-            if let Some(nid) = t.borrow().as_ref() {
+    TRAY_DATA.with(|t| {
+        if let Some(nid) = t.borrow().as_ref() {
+            // SAFETY: nid 为此前由主线程创建并管理的合法托盘图标信息结构体，在此安全删除。
+            unsafe {
                 let _ = Shell_NotifyIconW(NIM_DELETE, nid);
             }
-        });
-    }
+        }
+    });
 }
 
 pub fn show_context_menu(hwnd: HWND) {
+    let mut point = POINT::default();
+    // SAFETY: 获取当前鼠标坐标并存入 point 中。
     unsafe {
-        let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
+    }
 
-        let hmenu = CreatePopupMenu().unwrap();
+    // SAFETY: 创建一个弹出菜单。
+    let hmenu = unsafe { CreatePopupMenu().unwrap() };
+    let _menu_guard = MenuGuard(hmenu);
 
-        // 1. Version item (Disabled)
-        let version_str = format!("Traffic Monitor v{}\0", VERSION);
-        let version_text: Vec<u16> = version_str.encode_utf16().collect();
-        let mut version_item = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-            fState: MFS_DISABLED,
-            wID: 0,
-            ..Default::default()
-        };
-        version_item.dwTypeData = PWSTR(version_text.as_ptr() as *mut u16);
+    // 1. Version item (Disabled)
+    let version_str = format!("Traffic Monitor v{}\0", VERSION);
+    let version_text: Vec<u16> = version_str.encode_utf16().collect();
+    let mut version_item = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+        fState: MFS_DISABLED,
+        wID: 0,
+        ..Default::default()
+    };
+    version_item.dwTypeData = PWSTR(version_text.as_ptr() as *mut u16);
+    
+    // SAFETY: 插入版本菜单项。
+    unsafe {
         let _ = InsertMenuItemW(hmenu, 0, true, &version_item);
+    }
 
-        // 2. Separator
-        let sep_item = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_FTYPE,
-            fType: MFT_SEPARATOR,
-            ..Default::default()
-        };
+    // 2. Separator
+    let sep_item = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_FTYPE,
+        fType: MFT_SEPARATOR,
+        ..Default::default()
+    };
+    
+    // SAFETY: 插入分隔线项。
+    unsafe {
         let _ = InsertMenuItemW(hmenu, 1, true, &sep_item);
+    }
 
-        // 3. Autostart
-        let autostart_text: Vec<u16> = "开机自启\0".encode_utf16().collect();
-        let mut autostart_item = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-            fState: if is_autostart_enabled() {
-                MFS_CHECKED
-            } else {
-                MFS_UNCHECKED
-            },
-            wID: MENU_ID_AUTOSTART,
-            ..Default::default()
-        };
-        autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
+    // 3. Autostart
+    let autostart_text: Vec<u16> = "开机自启\0".encode_utf16().collect();
+    let mut autostart_item = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+        fState: if is_autostart_enabled() {
+            MFS_CHECKED
+        } else {
+            MFS_UNCHECKED
+        },
+        wID: MENU_ID_AUTOSTART,
+        ..Default::default()
+    };
+    autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
+    
+    // SAFETY: 插入自启项。
+    unsafe {
         let _ = InsertMenuItemW(hmenu, 2, true, &autostart_item);
+    }
 
-        // 4. Show mouse info
-        let show_mouse = SHOW_MOUSE_INFO.load(std::sync::atomic::Ordering::Relaxed);
-        let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
-        let mut mouse_item = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-            fState: if show_mouse {
-                MFS_CHECKED
-            } else {
-                MFS_UNCHECKED
-            },
-            wID: MENU_ID_SHOW_MOUSE,
-            ..Default::default()
-        };
-        mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
+    // 4. Show mouse info
+    let show_mouse = SHOW_MOUSE_INFO.load(std::sync::atomic::Ordering::Relaxed);
+    let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
+    let mut mouse_item = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+        fState: if show_mouse {
+            MFS_CHECKED
+        } else {
+            MFS_UNCHECKED
+        },
+        wID: MENU_ID_SHOW_MOUSE,
+        ..Default::default()
+    };
+    mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
+    
+    // SAFETY: 插入显示鼠标信息项。
+    unsafe {
         let _ = InsertMenuItemW(hmenu, 3, true, &mouse_item);
+    }
 
-        // 5. Restart HID (only visible when mouse info is shown)
-        let mut exit_pos = 4;
-        if show_mouse {
-            let restart_text: Vec<u16> = "重置鼠标\0".encode_utf16().collect();
-            let mut restart_item = MENUITEMINFOW {
-                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-                fState: MFS_UNCHECKED,
-                wID: MENU_ID_RESTART_HID,
-                ..Default::default()
-            };
-            restart_item.dwTypeData = PWSTR(restart_text.as_ptr() as *mut u16);
-            let _ = InsertMenuItemW(hmenu, 4, true, &restart_item);
-            exit_pos = 5;
-        }
-
-        // 6. Exit
-        let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
-        let mut exit_item = MENUITEMINFOW {
+    // 5. Restart HID (only visible when mouse info is shown)
+    let mut exit_pos = 4;
+    if show_mouse {
+        let restart_text: Vec<u16> = "重置鼠标\0".encode_utf16().collect();
+        let mut restart_item = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
             fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
             fState: MFS_UNCHECKED,
-            wID: MENU_ID_EXIT,
+            wID: MENU_ID_RESTART_HID,
             ..Default::default()
         };
-        exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
+        restart_item.dwTypeData = PWSTR(restart_text.as_ptr() as *mut u16);
+        
+        // SAFETY: 插入重置鼠标项。
+        unsafe {
+            let _ = InsertMenuItemW(hmenu, 4, true, &restart_item);
+        }
+        exit_pos = 5;
+    }
+
+    // 6. Exit
+    let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
+    let mut exit_item = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
+        fState: MFS_UNCHECKED,
+        wID: MENU_ID_EXIT,
+        ..Default::default()
+    };
+    exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
+    
+    // SAFETY: 插入退出项。
+    unsafe {
         let _ = InsertMenuItemW(hmenu, exit_pos, true, &exit_item);
+    }
 
+    // SAFETY:
+    // 将指定窗口设为前台活动窗口。
+    // 在指定位置跟踪托盘菜单并捕获用户的点击，hmenu 已通过 MenuGuard 实现 RAII 自动释放。
+    unsafe {
         let _ = SetForegroundWindow(hwnd);
-
         let _ = TrackPopupMenu(
             hmenu,
             TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
@@ -217,8 +287,6 @@ pub fn show_context_menu(hwnd: HWND) {
             hwnd,
             None,
         );
-
-        let _ = DestroyMenu(hmenu);
     }
 }
 
@@ -226,6 +294,9 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
     match item_id {
         MENU_ID_AUTOSTART => toggle_autostart(),
         MENU_ID_EXIT => {
+            // SAFETY:
+            // hwnd 是由主窗口实例传递过来的有效窗口句柄。
+            // PostMessageW 发送 WM_CLOSE 消息是安全的。
             unsafe {
                 let _ = PostMessageW(
                     Some(hwnd),
@@ -240,18 +311,22 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
 }
 
 fn is_autostart_enabled() -> bool {
-    unsafe {
-        use windows::Win32::System::Registry::{
-            RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
-        };
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
+    };
 
-        let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
-            .encode_utf16()
-            .collect();
-        let value_name: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut hkey = Default::default();
+    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+        .encode_utf16()
+        .collect();
+    let value_name: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut hkey = Default::default();
 
-        if RegOpenKeyExW(
+    // SAFETY:
+    // HKEY_CURRENT_USER 是预定义的根键。
+    // key_path 是以 NUL 结尾的宽字符数组。
+    // 打开的注册表项句柄将被存入 hkey 并通过 RegKey 自动进行生命周期释放（RAII）。
+    let open_ok = unsafe {
+        RegOpenKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR(key_path.as_ptr()),
             Some(0),
@@ -259,38 +334,48 @@ fn is_autostart_enabled() -> bool {
             &mut hkey,
         )
         .is_ok()
-        {
-            let mut buf = [0u8; 512];
-            let mut buf_size = buf.len() as u32;
-            let result = RegQueryValueExW(
+    };
+
+    if open_ok {
+        let _key_guard = RegKey(hkey);
+        let mut buf = [0u8; 512];
+        let mut buf_size = buf.len() as u32;
+        
+        // SAFETY:
+        // hkey 是成功打开的键句柄，value_name 是以 NUL 结尾的宽字符数组。
+        // 缓冲区 buf 的指针和长度变量均合法，操作系统向其填充值，在该调用期间是安全的。
+        let result = unsafe {
+            RegQueryValueExW(
                 hkey,
                 PCWSTR(value_name.as_ptr()),
                 None,
                 None,
                 Some(buf.as_mut_ptr()),
                 Some(&mut buf_size),
-            );
-            let _ = windows::Win32::System::Registry::RegCloseKey(hkey).ok();
-            result.is_ok()
-        } else {
-            false
-        }
+            )
+        };
+        result.is_ok()
+    } else {
+        false
     }
 }
 
 fn toggle_autostart() {
-    unsafe {
-        use windows::Win32::System::Registry::{
-            RegOpenKeyExW, RegSetValueExW, RegDeleteValueW, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
-        };
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegSetValueExW, RegDeleteValueW, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
+    };
 
-        let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
-            .encode_utf16()
-            .collect();
-        let value_name: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut hkey = Default::default();
+    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+        .encode_utf16()
+        .collect();
+    let value_name: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut hkey = Default::default();
 
-        if RegOpenKeyExW(
+    // SAFETY:
+    // 使用有效的预定义根键和以 NUL 结尾的子键名称路径打开注册表键。
+    // 成功打开后将其句柄保存在 hkey 并通过 RegKey 进行 RAII 自动关闭。
+    let open_ok = unsafe {
+        RegOpenKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR(key_path.as_ptr()),
             Some(0),
@@ -298,14 +383,24 @@ fn toggle_autostart() {
             &mut hkey,
         )
         .is_ok()
-        {
-            if is_autostart_enabled() {
+    };
+
+    if open_ok {
+        let _key_guard = RegKey(hkey);
+        if is_autostart_enabled() {
+            // SAFETY: 删除自启动项值。
+            unsafe {
                 let _ = RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr())).ok();
-            } else {
-                let exe_path = std::env::current_exe().unwrap();
-                let path_str = exe_path.to_string_lossy().to_string();
-                let path_quoted = format!("\"{}\"", path_str);
-                let path_wide: Vec<u16> = path_quoted.encode_utf16().chain(std::iter::once(0)).collect();
+            }
+        } else {
+            let exe_path = std::env::current_exe().unwrap();
+            let path_str = exe_path.to_string_lossy().to_string();
+            let path_quoted = format!("\"{}\"", path_str);
+            let path_wide: Vec<u16> = path_quoted.encode_utf16().chain(std::iter::once(0)).collect();
+            
+            // SAFETY:
+            // 写入键值，数据缓冲区的指针和字节数在调用期间合法且对应。
+            unsafe {
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR(value_name.as_ptr()),
@@ -314,12 +409,11 @@ fn toggle_autostart() {
                     Some(std::slice::from_raw_parts(
                         path_wide.as_ptr() as *const u8,
                         path_wide.len() * 2,
-                    )),
-                )
-                .ok();
-            }
-            let _ = windows::Win32::System::Registry::RegCloseKey(hkey).ok();
-        }
-    }
+                      )),
+                  )
+                  .ok();
+              }
+          }
+      }
 }
 

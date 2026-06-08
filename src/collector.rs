@@ -47,122 +47,167 @@ pub fn collect_cpu() {
     let mut kernel_time = 0u64;
     let mut user_time = 0u64;
 
-    unsafe {
-        if windows::Win32::System::Threading::GetSystemTimes(
+    // SAFETY:
+    // 传入的指针均指向当前栈帧分配的有效且可变的 u64 变量。
+    // Windows API 仅在此调用期间写入数据，符合内存安全和对齐要求。
+    let ok = unsafe {
+        windows::Win32::System::Threading::GetSystemTimes(
             Some(&mut idle_time as *mut u64 as *mut _),
             Some(&mut kernel_time as *mut u64 as *mut _),
             Some(&mut user_time as *mut u64 as *mut _),
         )
         .is_ok()
-        {
-            if !CPU_INITIALIZED.load(Ordering::Acquire) {
-                PREV_IDLE_TIME.store(idle_time, Ordering::Release);
-                PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
-                PREV_USER_TIME.store(user_time, Ordering::Release);
-                CPU_INITIALIZED.store(true, Ordering::Release);
-                return;
-            }
+    };
 
-            let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Acquire));
-            let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Acquire));
-            let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Acquire));
-            let total = kernel_diff + user_diff;
-
-            if total > 0 {
-                let usage = ((total - idle_diff) * 100 / total) as u32;
-                CPU_USAGE.store(usage.min(100), Ordering::Release);
-            }
-
+    if ok {
+        if !CPU_INITIALIZED.load(Ordering::Acquire) {
             PREV_IDLE_TIME.store(idle_time, Ordering::Release);
             PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
             PREV_USER_TIME.store(user_time, Ordering::Release);
+            CPU_INITIALIZED.store(true, Ordering::Release);
+            return;
         }
+
+        let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Acquire));
+        let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Acquire));
+        let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Acquire));
+        let total = kernel_diff + user_diff;
+
+        if total > 0 {
+            let usage = ((total - idle_diff) * 100 / total) as u32;
+            CPU_USAGE.store(usage.min(100), Ordering::Release);
+        }
+
+        PREV_IDLE_TIME.store(idle_time, Ordering::Release);
+        PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
+        PREV_USER_TIME.store(user_time, Ordering::Release);
     }
 }
 
 pub fn collect_memory() {
-    unsafe {
-        let mut mem_info = MEMORYSTATUSEX {
-            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-            ..Default::default()
-        };
+    let mut mem_info = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
 
-        if GlobalMemoryStatusEx(&mut mem_info).is_ok() {
-            MEM_USAGE.store(mem_info.dwMemoryLoad as u32, Ordering::Release);
+    // SAFETY:
+    // mem_info 结构体已正确初始化其 dwLength 字段以供 API 校验结构大小。
+    // 传入其可变引用符合内存对齐与独占性要求，API 仅在调用期间安全填充系统内存状态。
+    let ok = unsafe { GlobalMemoryStatusEx(&mut mem_info).is_ok() };
+
+    if ok {
+        MEM_USAGE.store(mem_info.dwMemoryLoad as u32, Ordering::Release);
+    }
+}
+
+struct MibTable(*mut MIB_IF_TABLE2);
+
+impl MibTable {
+    fn rows(&self) -> &[MIB_IF_ROW2] {
+        if self.0.is_null() {
+            &[]
+        } else {
+            // SAFETY:
+            // 1. self.0 是由成功返回的 GetIfTable2 分配的有效指针，且非空。
+            // 2. 操作系统保证该结构体的内存中 Table 数组实际包含 NumEntries 个连续的 MIB_IF_ROW2 元素。
+            // 3. 从 ULONG (u32) 到 usize 的转换是无损扩展转换（32 位到 64 位），在现代操作系统平台上不会发生溢出或截断。
+            // 4. 虽然 Rust 绑定把 Table 定义为大小为 1 的数组（对应 C 语言的柔性数组），但实际上在内存中它是大小为 NumEntries 的连续块。
+            //    在此我们使用 as_ptr() 获取首地址，再通过 std::slice::from_raw_parts 构造切片，这在内存布局上是合法且连续的。
+            // 5. 整个 `rows` 切片的生存期绑定到 `&self`，在 MibTable 析构前该切片始终有效且不会被修改。
+            unsafe {
+                let table_ref = &*self.0;
+                let num_entries = table_ref.NumEntries as usize;
+                std::slice::from_raw_parts(table_ref.Table.as_ptr(), num_entries)
+            }
+        }
+    }
+}
+
+impl Drop for MibTable {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: self.0是由GetIfTable2分配的有效指针，FreeMibTable将其正确释放。
+            unsafe {
+                FreeMibTable(self.0 as *const _);
+            }
         }
     }
 }
 
 pub fn collect_network() {
-    unsafe {
-        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-        let result = GetIfTable2(&mut table);
-        if result.0 == 0 && !table.is_null() {
-            let table_ref = &*table;
-            let num_entries = table_ref.NumEntries as usize;
-            let row_ptr = table_ref.Table.as_ptr();
+    let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    // SAFETY:
+    // table 指针传入 GetIfTable2 的可变引用中，成功调用后由 Windows 操作系统分配一块
+    // MIB_IF_TABLE2 结构的内存并填充数据，然后通过包装器 MibTable(table) 在其 Drop 中正确自动释放（RAII）。
+    let result = unsafe { GetIfTable2(&mut table) };
 
-            let virtual_blacklist = get_virtual_blacklist();
-            let mut current_data: HashMap<u64, (u64, u64)> = HashMap::new();
-            let mut has_up_interface = false;
+    if result.0 == 0 && !table.is_null() {
+        let table_wrapper = MibTable(table);
+        let virtual_blacklist = get_virtual_blacklist();
+        let mut current_data: HashMap<u64, (u64, u64)> = HashMap::new();
+        let mut has_up_interface = false;
 
-            for i in 0..num_entries {
-                let row = &*row_ptr.add(i);
-
-                if !is_valid_interface(row) {
-                    continue;
-                }
-
-                let luid = row.InterfaceLuid.Value;
-                if virtual_blacklist.contains(&luid) {
-                    continue;
-                }
-
-                if row.OperStatus == IfOperStatusUp {
-                    has_up_interface = true;
-                    current_data.insert(luid, (row.InOctets, row.OutOctets));
-                }
+        for row in table_wrapper.rows() {
+            if !is_valid_interface(row) {
+                continue;
             }
 
-            if !NET_INITIALIZED.load(Ordering::Acquire) {
-                let mut history = INTERFACE_HISTORY.lock().unwrap();
-                *history = current_data;
-                NET_INITIALIZED.store(true, Ordering::Release);
-                FreeMibTable(table as *const _);
-                return;
+            // SAFETY:
+            // InterfaceLuid 是 Win32 中的联合体（union）。
+            // 操作系统返回的 MibTable 中的每一行数据均由系统成功初始化，因此访问此联合体字段是内存安全的。
+            let luid = unsafe { row.InterfaceLuid.Value };
+            if virtual_blacklist.contains(&luid) {
+                continue;
             }
 
+            if row.OperStatus == IfOperStatusUp {
+                has_up_interface = true;
+                current_data.insert(luid, (row.InOctets, row.OutOctets));
+            }
+        }
+
+        if !NET_INITIALIZED.load(Ordering::Acquire) {
             let mut history = INTERFACE_HISTORY.lock().unwrap();
+            *history = current_data;
+            NET_INITIALIZED.store(true, Ordering::Release);
+            return;
+        }
 
-            let mut max_total: u64 = 0;
-            let mut best_speed_down: u32 = 0;
-            let mut best_speed_up: u32 = 0;
+        let mut history = INTERFACE_HISTORY.lock().unwrap();
 
-            for (luid, (in_octets, out_octets)) in &current_data {
-                if let Some(&(prev_in, prev_out)) = history.get(luid) {
-                    let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
-                    let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
-                    let total = speed_down as u64 + speed_up as u64;
+        let mut max_total: u64 = 0;
+        let mut best_speed_down: u32 = 0;
+        let mut best_speed_up: u32 = 0;
 
-                    if total > max_total {
-                        max_total = total;
-                        best_speed_down = speed_down;
-                        best_speed_up = speed_up;
-                    }
+        for (luid, (in_octets, out_octets)) in &current_data {
+            if let Some(&(prev_in, prev_out)) = history.get(luid) {
+                let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
+                let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
+                let total = speed_down as u64 + speed_up as u64;
+
+                if total > max_total {
+                    max_total = total;
+                    best_speed_down = speed_down;
+                    best_speed_up = speed_up;
                 }
             }
+        }
 
-            *history = current_data;
-            drop(history);
+        *history = current_data;
+        drop(history);
 
-            NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
-            NET_SPEED_UP.store(best_speed_up, Ordering::Release);
+        NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
+        NET_SPEED_UP.store(best_speed_up, Ordering::Release);
 
-            if best_speed_down == 0 && best_speed_up == 0 && !has_up_interface {
-                let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
-                    NETWORK_BACKOFF.store(true, Ordering::Release);
-                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
+        if best_speed_down == 0 && best_speed_up == 0 && !has_up_interface {
+            let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
+                NETWORK_BACKOFF.store(true, Ordering::Release);
+                let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
+                // SAFETY:
+                // HWND 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
+                // PostMessageW 是线程安全的 Windows API，能安全地跨线程投递自定义的网络断开消息。
+                unsafe {
                     let _ = PostMessageW(
                         Some(hwnd),
                         WM_USER_NETWORK_DISCONNECTED,
@@ -170,11 +215,16 @@ pub fn collect_network() {
                         LPARAM(0),
                     );
                 }
-            } else {
-                CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
-                if NETWORK_BACKOFF.load(Ordering::Acquire) {
-                    NETWORK_BACKOFF.store(false, Ordering::Release);
-                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
+            }
+        } else {
+            CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
+            if NETWORK_BACKOFF.load(Ordering::Acquire) {
+                NETWORK_BACKOFF.store(false, Ordering::Release);
+                let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
+                // SAFETY:
+                // HWND 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
+                // PostMessageW 是线程安全的 Windows API，能安全地跨线程投递自定义的网络重连消息。
+                unsafe {
                     let _ = PostMessageW(
                         Some(hwnd),
                         WM_USER_NETWORK_RECONNECTED,
@@ -183,8 +233,6 @@ pub fn collect_network() {
                     );
                 }
             }
-
-            FreeMibTable(table as *const _);
         }
     }
 }
@@ -225,11 +273,18 @@ fn is_virtual_friendly_name(name: &str) -> bool {
         || name_lower.contains("xen")
 }
 
+/// # Safety
+///
+/// 调用者必须保证：
+/// 1. `ptr` 必须指向一个有效的、以 `0` (NUL) 结尾的 UTF-16 宽字符序列。
+/// 2. 在此函数执行结束前，`ptr` 指向的内存块必须保持有效且不可变。
 unsafe fn read_wide_string(ptr: *mut u16) -> String {
     if ptr.is_null() {
         return String::new();
     }
     let mut len = 0;
+    // SAFETY: 调用者保证了 ptr 指向有效的 NUL 结尾 UTF-16 字符串，
+    // 我们可以安全地递增地址并解引用以计算长度，最后通过 from_raw_parts 安全读取。
     unsafe {
         while *ptr.add(len) != 0 {
             len += 1;
@@ -238,39 +293,59 @@ unsafe fn read_wide_string(ptr: *mut u16) -> String {
     }
 }
 
-unsafe fn build_virtual_blacklist() -> Option<Vec<u64>> {
-    unsafe {
-        let mut buf_size: u32 = 0;
-        let ret = GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, None, &mut buf_size);
-        if ret != ERROR_BUFFER_OVERFLOW.0 {
-            return None;
-        }
-
-        let mut buf: Vec<u64> = vec![0u64; (buf_size as usize).div_ceil(8)];
-        let adapter_ptr = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
-
-        let ret = GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, Some(adapter_ptr), &mut buf_size);
-        if ret != 0 {
-            return None;
-        }
-
-        let mut blacklist = Vec::new();
-        let mut current = adapter_ptr;
-        while !current.is_null() {
-            let adapter = &*current;
-
-            let friendly = read_wide_string(adapter.FriendlyName.0);
-            let desc = read_wide_string(adapter.Description.0);
-
-            if is_virtual_friendly_name(&friendly) || is_virtual_friendly_name(&desc) {
-                blacklist.push(adapter.Luid.Value);
-            }
-
-            current = adapter.Next;
-        }
-
-        Some(blacklist)
+fn build_virtual_blacklist() -> Option<Vec<u64>> {
+    let mut buf_size: u32 = 0;
+    // SAFETY:
+    // GetAdaptersAddresses 是标准的 Win32 API。第一次传入 None 的目的是为了查询系统所需的缓冲区字节大小，
+    // 并写入 buf_size 中。参数传入符合 API 规范。
+    let ret = unsafe {
+        GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, None, &mut buf_size)
+    };
+    if ret != ERROR_BUFFER_OVERFLOW.0 {
+        return None;
     }
+
+    // 分配对齐的内存来存储适配器信息
+    let mut buf: Vec<u64> = vec![0u64; (buf_size as usize).div_ceil(8)];
+    let adapter_ptr = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+
+    // SAFETY:
+    // adapter_ptr 指向刚才分配的、对齐且大小为 buf_size 的有效内存缓冲区 buf。
+    // API 调用会向该缓冲区填充系统网络适配器链表数据。
+    let ret = unsafe {
+        GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, Some(adapter_ptr), &mut buf_size)
+    };
+    if ret != 0 {
+        return None;
+    }
+
+    let mut blacklist = Vec::new();
+    let mut current = adapter_ptr;
+    while !current.is_null() {
+        // SAFETY:
+        // current 是 GetAdaptersAddresses 返回的单向链表中的非空有效节点。
+        // 在本作用域内，buf 的生命周期足够长，且其内存没有被修改或释放，因此解引用 current 是内存安全的。
+        let adapter = unsafe { &*current };
+
+        // SAFETY:
+        // adapter.FriendlyName.0 和 adapter.Description.0 是 Windows 操作系统填充的、
+        // 以 NUL 结尾的有效 UTF-16 宽字符指针，且在此函数的执行期间保持有效。
+        // 满足 read_wide_string 的安全契约。
+        let friendly = unsafe { read_wide_string(adapter.FriendlyName.0) };
+        let desc = unsafe { read_wide_string(adapter.Description.0) };
+
+        if is_virtual_friendly_name(&friendly) || is_virtual_friendly_name(&desc) {
+            // SAFETY:
+            // Luid 是 Win32 中的联合体（union）。
+            // GetAdaptersAddresses 成功返回的节点中，其 Luid 部分数据已由系统初始化，安全访问其 Value 字段。
+            let luid_val = unsafe { adapter.Luid.Value };
+            blacklist.push(luid_val);
+        }
+
+        current = adapter.Next;
+    }
+
+    Some(blacklist)
 }
 
 fn get_virtual_blacklist() -> Vec<u64> {
@@ -283,7 +358,7 @@ fn get_virtual_blacklist() -> Vec<u64> {
         }
     }
 
-    let new_list = unsafe { build_virtual_blacklist() };
+    let new_list = build_virtual_blacklist();
     match new_list {
         Some(list) => {
             *VIRTUAL_BLACKLIST.lock().unwrap() = Some((list.clone(), Instant::now()));
@@ -297,6 +372,10 @@ fn get_virtual_blacklist() -> Vec<u64> {
 }
 
 pub fn trim_working_set() {
+    // SAFETY:
+    // GetCurrentProcess() 获取当前进程的伪句柄。
+    // SetProcessWorkingSetSize 传入 usize::MAX 可触发系统回收当前进程的工作集内存，
+    // 该操作是系统级内存优化，不违反 Rust 内存安全原则。
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
