@@ -88,10 +88,13 @@ pub fn create_main_window() -> Result<HWND, String> {
 
 pub fn create_tray_icon(hwnd: HWND) {
     // SAFETY: LoadIconW 失败时回退到 IDI_APPLICATION。
+    #[allow(clippy::manual_dangling_ptr)]
+    // 1 as *const u16 对应 Win32 MAKEINTRESOURCEW(1)，表示嵌入的资源 ID 1（assets/icon.ico），
+    // clippy 的 manual_dangling_ptr 规则无法识别 Windows 资源 ID 惯用法，此处需抑制该 lint。
     let hicon = unsafe {
         LoadIconW(
             Some(GetModuleHandleW(None).unwrap().into()),
-            PCWSTR(std::ptr::dangling::<u16>()),
+            PCWSTR(1 as *const u16),
         )
         .or_else(|_| LoadIconW(None, IDI_APPLICATION))
         .unwrap_or_default()
