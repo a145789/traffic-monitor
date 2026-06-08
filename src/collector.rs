@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetIfTable2, FreeMibTable, NotifyAddrChange, MIB_IF_TABLE2, MIB_IF_ROW2,
+    GetIfTable2, FreeMibTable, MIB_IF_TABLE2, MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::System::SystemInformation::{
@@ -8,7 +8,6 @@ use windows::Win32::System::SystemInformation::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::{
@@ -34,37 +33,7 @@ static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 pub fn init_network_listener(hwnd: HWND) {
-    MAIN_HWND_NETWORK.store(hwnd.0, Ordering::Relaxed);
-    spawn_network_listener();
-}
-
-fn spawn_network_listener() {
-    std::thread::Builder::new()
-        .stack_size(64 * 1024)
-        .spawn(|| {
-            loop {
-                unsafe {
-                    let result = NotifyAddrChange(std::ptr::null_mut(), std::ptr::null::<OVERLAPPED>());
-                    if result != 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        continue;
-                    }
-                }
-
-                if NETWORK_BACKOFF.load(Ordering::Relaxed) {
-                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Relaxed));
-                    unsafe {
-                        let _ = PostMessageW(
-                            Some(hwnd),
-                            WM_USER_NETWORK_RECONNECTED,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
-            }
-        })
-        .expect("Failed to spawn network listener thread");
+    MAIN_HWND_NETWORK.store(hwnd.0, Ordering::Release);
 }
 
 pub fn collect_cpu() {
@@ -80,27 +49,27 @@ pub fn collect_cpu() {
         )
         .is_ok()
         {
-            if !CPU_INITIALIZED.load(Ordering::Relaxed) {
-                PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);
-                PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
-                PREV_USER_TIME.store(user_time, Ordering::Relaxed);
-                CPU_INITIALIZED.store(true, Ordering::Relaxed);
+            if !CPU_INITIALIZED.load(Ordering::Acquire) {
+                PREV_IDLE_TIME.store(idle_time, Ordering::Release);
+                PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
+                PREV_USER_TIME.store(user_time, Ordering::Release);
+                CPU_INITIALIZED.store(true, Ordering::Release);
                 return;
             }
 
-            let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Relaxed));
-            let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Relaxed));
-            let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Relaxed));
+            let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Acquire));
+            let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Acquire));
+            let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Acquire));
             let total = kernel_diff + user_diff;
 
             if total > 0 {
                 let usage = ((total - idle_diff) * 100 / total) as u32;
-                CPU_USAGE.store(usage.min(100), Ordering::Relaxed);
+                CPU_USAGE.store(usage.min(100), Ordering::Release);
             }
 
-            PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);
-            PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
-            PREV_USER_TIME.store(user_time, Ordering::Relaxed);
+            PREV_IDLE_TIME.store(idle_time, Ordering::Release);
+            PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
+            PREV_USER_TIME.store(user_time, Ordering::Release);
         }
     }
 }
@@ -113,7 +82,7 @@ pub fn collect_memory() {
         };
 
         if GlobalMemoryStatusEx(&mut mem_info).is_ok() {
-            MEM_USAGE.store(mem_info.dwMemoryLoad as u32, Ordering::Relaxed);
+            MEM_USAGE.store(mem_info.dwMemoryLoad as u32, Ordering::Release);
         }
     }
 }
@@ -145,25 +114,25 @@ pub fn collect_network() {
                 }
             }
 
-            if !NET_INITIALIZED.load(Ordering::Relaxed) {
-                PREV_NET_IN.store(total_in, Ordering::Relaxed);
-                PREV_NET_OUT.store(total_out, Ordering::Relaxed);
-                NET_INITIALIZED.store(true, Ordering::Relaxed);
+            if !NET_INITIALIZED.load(Ordering::Acquire) {
+                PREV_NET_IN.store(total_in, Ordering::Release);
+                PREV_NET_OUT.store(total_out, Ordering::Release);
+                NET_INITIALIZED.store(true, Ordering::Release);
                 FreeMibTable(table as *const _);
                 return;
             }
 
-            let speed_down = total_in.saturating_sub(PREV_NET_IN.load(Ordering::Relaxed)).min(u32::MAX as u64) as u32;
-            let speed_up = total_out.saturating_sub(PREV_NET_OUT.load(Ordering::Relaxed)).min(u32::MAX as u64) as u32;
+            let speed_down = total_in.saturating_sub(PREV_NET_IN.load(Ordering::Acquire)).min(u32::MAX as u64) as u32;
+            let speed_up = total_out.saturating_sub(PREV_NET_OUT.load(Ordering::Acquire)).min(u32::MAX as u64) as u32;
 
-            NET_SPEED_DOWN.store(speed_down, Ordering::Relaxed);
-            NET_SPEED_UP.store(speed_up, Ordering::Relaxed);
+            NET_SPEED_DOWN.store(speed_down, Ordering::Release);
+            NET_SPEED_UP.store(speed_up, Ordering::Release);
 
             if speed_down == 0 && speed_up == 0 && !has_up_interface {
                 let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Relaxed) {
-                    NETWORK_BACKOFF.store(true, Ordering::Relaxed);
-                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Relaxed));
+                if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
+                    NETWORK_BACKOFF.store(true, Ordering::Release);
+                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
                     let _ = PostMessageW(
                         Some(hwnd),
                         WM_USER_NETWORK_DISCONNECTED,
@@ -172,10 +141,10 @@ pub fn collect_network() {
                     );
                 }
             } else {
-                CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
-                if NETWORK_BACKOFF.load(Ordering::Relaxed) {
-                    NETWORK_BACKOFF.store(false, Ordering::Relaxed);
-                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Relaxed));
+                CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
+                if NETWORK_BACKOFF.load(Ordering::Acquire) {
+                    NETWORK_BACKOFF.store(false, Ordering::Release);
+                    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
                     let _ = PostMessageW(
                         Some(hwnd),
                         WM_USER_NETWORK_RECONNECTED,
@@ -185,14 +154,19 @@ pub fn collect_network() {
                 }
             }
 
-            PREV_NET_IN.store(total_in, Ordering::Relaxed);
-            PREV_NET_OUT.store(total_out, Ordering::Relaxed);
+            PREV_NET_IN.store(total_in, Ordering::Release);
+            PREV_NET_OUT.store(total_out, Ordering::Release);
 
             FreeMibTable(table as *const _);
         }
     }
 }
 
+// 注意：此处故意不检查 HardwareInterface 标志位。
+// 在 Hyper-V / WSL2 / Docker Desktop 环境下，物理网卡绑定到虚拟交换机后，
+// 外网流量实际由 vEthernet 等虚拟网口承载，其 HardwareInterface 为 false。
+// 若保留该检查，这些环境下网速将始终显示为 0。
+// 因此仅保留接口类型（Ethernet / Wi-Fi）和 PhysicalAddressLength > 0 的过滤。
 fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
     let if_type = row.Type;
     if if_type != IF_TYPE_ETHERNET_CSMACD && if_type != IF_TYPE_IEEE80211 {
