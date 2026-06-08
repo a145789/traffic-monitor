@@ -118,10 +118,18 @@ jobs:
           mv Output/TrafficMonitor-Setup.exe Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe
 
       - name: Upload to Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload ${{ github.ref_name }} `
-            target/release/traffic-monitor.exe#traffic-monitor.exe `
-            Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe#TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe `
+          if ! gh release view "${{ github.ref_name }}" &>/dev/null; then
+            echo "Release ${{ github.ref_name }} not found. Creating it..."
+            gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes
+          else
+            echo "Release ${{ github.ref_name }} already exists."
+          fi
+
+          gh release upload "${{ github.ref_name }}" \
+            "target/release/traffic-monitor.exe#traffic-monitor.exe" \
+            "Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe#TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe" \
             --clobber

@@ -56,9 +56,7 @@ execSync(`git tag v${newVersion}`, { stdio: "inherit" });
 console.log("Pushing to remote...");
 execSync("git push && git push --tags", { stdio: "inherit" });
 
-// Create GitHub Release
-console.log("Creating GitHub Release...");
-execSync(`gh release create v${newVersion} --title "v${newVersion}" --generate-notes`, { stdio: "inherit" });
+// Print success message
+console.log(`\nTag v${newVersion} pushed successfully!`);
+console.log("GitHub Actions will automatically create the Release, build the binaries, and upload the assets.");
 
-console.log(`\nRelease v${newVersion} created!`);
-console.log("GitHub Actions will build and upload the assets automatically.");
