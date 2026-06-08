@@ -1,19 +1,16 @@
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
-    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, GetTextExtentPoint32W,
-    GetWindowDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    HDC, HFONT, HBITMAP, HGDIOBJ, HBRUSH,
-    SRCCOPY, FONT_QUALITY, LOGFONTW, TRANSPARENT,
-    DrawTextW, DT_LEFT, DT_RIGHT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreateSolidBrush,
+    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+    FONT_QUALITY, FillRect, GetTextExtentPoint32W, GetWindowDC, HBITMAP, HBRUSH, HDC, HFONT,
+    HGDIOBJ, LOGFONTW, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 
 use crate::config::{
-    COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE, MOUSE_ONLINE, CPU_USAGE, MEM_USAGE,
-    NET_SPEED_DOWN, NET_SPEED_UP, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_IS_CHARGING,
-    SHOW_MOUSE_INFO,
+    COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, CPU_USAGE, DISPLAY_HEIGHT,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
+    MOUSE_IS_CHARGING, MOUSE_ONLINE, NET_SPEED_DOWN, NET_SPEED_UP, SHOW_MOUSE_INFO,
 };
 use crate::ffi_guard::RegKey;
 
@@ -33,35 +30,27 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
-        // SAFETY:
-        // 传入 null_mut 句柄用于获取整个主屏幕的临时设备上下文句柄（HDC）。
+        // SAFETY: null_mut 句柄获取整个屏幕的临时 HDC。
         let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
-        
-        // SAFETY:
-        // hdc_screen 是有效的屏幕设备上下文句柄，由系统临时分配。
+
+        // SAFETY: hdc_screen 有效，创建兼容内存 DC。
         let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
-        
-        // SAFETY:
-        // hdc_screen 是有效句柄。创建与 hdc_screen 格式兼容的 HBITMAP 资源。
+
+        // SAFETY: hdc_screen 有效，创建兼容位图。
         let hbitmap = unsafe { CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT) };
-        
-        // SAFETY:
-        // hdc_mem 是有效的内存上下文句柄，hbitmap 是有效的位图句柄。
-        // 将新位图选入设备上下文并返回旧有的 GDI 备份对象。
+
+        // SAFETY: hdc_mem 和 hbitmap 有效，选入并备份旧位图。
         let old_bitmap = unsafe { SelectObject(hdc_mem, hbitmap.into()) };
 
         let hfont = create_font(FONT_BASE_SIZE);
-        
-        // SAFETY:
-        // 将有效的新字体对象选入内存上下文中。
+
+        // SAFETY: hfont 有效，选入并备份旧字体。
         let old_font = unsafe { SelectObject(hdc_mem, hfont.into()) };
 
-        // SAFETY:
-        // 创建指定背景透明的纯色刷子对象。
+        // SAFETY: 创建透明背景纯色刷子。
         let hbrush = unsafe { CreateSolidBrush(COLORREF(COLOR_KEY)) };
 
-        // SAFETY:
-        // 设置指定内存上下文的背景混合模式为透明模式。
+        // SAFETY: 设置背景模式为透明。
         unsafe {
             let _ = SetBkMode(hdc_mem, TRANSPARENT);
         }
@@ -69,17 +58,15 @@ impl Renderer {
         let arrow_width = {
             let arrow_text = to_wide("\u{2191} ");
             let mut size = SIZE::default();
-            // SAFETY:
-            // hdc_mem 是有效内存上下文，arrow_text 是以 NUL 结尾的有效宽字符数组。
-            // 写入 size 是合法的栈内存地址，操作在其调用期间安全。
+            // SAFETY: hdc_mem 有效，arrow_text 以 NUL 结尾，size 在栈上。
             unsafe {
-                let _ = GetTextExtentPoint32W(hdc_mem, &arrow_text[..arrow_text.len() - 1], &mut size);
+                let _ =
+                    GetTextExtentPoint32W(hdc_mem, &arrow_text[..arrow_text.len() - 1], &mut size);
             }
             size.cx
         };
 
-        // SAFETY:
-        // 释放先前由 GetWindowDC 获取的屏幕设备上下文。
+        // SAFETY: 释放临时屏幕 HDC。
         unsafe {
             let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
         }
@@ -135,11 +122,7 @@ impl Renderer {
         let speed_left = speed_right - (76.0 * scale).round() as i32;
         let arrow_right = speed_left + self.arrow_width;
 
-        // SAFETY:
-        // 在这里我们对当前结构体持有的有效句柄进行 GDI 渲染。
-        // hdc_mem 和 hbrush 均在所有者生存期内保证合法。
-        // 调用 DrawTextW 传入的 RECT 指针和 wide 字符切片均在当前栈帧内分配且有效。
-        // 目标句柄 hdc 是由 Windows 传入的有效设备上下文。
+        // SAFETY: hdc_mem、hbrush 均有效，DrawTextW 的 RECT 和字符串在栈上分配。
         unsafe {
             let _ = FillRect(self.hdc_mem, &rect, self.hbrush);
             SetTextColor(self.hdc_mem, self.text_color);
@@ -379,22 +362,21 @@ impl Renderer {
         let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
 
         // 1. 创建符合新大小的 Compatible Bitmap
-        // SAFETY: 传入 NULL 句柄给 GetWindowDC 用于临时获取整个主屏幕屏幕设备的 HDC 上下文，这在 GDI 绘图中是标准且安全的常规操作。
+        // SAFETY: null_mut 句柄获取临时屏幕 HDC。
         let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
-        
-        // SAFETY: hdc_screen 是先前成功获取的屏幕设备有效 HDC，使用其兼容格式和合理宽高参数创建位图，不会引发越界分配。
+
+        // SAFETY: hdc_screen 有效，创建兼容位图。
         let new_bitmap = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
-        
-        // SAFETY: 临时获取的屏幕 hdc_screen 不再需要使用，调用 ReleaseDC 归还系统资源以防止 HDC 资源泄露。
+
+        // SAFETY: 释放临时屏幕 HDC。
         unsafe {
             let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
         }
 
         // 2. 将新位图选入内存 DC，销毁旧位图
         if !new_bitmap.is_invalid() {
-            // SAFETY: self.hdc_mem 是在 Renderer 初始化时成功创建的内存设备上下文，new_bitmap 是通过 CreateCompatibleBitmap 分配成功的有效句柄，在此将新位图选入设备上下文是内存安全的。
+            // SAFETY: hdc_mem 和 new_bitmap 有效，选入新位图并销毁旧位图。
             let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.into()) };
-            // SAFETY: 选出内存上下文的旧位图 old_bitmap 不再需要使用，调用 DeleteObject 释放其底层 GDI 资源是内存安全的。
             unsafe {
                 let _ = DeleteObject(old_bitmap.into());
             }
@@ -405,9 +387,8 @@ impl Renderer {
         let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
         let new_font = create_font(font_size);
         if !new_font.is_invalid() {
-            // SAFETY: new_font 是新分配的合法字体对象，选入当前内存设备上下文 self.hdc_mem 不会发生资源冲突。
+            // SAFETY: hdc_mem 和 new_font 有效，选入新字体并销毁旧字体。
             let old_font = unsafe { SelectObject(self.hdc_mem, new_font.into()) };
-            // SAFETY: 替换出的旧字体对象已无其他地方引用，在此销毁它以防止内存和 GDI 资源泄漏。
             unsafe {
                 let _ = DeleteObject(old_font.into());
             }
@@ -419,7 +400,7 @@ impl Renderer {
         self.width = width;
         self.height = height;
 
-        // SAFETY: self.hdc_mem 为当前实例中持有的有效内存设备上下文，设置其背景模式为 TRANSPARENT 可使得 TextOut 等绘制不填充背景，是无副作用的安全调用。
+        // SAFETY: hdc_mem 有效，设置背景模式为透明。
         unsafe {
             let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
         }
@@ -427,11 +408,13 @@ impl Renderer {
         let arrow_width = {
             let arrow_text = to_wide("\u{2191} ");
             let mut size = SIZE::default();
-            // SAFETY:
-            // hdc_mem 是有效内存上下文，arrow_text 是以 NUL 结尾的有效宽字符数组。
-            // 写入 size 是合法的栈内存地址，操作在其调用期间安全。
+            // SAFETY: hdc_mem 有效，arrow_text 以 NUL 结尾，size 在栈上。
             unsafe {
-                let _ = GetTextExtentPoint32W(self.hdc_mem, &arrow_text[..arrow_text.len() - 1], &mut size);
+                let _ = GetTextExtentPoint32W(
+                    self.hdc_mem,
+                    &arrow_text[..arrow_text.len() - 1],
+                    &mut size,
+                );
             }
             size.cx
         };
@@ -485,10 +468,9 @@ fn format_speed(bytes_per_sec: u32) -> String {
     }
 }
 
-
 pub fn is_system_light_theme() -> bool {
     use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
+        HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
     };
     use windows::core::PCWSTR;
 
@@ -514,7 +496,7 @@ pub fn is_system_light_theme() -> bool {
     };
 
     if open_ok {
-        let _key_guard = RegKey(hkey);
+        let _key_guard = RegKey::new(hkey);
         let mut value: u32 = 0;
         let mut value_size = std::mem::size_of::<u32>() as u32;
 

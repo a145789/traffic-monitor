@@ -1,22 +1,20 @@
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GetIfTable2, FreeMibTable, IP_ADAPTER_ADDRESSES_LH,
-    MIB_IF_TABLE2, MIB_IF_ROW2, GET_ADAPTERS_ADDRESSES_FLAGS,
+    FreeMibTable, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetIfTable2,
+    IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::System::SystemInformation::{
-    GlobalMemoryStatusEx, MEMORYSTATUSEX,
-};
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
-use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::{
-    CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP,
-    BACKOFF_ZERO_THRESHOLD, NETWORK_BACKOFF, CONSECUTIVE_ZERO_COUNT,
+    BACKOFF_ZERO_THRESHOLD, CONSECUTIVE_ZERO_COUNT, CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN,
+    NET_SPEED_UP, NETWORK_BACKOFF,
 };
 
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
@@ -34,8 +32,10 @@ static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-static INTERFACE_HISTORY: LazyLock<Mutex<HashMap<u64, (u64, u64)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static VIRTUAL_BLACKLIST: LazyLock<Mutex<Option<(Vec<u64>, Instant)>>> = LazyLock::new(|| Mutex::new(None));
+static INTERFACE_HISTORY: LazyLock<Mutex<HashMap<u64, (u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static VIRTUAL_BLACKLIST: LazyLock<Mutex<Option<(Vec<u64>, Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
 const BLACKLIST_REFRESH_SECS: u64 = 30;
 
 pub fn init_network_listener(hwnd: HWND) {
@@ -118,9 +118,7 @@ impl MibTable {
         // 3. 虽然 Rust 绑定将 Table 定义为大小为 1 的数组（对应 C 的柔性数组），但在内存中它是大小为 num_entries 的连续块。
         //    我们通过 std::slice::from_raw_parts 构造切片，内存布局合法连续。
         // 4. 切片借用生命周期绑定到 &self，保证在 MibTable 析构前切片始终有效且不被修改。
-        unsafe {
-            std::slice::from_raw_parts((*self.0).Table.as_ptr(), num_entries)
-        }
+        unsafe { std::slice::from_raw_parts((*self.0).Table.as_ptr(), num_entries) }
     }
 }
 
@@ -302,7 +300,13 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
     // 2. 第一次调用传入 None 作为 AdapterAddresses 的目标缓冲区，仅为了让系统计算出缓冲区所需的实际字节数并回填至栈分配的 buf_size。
     // 3. 传入 &mut buf_size 可变指针在此期间是独占且安全的。
     let ret = unsafe {
-        GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, None, &mut buf_size)
+        GetAdaptersAddresses(
+            0,
+            GET_ADAPTERS_ADDRESSES_FLAGS(0),
+            None,
+            None,
+            &mut buf_size,
+        )
     };
     if ret != ERROR_BUFFER_OVERFLOW.0 {
         return None;
@@ -316,7 +320,13 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
     // 1. adapter_ptr 指向刚才基于 u64 对齐分配的、大小足以容纳 buf_size 字节的有效 Vec 缓冲区。
     // 2. 操作系统在该调用期间独占该缓冲区并安全填充系统网卡适配器链表数据，不会发生缓冲区溢出。
     let ret = unsafe {
-        GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, Some(adapter_ptr), &mut buf_size)
+        GetAdaptersAddresses(
+            0,
+            GET_ADAPTERS_ADDRESSES_FLAGS(0),
+            None,
+            Some(adapter_ptr),
+            &mut buf_size,
+        )
     };
     if ret != 0 {
         return None;

@@ -11,7 +11,13 @@ impl Drop for MutexGuard {
     }
 }
 
-pub struct RegKey(pub windows::Win32::System::Registry::HKEY);
+pub struct RegKey(windows::Win32::System::Registry::HKEY);
+
+impl RegKey {
+    pub fn new(handle: windows::Win32::System::Registry::HKEY) -> Self {
+        Self(handle)
+    }
+}
 
 impl Drop for RegKey {
     fn drop(&mut self) {
