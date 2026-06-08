@@ -12,6 +12,10 @@ pub const GAP: i32 = -3;
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 
+pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
+pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
+pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
+
 pub const MOUSE_VIDS: [u16; 2] = [0xA8A4, 0xA8A5];
 pub const MOUSE_PID: u16 = 0x2255;
 pub const MOUSE_USAGE_PAGE: u16 = 0xFF01;
@@ -44,6 +48,9 @@ pub static MOUSE_DPI_VALUE: AtomicU32 = AtomicU32::new(0);
 
 pub static NET_SPEED_UP: AtomicU32 = AtomicU32::new(0);
 pub static NET_SPEED_DOWN: AtomicU32 = AtomicU32::new(0);
+
+pub static NETWORK_BACKOFF: AtomicBool = AtomicBool::new(false);
+pub static CONSECUTIVE_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub static CPU_USAGE: AtomicU32 = AtomicU32::new(0);
 pub static MEM_USAGE: AtomicU32 = AtomicU32::new(0);
