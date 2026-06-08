@@ -556,9 +556,13 @@ fn write_u32(buf: &mut Vec<u16>, mut n: u32) {
 }
 
 fn write_fixed1(buf: &mut Vec<u16>, val: f64) {
-    let int_part = val as u32;
-    let frac = ((val - int_part as f64) * 10.0).round() as u32;
+    let mut int_part = val as u32;
+    let mut frac = ((val - int_part as f64) * 10.0).round() as u32;
+    if frac >= 10 {
+        int_part += 1;
+        frac = 0;
+    }
     write_u32(buf, int_part);
     buf.push(b'.' as u16);
-    buf.push((b'0' + frac.min(9) as u8) as u16);
+    buf.push((b'0' + frac as u8) as u16);
 }

@@ -209,25 +209,26 @@ fn check_fullscreen(hwnd: HWND) {
     // SAFETY: hmon_fg 有效，mi_fg 在栈上分配且 cbSize 已初始化。
     let fg_ok = unsafe { GetMonitorInfoW(hmon_fg, &mut mi_fg as *mut MONITORINFOEXW as *mut _) };
 
-    if !fg_ok.as_bool() {
-        return;
-    }
-
-    let mon_rect = mi_fg.monitorInfo.rcMonitor;
-    let is_full = rect.left == mon_rect.left
-        && rect.top == mon_rect.top
-        && rect.right == mon_rect.right
-        && rect.bottom == mon_rect.bottom;
+    let is_full = if fg_ok.as_bool() {
+        let mon_rect = mi_fg.monitorInfo.rcMonitor;
+        rect.left == mon_rect.left
+            && rect.top == mon_rect.top
+            && rect.right == mon_rect.right
+            && rect.bottom == mon_rect.bottom
+    } else {
+        false
+    };
 
     // 检查前台窗口是否覆盖任务栏所在显示器
     // SAFETY: 系统窗口类名，不存在时安全返回。
-    let h_taskbar = match unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")) } {
-        Ok(h) => h,
-        Err(_) => return,
+    let same_monitor = match unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")) } {
+        Ok(h_taskbar) => {
+            // SAFETY: h_taskbar 有效。
+            let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
+            hmon_fg == hmon_tb
+        }
+        Err(_) => false,
     };
-    // SAFETY: h_taskbar 有效。
-    let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
-    let same_monitor = hmon_fg == hmon_tb;
 
     let was = FULLSCREEN.load(Ordering::Acquire);
     let should_suspend = is_full && same_monitor;
