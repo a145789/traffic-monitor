@@ -12,9 +12,6 @@ use crate::config::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
 
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
-// NET_IF_INTERFACE_AND_OPER_STATUS_FLAGS_HARDWARE_INTERFACE (bit 0, mask 0x01)
-// windows-rs 0.62 does not expose a getter for this bitfield, so we use a manual mask.
-const HARDWARE_INTERFACE_MASK: u8 = 0x01;
 
 static PREV_IDLE_TIME: AtomicU64 = AtomicU64::new(0);
 static PREV_KERNEL_TIME: AtomicU64 = AtomicU64::new(0);
@@ -91,7 +88,7 @@ pub fn collect_network() {
             for i in 0..num_entries {
                 let row = &*row_ptr.add(i);
 
-                if !is_physical_interface(row) {
+                if !is_valid_interface(row) {
                     continue;
                 }
 
@@ -125,17 +122,18 @@ pub fn collect_network() {
     }
 }
 
-fn is_physical_interface(row: &MIB_IF_ROW2) -> bool {
+// 注意：此处故意不检查 HardwareInterface 标志位。
+// 在 Hyper-V / WSL2 / Docker Desktop 环境下，物理网卡绑定到虚拟交换机后，
+// 外网流量实际由 vEthernet 等虚拟网口承载，其 HardwareInterface 为 false。
+// 若保留该检查，这些环境下网速将始终显示为 0。
+// 因此仅保留接口类型（Ethernet / Wi-Fi）和 PhysicalAddressLength > 0 的过滤。
+fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
     let if_type = row.Type;
     if if_type != IF_TYPE_ETHERNET_CSMACD && if_type != IF_TYPE_IEEE80211 {
         return false;
     }
 
     if row.PhysicalAddressLength == 0 {
-        return false;
-    }
-
-    if row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE_MASK == 0 {
         return false;
     }
 
