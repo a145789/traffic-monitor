@@ -34,8 +34,8 @@ static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr:
 
 static INTERFACE_HISTORY: LazyLock<Mutex<HashMap<u64, (u64, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static VIRTUAL_BLACKLIST: LazyLock<Mutex<Option<(Vec<u64>, Instant)>>> =
-    LazyLock::new(|| Mutex::new(None));
+type BlacklistCache = Option<(Vec<u64>, Instant)>;
+static VIRTUAL_BLACKLIST: LazyLock<Mutex<BlacklistCache>> = LazyLock::new(|| Mutex::new(None));
 const BLACKLIST_REFRESH_SECS: u64 = 30;
 
 pub fn init_network_listener(hwnd: HWND) {
@@ -364,10 +364,10 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
 fn get_virtual_blacklist() -> Vec<u64> {
     {
         let cache = VIRTUAL_BLACKLIST.lock().unwrap();
-        if let Some((list, last_refresh)) = cache.as_ref() {
-            if last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS {
-                return list.clone();
-            }
+        if let Some((list, last_refresh)) = cache.as_ref()
+            && last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS
+        {
+            return list.clone();
         }
     }
 

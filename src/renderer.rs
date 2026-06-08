@@ -403,7 +403,7 @@ impl Renderer {
             // SAFETY: hdc_mem 和 new_bitmap 有效，选入新位图并销毁旧位图。
             let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.into()) };
             unsafe {
-                let _ = DeleteObject(old_bitmap.into());
+                let _ = DeleteObject(old_bitmap);
             }
             self.hbitmap = new_bitmap;
         }
@@ -415,7 +415,7 @@ impl Renderer {
             // SAFETY: hdc_mem 和 new_font 有效，选入新字体并销毁旧字体。
             let old_font = unsafe { SelectObject(self.hdc_mem, new_font.into()) };
             unsafe {
-                let _ = DeleteObject(old_font.into());
+                let _ = DeleteObject(old_font);
             }
             self.hfont = new_font;
         }
