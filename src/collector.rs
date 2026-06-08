@@ -11,7 +11,7 @@ use windows::Win32::System::SystemInformation::{
     GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::{
@@ -102,6 +102,7 @@ pub fn collect_network() {
             let num_entries = table_ref.NumEntries as usize;
             let row_ptr = table_ref.Table.as_ptr();
 
+            let virtual_blacklist = get_virtual_blacklist();
             let mut current_data: HashMap<u64, (u64, u64)> = HashMap::new();
             let mut has_up_interface = false;
 
@@ -113,7 +114,7 @@ pub fn collect_network() {
                 }
 
                 let luid = row.InterfaceLuid.Value;
-                if is_virtual_adapter(luid) {
+                if virtual_blacklist.contains(&luid) {
                     continue;
                 }
 
@@ -138,15 +139,16 @@ pub fn collect_network() {
             let mut best_speed_up: u32 = 0;
 
             for (luid, (in_octets, out_octets)) in &current_data {
-                let (prev_in, prev_out) = history.get(luid).copied().unwrap_or((*in_octets, *out_octets));
-                let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
-                let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
-                let total = speed_down as u64 + speed_up as u64;
+                if let Some(&(prev_in, prev_out)) = history.get(luid) {
+                    let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
+                    let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
+                    let total = speed_down as u64 + speed_up as u64;
 
-                if total > max_total {
-                    max_total = total;
-                    best_speed_down = speed_down;
-                    best_speed_up = speed_up;
+                    if total > max_total {
+                        max_total = total;
+                        best_speed_down = speed_down;
+                        best_speed_up = speed_up;
+                    }
                 }
             }
 
@@ -197,6 +199,11 @@ fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
         return false;
     }
 
+    // 注意：此处故意不检查 HardwareInterface 标志位。
+    // 在 Hyper-V / WSL2 / Docker Desktop 环境下，物理网卡绑定到虚拟交换机后，
+    // 外网流量实际由 vEthernet 等虚拟网口承载，其 HardwareInterface 为 false。
+    // 若保留该检查，这些环境下网速将始终显示为 0。
+    // 虚拟网口的过滤现已交由 is_virtual_friendly_name 黑名单完成。
     true
 }
 
@@ -210,6 +217,12 @@ fn is_virtual_friendly_name(name: &str) -> bool {
         || name_lower.contains("tap")
         || name_lower.contains("vpn")
         || name_lower.contains("loopback")
+        || name_lower.contains("teredo")
+        || name_lower.contains("isatap")
+        || name_lower.contains("6to4")
+        || name_lower.contains("ppp")
+        || name_lower.contains("kvm")
+        || name_lower.contains("xen")
 }
 
 unsafe fn read_wide_string(ptr: *mut u16) -> String {
@@ -225,24 +238,23 @@ unsafe fn read_wide_string(ptr: *mut u16) -> String {
     }
 }
 
-unsafe fn build_virtual_blacklist() -> Vec<u64> {
+unsafe fn build_virtual_blacklist() -> Option<Vec<u64>> {
     unsafe {
-        let mut blacklist = Vec::new();
-
         let mut buf_size: u32 = 0;
         let ret = GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, None, &mut buf_size);
-        if ret != 111 {
-            return blacklist;
+        if ret != ERROR_BUFFER_OVERFLOW.0 {
+            return None;
         }
 
-        let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+        let mut buf: Vec<u64> = vec![0u64; (buf_size as usize + 7) / 8];
         let adapter_ptr = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
 
         let ret = GetAdaptersAddresses(0, GET_ADAPTERS_ADDRESSES_FLAGS(0), None, Some(adapter_ptr), &mut buf_size);
         if ret != 0 {
-            return blacklist;
+            return None;
         }
 
+        let mut blacklist = Vec::new();
         let mut current = adapter_ptr;
         while !current.is_null() {
             let adapter = &*current;
@@ -257,25 +269,29 @@ unsafe fn build_virtual_blacklist() -> Vec<u64> {
             current = adapter.Next;
         }
 
-        blacklist
+        Some(blacklist)
     }
 }
 
-fn is_virtual_adapter(luid: u64) -> bool {
-    let mut cache = VIRTUAL_BLACKLIST.lock().unwrap();
-    let now = Instant::now();
-
-    match cache.as_ref() {
-        Some((list, last_refresh))
-            if now.duration_since(*last_refresh).as_secs() < BLACKLIST_REFRESH_SECS =>
-        {
-            list.contains(&luid)
+fn get_virtual_blacklist() -> Vec<u64> {
+    {
+        let cache = VIRTUAL_BLACKLIST.lock().unwrap();
+        if let Some((list, last_refresh)) = cache.as_ref() {
+            if last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS {
+                return list.clone();
+            }
         }
-        _ => {
-            let new_list = unsafe { build_virtual_blacklist() };
-            let result = new_list.contains(&luid);
-            *cache = Some((new_list, now));
-            result
+    }
+
+    let new_list = unsafe { build_virtual_blacklist() };
+    match new_list {
+        Some(list) => {
+            *VIRTUAL_BLACKLIST.lock().unwrap() = Some((list.clone(), Instant::now()));
+            list
+        }
+        None => {
+            let cache = VIRTUAL_BLACKLIST.lock().unwrap();
+            cache.as_ref().map(|(l, _)| l.clone()).unwrap_or_default()
         }
     }
 }
