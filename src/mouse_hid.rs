@@ -1,14 +1,14 @@
+use hidapi::{HidApi, HidDevice};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
-use hidapi::{HidApi, HidDevice};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::{
-    DPI_SCALE_FACTOR, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_FAIL_THRESHOLD, MOUSE_IS_CHARGING,
-    MOUSE_ONLINE, MOUSE_PID, MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE,
-    MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
+    DPI_SCALE_FACTOR, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_FAIL_THRESHOLD,
+    MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID, MOUSE_POLL_INTERVAL_OFFLINE,
+    MOUSE_POLL_INTERVAL_ONLINE, MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -126,7 +126,11 @@ fn poll_mouse() -> Result<MouseData, ()> {
     let device = find_mouse_device(&api).ok_or(())?;
     let (level, charging) = query_mouse_battery(&device)?;
     let dpi = query_mouse_dpi(&device)?;
-    Ok(MouseData { level, charging, dpi })
+    Ok(MouseData {
+        level,
+        charging,
+        dpi,
+    })
 }
 
 fn mouse_worker_loop() {
@@ -149,10 +153,13 @@ fn mouse_worker_loop() {
                 FAIL_COUNT.store(0, Ordering::Relaxed);
                 MOUSE_ONLINE.store(true, Ordering::Relaxed);
 
+                let lparam = ((data.level & 0xFF) << 16) | (data.dpi & 0xFFFF);
+                let wparam = data.charging as usize;
+                let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
+                // SAFETY:
+                // hwnd 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
+                // PostMessageW 是线程安全的 Windows API，能安全地跨线程投递自定义的鼠标更新消息。
                 unsafe {
-                    let lparam = ((data.level & 0xFF) << 16) | (data.dpi & 0xFFFF);
-                    let wparam = data.charging as usize;
-                    let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                     let _ = PostMessageW(
                         Some(hwnd),
                         WM_USER_MOUSE_UPDATE,
@@ -263,14 +270,12 @@ fn handle_mouse_offline() {
         MOUSE_BATTERY_LEVEL.store(0, Ordering::Relaxed);
         MOUSE_DPI_VALUE.store(0, Ordering::Relaxed);
 
+        let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
+        // SAFETY:
+        // hwnd 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
+        // PostMessageW 是线程安全的 Windows API，能安全地跨线程投递自定义的鼠标离线状态消息。
         unsafe {
-            let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
-            let _ = PostMessageW(
-                Some(hwnd),
-                WM_USER_MOUSE_STATUS,
-                WPARAM(0),
-                LPARAM(0),
-            );
+            let _ = PostMessageW(Some(hwnd), WM_USER_MOUSE_STATUS, WPARAM(0), LPARAM(0));
         }
     }
 }
