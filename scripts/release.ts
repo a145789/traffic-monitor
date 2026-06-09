@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync } from "fs";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 const newVersion = process.argv[2];
 if (!newVersion) {
@@ -43,20 +43,21 @@ console.log("Updating Cargo.lock...");
 execSync("cargo update --workspace", { stdio: "inherit" });
 
 // Build release to verify everything compiles
-console.log("Building release...");
+console.log("Building release (verification)...");
 execSync("cargo build --release", { stdio: "inherit" });
 
-// Git commit and tag
-console.log("Creating git commit and tag...");
+// Git commit
+console.log("Creating git commit...");
 execSync("git add Cargo.toml installer.iss Cargo.lock", { stdio: "inherit" });
-execSync(`git commit -m "release: v${newVersion}"`, { stdio: "inherit" });
-execSync(`git tag v${newVersion}`, { stdio: "inherit" });
+execFileSync("git", ["commit", "-m", `release: v${newVersion}`], { stdio: "inherit" });
 
-// Git push
-console.log("Pushing to remote...");
+// Create tag
+console.log(`Creating tag v${newVersion}...`);
+execFileSync("git", ["tag", `v${newVersion}`], { stdio: "inherit" });
+
+// Git push commit and tag
+console.log("Pushing commit and tag to remote...");
 execSync("git push && git push --tags", { stdio: "inherit" });
 
-// Print success message
-console.log(`\nTag v${newVersion} pushed successfully!`);
-console.log("GitHub Actions will automatically create the Release, build the binaries, and upload the assets.");
-
+console.log(`\nVersion v${newVersion} released and tag pushed successfully!`);
+console.log("GitHub Actions will build the binaries and publish the release.");

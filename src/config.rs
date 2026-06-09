@@ -38,9 +38,13 @@ pub static MOUSE_ONLINE: AtomicBool = AtomicBool::new(false);
 pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
 pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 pub static SHOW_MOUSE_INFO: AtomicBool = AtomicBool::new(false);
+pub static ENABLE_AUTO_UPDATE: AtomicBool = AtomicBool::new(true);
+pub static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 pub const MENU_ID_SHOW_MOUSE: u32 = 1003;
 pub const MENU_ID_RESTART_HID: u32 = 1004;
+pub const MENU_ID_AUTO_UPDATE_TOGGLE: u32 = 1005;
+pub const MENU_ID_CHECK_UPDATE_MANUAL: u32 = 1006;
 
 pub static MOUSE_BATTERY_LEVEL: AtomicU32 = AtomicU32::new(0);
 pub static MOUSE_IS_CHARGING: AtomicBool = AtomicBool::new(false);

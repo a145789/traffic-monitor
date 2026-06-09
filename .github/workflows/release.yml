@@ -13,21 +13,15 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout tag
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Extract version from tag
         id: version
         shell: bash
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
-      - name: Update version in Cargo.toml
-        run: |
-          (Get-Content Cargo.toml) -replace '^version = ".*"', 'version = "${{ steps.version.outputs.VERSION }}"' | Set-Content Cargo.toml
-
-      - name: Update version in installer.iss
-        run: |
-          (Get-Content installer.iss) -replace '^AppVersion=.*', 'AppVersion=${{ steps.version.outputs.VERSION }}' | Set-Content installer.iss
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -117,6 +111,14 @@ jobs:
         run: |
           mv Output/TrafficMonitor-Setup.exe Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe
 
+      - name: Generate version.txt
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          INSTALLER="Output/TrafficMonitor-Setup-${VERSION}.exe"
+          HASH=$(sha256sum "$INSTALLER" | cut -d' ' -f1 | tr 'a-z' 'A-Z')
+          printf "%s\n%s\n" "$VERSION" "$HASH" > version.txt
+
       - name: Upload to Release
         shell: bash
         env:
@@ -132,4 +134,5 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             "target/release/traffic-monitor.exe#traffic-monitor.exe" \
             "Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe#TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe" \
+            "version.txt#version.txt" \
             --clobber
