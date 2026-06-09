@@ -85,14 +85,14 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
-    let _agent = to_wide("Traffic Monitor");
+    let agent = to_wide("Traffic Monitor");
     let host_wide = to_wide(host);
     let path_wide = to_wide(path);
 
     // SAFETY: All pointers are valid for the duration of the calls.
     unsafe {
         let h_session = WinHttpOpen(
-            Some(&PCWSTR(_agent.as_ptr())),
+            Some(&PCWSTR(agent.as_ptr())),
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             None,
             None,
@@ -101,6 +101,9 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
         if h_session.is_null() {
             return Err("WinHttpOpen returned null".to_string());
         }
+
+        // Set 10-second timeouts to prevent thread hang.
+        let _ = WinHttpSetTimeouts(h_session, 10000, 10000, 10000, 10000);
 
         let port = if secure {
             INTERNET_DEFAULT_HTTPS_PORT
@@ -221,6 +224,15 @@ fn format_hex(bytes: &[u8]) -> String {
         .join("")
 }
 
+fn compute_sha256_hex_file(path: &std::path::Path) -> Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to open file for hashing: {e}"))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut data)
+        .map_err(|e| format!("Failed to read file for hashing: {e}"))?;
+    compute_sha256_hex(&data)
+}
+
 fn compare_versions(current: &str, latest: &str) -> bool {
     parse_version(latest) > parse_version(current)
 }
@@ -234,10 +246,17 @@ fn parse_version(v: &str) -> Vec<u32> {
 
 pub fn is_installed_version() -> bool {
     match std::env::current_exe() {
-        Ok(exe) => match exe.parent() {
-            Some(dir) => dir.join("unins000.exe").exists(),
-            None => false,
-        },
+        Ok(exe) => {
+            let has_unins = match exe.parent() {
+                Some(dir) => dir.join("unins000.exe").exists(),
+                None => false,
+            };
+            let in_program_files = exe
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("program files");
+            has_unins && in_program_files
+        }
         Err(_) => false,
     }
 }
@@ -338,13 +357,12 @@ pub fn start_auto_check(hwnd: HWND) {
     }
 
     {
-        let mut last = LAST_CHECK_TIME.lock().unwrap();
+        let last = LAST_CHECK_TIME.lock().unwrap();
         if let Some(t) = *last {
             if t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS {
                 return;
             }
         }
-        *last = Some(Instant::now());
     }
 
     if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
@@ -353,31 +371,40 @@ pub fn start_auto_check(hwnd: HWND) {
 
     let hwnd_raw: isize = hwnd.0 as isize;
 
-    std::thread::Builder::new()
+    if std::thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(move || {
             update_check_worker(hwnd_raw, false);
         })
-        .ok();
+        .is_err()
+    {
+        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    }
 }
 
 pub fn start_manual_check(hwnd: HWND) {
     if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        show_info("检查更新正在进行中，请稍后再试。");
         return;
     }
 
     let hwnd_raw: isize = hwnd.0 as isize;
 
-    std::thread::Builder::new()
+    if std::thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(move || {
             update_check_worker(hwnd_raw, true);
         })
-        .ok();
+        .is_err()
+    {
+        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+        show_error("启动更新检查失败。");
+    }
 }
 
 fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
     let result = do_update_check(is_manual);
+    let is_error = matches!(result, CheckResult::Error);
 
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
@@ -401,6 +428,11 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
                 post_update_status(hwnd, UPDATE_STATUS_ERROR);
             }
         }
+    }
+
+    if !is_manual && !is_error {
+        let mut last = LAST_CHECK_TIME.lock().unwrap();
+        *last = Some(Instant::now());
     }
 
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
@@ -445,6 +477,21 @@ fn do_update_check(_is_manual: bool) -> CheckResult {
         "/a145789/traffic-monitor/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
     );
 
+    let temp_path = get_temp_installer_path();
+    let temp_path_str = temp_path.to_string_lossy().to_string();
+
+    // Skip download if temp file already exists with matching hash.
+    if temp_path.exists() {
+        if let Ok(existing_hash) = compute_sha256_hex_file(&temp_path) {
+            if existing_hash.to_uppercase() == expected_hash_hex {
+                return CheckResult::InstalledReady(latest_version, temp_path_str);
+            }
+            let _ = std::fs::remove_file(&temp_path);
+        } else {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+    }
+
     let installer_data = match fetch_url(DOWNLOAD_HOST, &download_path, true) {
         Ok(data) => data,
         Err(_) => {
@@ -462,9 +509,6 @@ fn do_update_check(_is_manual: bool) -> CheckResult {
     if actual_hash_hex.to_uppercase() != expected_hash_hex {
         return CheckResult::Error;
     }
-
-    let temp_path = get_temp_installer_path();
-    let temp_path_str = temp_path.to_string_lossy().to_string();
 
     if std::fs::write(&temp_path, &installer_data).is_err() {
         return CheckResult::Error;
@@ -585,7 +629,7 @@ fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
     // SAFETY: sei is properly initialized, path_wide and verb_wide are valid.
     let ok = unsafe { ShellExecuteExW(&mut sei) };
 
-    if ok.is_ok() {
+    if ok.is_ok() && sei.hInstApp.0 as usize > 32 {
         remove_tray_icon();
         // SAFETY: PostQuitMessage is safe from the main thread.
         unsafe {
