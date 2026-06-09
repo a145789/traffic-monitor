@@ -499,11 +499,11 @@ pub fn start_auto_check(hwnd: HWND) {
 
     {
         let last = LAST_CHECK_TIME.lock().unwrap();
-        if let Some(t) = *last {
-            if t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS {
-                UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-                return;
-            }
+        if let Some(t) = *last
+            && t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS
+        {
+            UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+            return;
         }
     }
 
@@ -649,10 +649,7 @@ fn do_update_check() -> CheckResult {
         }
     }
 
-    let mut installer_data = match fetch_url(DOWNLOAD_HOST, &download_path, true) {
-        Ok(data) => Some(data),
-        Err(_) => None,
-    };
+    let mut installer_data = fetch_url(DOWNLOAD_HOST, &download_path, true).ok();
 
     if installer_data.is_none() {
         let proxy_path = format!(
@@ -792,7 +789,7 @@ fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         lpVerb: PCWSTR(verb_wide.as_ptr()),
         lpFile: PCWSTR(path_wide.as_ptr()),
-        nShow: SW_SHOWNORMAL.0 as i32,
+        nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
 
