@@ -360,9 +360,8 @@ impl Renderer {
             }
 
             // 3. 绘制第一列 (CPU & MEM) - 最左列
-            // 宽度 54。右界与下一列相距 col_gap
             let cpu_right = if show_mouse {
-                speed_left - col_gap - (52.0 * scale).round() as i32 - col_gap
+                speed_left - col_gap - (62.0 * scale).round() as i32 - col_gap
             } else {
                 speed_left - col_gap
             };
