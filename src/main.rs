@@ -85,6 +85,20 @@ thread_local! {
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
+
+fn get_taskbar_hwnd() -> Option<HWND> {
+    let cached = TASKBAR_HWND.load(Ordering::Acquire);
+    if cached != 0 {
+        Some(HWND(cached as *mut std::ffi::c_void))
+    } else {
+        let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok() };
+        if let Some(h) = hwnd {
+            TASKBAR_HWND.store(h.0 as isize, Ordering::Release);
+        }
+        hwnd
+    }
+}
 
 // MutexGuard 定义已提取至 ffi_guard 模块中进行共用。
 
@@ -226,14 +240,13 @@ fn check_fullscreen(hwnd: HWND) {
     };
 
     // 检查前台窗口是否覆盖任务栏所在显示器
-    // SAFETY: 系统窗口类名，不存在时安全返回。
-    let same_monitor = match unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")) } {
-        Ok(h_taskbar) => {
+    let same_monitor = match get_taskbar_hwnd() {
+        Some(h_taskbar) => {
             // SAFETY: h_taskbar 有效。
             let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
             hmon_fg == hmon_tb
         }
-        Err(_) => false,
+        None => false,
     };
 
     let was = FULLSCREEN.load(Ordering::Acquire);
@@ -429,8 +442,7 @@ fn main() {
 }
 
 fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
-    // SAFETY: 系统窗口类名，不存在时安全返回 None。
-    let h_taskbar = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok()? };
+    let h_taskbar = get_taskbar_hwnd()?;
     // SAFETY: h_taskbar 已被验证为有效句柄，"TrayNotifyWnd" 为系统 Tray 窗口类名。
     let h_tray = unsafe { FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")).ok()? };
 
@@ -464,10 +476,9 @@ fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     };
 
-    // SAFETY: 系统窗口类名，不存在时安全返回错误。
-    let h_taskbar = match unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")) } {
-        Ok(h) => h,
-        Err(_) => {
+    let h_taskbar = match get_taskbar_hwnd() {
+        Some(h) => h,
+        None => {
             show_error("Cannot find Shell_TrayWnd");
             return false;
         }
@@ -498,6 +509,8 @@ fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     }
 
+    // SAFETY: h_taskbar 已通过 FindWindowW 验证有效，存储到全局缓存。
+    TASKBAR_HWND.store(h_taskbar.0 as isize, Ordering::Release);
     true
 }
 
@@ -545,6 +558,7 @@ const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 
 fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
+    TASKBAR_HWND.store(0, Ordering::Release);
     remove_tray_icon();
     // SAFETY: hwnd 有效，隐藏窗口。
     unsafe {

@@ -104,6 +104,44 @@ impl Renderer {
         &mut self.wide_buf
     }
 
+    fn format_cpu_mem_wide(&mut self, label: &str, value: u32) -> &mut [u16] {
+        self.wide_buf.clear();
+        push_ascii(&mut self.wide_buf, label);
+        push_ascii(&mut self.wide_buf, ": ");
+        write_u32(&mut self.wide_buf, value);
+        push_ascii(&mut self.wide_buf, "%");
+        self.wide_buf.push(0);
+        &mut self.wide_buf
+    }
+
+    fn format_percent_wide(&mut self, value: u32) -> &mut [u16] {
+        self.wide_buf.clear();
+        write_u32(&mut self.wide_buf, value);
+        push_ascii(&mut self.wide_buf, "%");
+        self.wide_buf.push(0);
+        &mut self.wide_buf
+    }
+
+    fn format_mouse_battery_wide(&mut self, value: u32) -> &mut [u16] {
+        self.wide_buf.clear();
+        // U+1F5B1 (🖱️) 的 UTF-16 代理对
+        self.wide_buf.push(0xD83D);
+        self.wide_buf.push(0xDDB1);
+        self.wide_buf.push(b' ' as u16);
+        write_u32(&mut self.wide_buf, value);
+        push_ascii(&mut self.wide_buf, "%");
+        self.wide_buf.push(0);
+        &mut self.wide_buf
+    }
+
+    fn format_dpi_wide(&mut self, value: u32) -> &mut [u16] {
+        self.wide_buf.clear();
+        push_ascii(&mut self.wide_buf, "DPI: ");
+        write_u32(&mut self.wide_buf, value);
+        self.wide_buf.push(0);
+        &mut self.wide_buf
+    }
+
     fn format_speed_wide(&mut self, bytes_per_sec: u32) -> &mut [u16] {
         self.wide_buf.clear();
         if bytes_per_sec < 1024 {
@@ -241,14 +279,13 @@ impl Renderer {
                         // 用红色画电量数字，左侧相对偏移 16 像素
                         let battery_color = COLORREF(COLOR_LOW_BATTERY);
                         SetTextColor(hdc_mem, battery_color);
-                        let battery_text = format!("{}%", battery);
+                        let battery_wide = self.format_percent_wide(battery);
                         let mut rc_bat = RECT {
                             left: mouse_left + (16.0 * scale).round() as i32,
                             top: 0,
                             right: mouse_right,
                             bottom: half_height,
                         };
-                        let battery_wide = self.wide(&battery_text);
                         let _ = DrawTextW(
                             hdc_mem,
                             battery_wide,
@@ -259,14 +296,13 @@ impl Renderer {
                         // 恢复颜色
                         SetTextColor(hdc_mem, self.text_color);
                     } else {
-                        let mouse_text = format!("\u{1F5B1} {}%", battery);
+                        let mouse_wide = self.format_mouse_battery_wide(battery);
                         let mut rc_mouse = RECT {
                             left: mouse_left,
                             top: 0,
                             right: mouse_right,
                             bottom: half_height,
                         };
-                        let mouse_wide = self.wide(&mouse_text);
                         let _ = DrawTextW(
                             hdc_mem,
                             mouse_wide,
@@ -276,14 +312,14 @@ impl Renderer {
                     }
 
                     // 第二行：DPI
-                    let dpi_text = format!("DPI: {}", dpi);
+                    let h = self.height;
+                    let dpi_wide = self.format_dpi_wide(dpi);
                     let mut rc_dpi = RECT {
                         left: mouse_left,
                         top: half_height,
                         right: mouse_right,
-                        bottom: self.height,
+                        bottom: h,
                     };
-                    let dpi_wide = self.wide(&dpi_text);
                     let _ = DrawTextW(
                         hdc_mem,
                         dpi_wide,
@@ -333,14 +369,13 @@ impl Renderer {
             };
             let cpu_left = cpu_right - (76.0 * scale).round() as i32;
 
-            let cpu_text = format!("CPU: {}%", cpu);
+            let cpu_wide = self.format_cpu_mem_wide("CPU", cpu);
             let mut rc_cpu = RECT {
                 left: cpu_left,
                 top: 0,
                 right: cpu_right,
                 bottom: half_height,
             };
-            let cpu_wide = self.wide(&cpu_text);
             let _ = DrawTextW(
                 hdc_mem,
                 cpu_wide,
@@ -348,14 +383,14 @@ impl Renderer {
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
 
-            let mem_text = format!("MEM: {}%", mem);
+            let h = self.height;
+            let mem_wide = self.format_cpu_mem_wide("MEM", mem);
             let mut rc_mem = RECT {
                 left: cpu_left,
                 top: half_height,
                 right: cpu_right,
-                bottom: self.height,
+                bottom: h,
             };
-            let mem_wide = self.wide(&mem_text);
             let _ = DrawTextW(
                 hdc_mem,
                 mem_wide,
