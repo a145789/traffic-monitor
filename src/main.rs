@@ -27,13 +27,13 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetDesktopWindow,
-    GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP, KillTimer,
-    LWA_COLORKEY, MB_ICONERROR, MB_OK, MessageBoxW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
-    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
-    WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
-    WS_CHILD, WS_EX_LAYERED, WS_VISIBLE,
+    GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP, IsWindow,
+    KillTimer, LWA_COLORKEY, MB_ICONERROR, MB_OK, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
+    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_TIMER, WM_WTSSESSION_CHANGE, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -90,14 +90,21 @@ static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 fn get_taskbar_hwnd() -> Option<HWND> {
     let cached = TASKBAR_HWND.load(Ordering::Acquire);
     if cached != 0 {
-        Some(HWND(cached as *mut std::ffi::c_void))
-    } else {
-        let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok() };
-        if let Some(h) = hwnd {
-            TASKBAR_HWND.store(h.0 as isize, Ordering::Release);
+        let hwnd = HWND(cached as *mut std::ffi::c_void);
+        // SAFETY: IsWindow 是纯查询 API，hwnd 来自缓存，仅做有效性判断。
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return Some(hwnd);
         }
-        hwnd
+        TASKBAR_HWND.store(0, Ordering::Release);
     }
+    // SAFETY:
+    // "Shell_TrayWnd" 是 Windows 任务栏窗口的标准类名，常量宽字符串生命周期覆盖调用。
+    // FindWindowW 仅查询窗口句柄，不解引用任何裸指针，失败时安全返回 Err。
+    let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok() };
+    if let Some(h) = hwnd {
+        TASKBAR_HWND.store(h.0 as isize, Ordering::Release);
+    }
+    hwnd
 }
 
 // MutexGuard 定义已提取至 ffi_guard 模块中进行共用。
@@ -509,8 +516,6 @@ fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     }
 
-    // SAFETY: h_taskbar 已通过 FindWindowW 验证有效，存储到全局缓存。
-    TASKBAR_HWND.store(h_taskbar.0 as isize, Ordering::Release);
     true
 }
 

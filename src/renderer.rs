@@ -253,7 +253,6 @@ impl Renderer {
             );
 
             // 2. 绘制第二列 (鼠标信息) - 中列
-            // 宽度 52。右界与网速列左界相距 col_gap
             if show_mouse {
                 let mouse_right = speed_left - col_gap;
                 let mouse_left = mouse_right - (62.0 * scale).round() as i32;
