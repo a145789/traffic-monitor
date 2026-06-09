@@ -6,6 +6,7 @@ mod ffi_guard;
 mod mouse_hid;
 mod renderer;
 mod tray;
+mod update;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
@@ -41,9 +42,9 @@ use crate::collector::{
     collect_network, init_network_listener, trim_working_set,
 };
 use crate::config::{
-    COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, FULLSCREEN, GAP,
-    MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_ONLINE,
-    NETWORK_BACKOFF, SHOW_MOUSE_INFO, SUSPENDED, TIMER_ID_CPU_MEM, TIMER_ID_NETWORK,
+    COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
+    FULLSCREEN, GAP, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
+    MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SUSPENDED, TIMER_ID_CPU_MEM, TIMER_ID_NETWORK,
     TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::mouse_hid::{
@@ -54,6 +55,9 @@ use crate::renderer::Renderer;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
     save_show_mouse_info,
+};
+use crate::update::{
+    WM_USER_UPDATE_READY, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
 };
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
@@ -352,6 +356,9 @@ fn main() {
     let persisted = tray::load_show_mouse_info();
     SHOW_MOUSE_INFO.store(persisted, Ordering::Release);
 
+    let auto_update = load_auto_update_enabled();
+    ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Release);
+
     create_tray_icon(hwnd);
 
     RENDERER.with(|r| {
@@ -386,6 +393,9 @@ fn main() {
     unsafe {
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
     }
+
+    init_cleanup_temp();
+    start_auto_check(hwnd);
 
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
 
@@ -739,6 +749,13 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
                 }
             }
+            start_auto_check(hwnd);
+            LRESULT(0)
+        }
+
+        WM_USER_UPDATE_READY => {
+            let status = wparam.0;
+            crate::update::handle_update_ready(hwnd, status);
             LRESULT(0)
         }
 
