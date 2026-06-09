@@ -186,6 +186,7 @@ fn check_fullscreen(hwnd: HWND) {
     // SAFETY: 纯查询 API，无副作用。
     let foreground = unsafe { GetForegroundWindow() };
     let is_invalid = foreground.is_invalid();
+    // SAFETY: GetDesktopWindow 和 GetShellWindow 是纯查询 Win32 API，无副作用。
     let is_desktop_or_shell =
         unsafe { GetDesktopWindow() == foreground || GetShellWindow() == foreground };
 
@@ -430,6 +431,7 @@ fn main() {
 fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     // SAFETY: 系统窗口类名，不存在时安全返回 None。
     let h_taskbar = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok()? };
+    // SAFETY: h_taskbar 已被验证为有效句柄，"TrayNotifyWnd" 为系统 Tray 窗口类名。
     let h_tray = unsafe { FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")).ok()? };
 
     let mut rc_tray = RECT::default();
@@ -805,6 +807,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
+        // SAFETY: hwnd、msg、wparam、lparam 由操作系统传入，调用默认窗口过程是安全的。
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }

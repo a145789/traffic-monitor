@@ -446,6 +446,7 @@ pub fn load_show_mouse_info() -> bool {
     let value_name: Vec<u16> = "ShowMouseInfo\0".encode_utf16().collect();
     let mut hkey = Default::default();
 
+    // SAFETY: key_path 以 NUL 结尾，hkey 在栈上分配，成功后由 RegKey 管理以自动释放句柄。
     let open_ok = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -462,6 +463,7 @@ pub fn load_show_mouse_info() -> bool {
         let mut dword: u32 = 0;
         let mut size = std::mem::size_of::<u32>() as u32;
 
+        // SAFETY: hkey 为已验证有效的注册表键句柄，dword 和 size 均为栈上分配的变量，且 dword 缓冲区大小与 size 一致。
         let result = unsafe {
             RegQueryValueExW(
                 hkey,
@@ -491,6 +493,7 @@ pub fn save_show_mouse_info(show: bool) {
     let mut hkey = Default::default();
     let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
 
+    // SAFETY: key_path 以 NUL 结尾，hkey 和 disposition 均在栈上分配，成功后句柄由 RegKey 自动接管释放。
     let open_ok = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -510,6 +513,8 @@ pub fn save_show_mouse_info(show: bool) {
         let _key_guard = RegKey::new(hkey);
         let dword: u32 = if show { 1 } else { 0 };
 
+        // SAFETY: hkey 为已验证有效的注册表键句柄，value_name 以 NUL 结尾，
+        // 通过 std::slice::from_raw_parts 安全将栈上 dword 的指针转换为字节切片，且长度正确。
         unsafe {
             let _ = RegSetValueExW(
                 hkey,
