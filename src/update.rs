@@ -546,24 +546,29 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
 
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
+    let mut posted = false;
     match result {
         CheckResult::NoUpdate => {
             if is_manual {
                 post_update_status(hwnd, UPDATE_STATUS_NO_UPDATE);
+                posted = true;
             }
         }
         CheckResult::PortableFound(version) => {
             *LATEST_VERSION.lock().unwrap() = version;
             post_update_status(hwnd, UPDATE_STATUS_PORTABLE_FOUND);
+            posted = true;
         }
         CheckResult::InstalledReady(version, temp_path) => {
             *LATEST_VERSION.lock().unwrap() = version;
             *TEMP_FILE_PATH.lock().unwrap() = temp_path;
             post_update_status(hwnd, UPDATE_STATUS_INSTALLED_READY);
+            posted = true;
         }
         CheckResult::Error => {
             if is_manual {
                 post_update_status(hwnd, UPDATE_STATUS_ERROR);
+                posted = true;
             }
         }
     }
@@ -583,7 +588,9 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
         }
     }
 
-    UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    if !posted {
+        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    }
 }
 
 enum CheckResult {
@@ -594,17 +601,7 @@ enum CheckResult {
 }
 
 fn do_update_check() -> CheckResult {
-    let mut response = match fetch_url(VERSION_HOST, VERSION_PATH, true) {
-        Ok(data) => Some(data),
-        Err(_) => None,
-    };
-
-    if response.is_none() {
-        let proxy_path = format!("/{GITHUB_BASE}/releases/latest/download/version.txt");
-        if let Ok(data) = fetch_url(PROXY_HOST, &proxy_path, true) {
-            response = Some(data);
-        }
-    }
+    let response = fetch_url(VERSION_HOST, VERSION_PATH, true).ok();
 
     let response = match response {
         Some(data) => data,
@@ -722,6 +719,7 @@ pub fn handle_update_ready(hwnd: HWND, status: usize) {
         }
         _ => {}
     }
+    UPDATE_IN_PROGRESS.store(false, Ordering::Release);
 }
 
 fn show_info(msg: &str) {
@@ -819,16 +817,10 @@ fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
 }
 
 pub fn init_cleanup_temp() {
-    std::thread::Builder::new()
-        .stack_size(64 * 1024)
-        .spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            let path = get_temp_installer_path();
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
-        })
-        .ok();
+    let path = get_temp_installer_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

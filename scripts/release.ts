@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync } from "fs";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 const newVersion = process.argv[2];
 if (!newVersion) {
@@ -49,11 +49,11 @@ execSync("cargo build --release", { stdio: "inherit" });
 // Git commit
 console.log("Creating git commit...");
 execSync("git add Cargo.toml installer.iss Cargo.lock", { stdio: "inherit" });
-execSync(`git commit -m "release: v${newVersion}"`, { stdio: "inherit" });
+execFileSync("git", ["commit", "-m", `release: v${newVersion}`], { stdio: "inherit" });
 
 // Create tag
 console.log(`Creating tag v${newVersion}...`);
-execSync(`git tag v${newVersion}`, { stdio: "inherit" });
+execFileSync("git", ["tag", `v${newVersion}`], { stdio: "inherit" });
 
 // Git push commit and tag
 console.log("Pushing commit and tag to remote...");
