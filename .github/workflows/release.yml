@@ -13,8 +13,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Extract version from tag
         id: version
@@ -116,6 +118,23 @@ jobs:
         shell: bash
         run: |
           mv Output/TrafficMonitor-Setup.exe Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe
+
+      - name: Generate version.txt
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          INSTALLER="Output/TrafficMonitor-Setup-${VERSION}.exe"
+          HASH=$(sha256sum "$INSTALLER" | cut -d' ' -f1 | tr 'a-z' 'A-Z')
+          printf "%s\n%s\n" "$VERSION" "$HASH" > assets/version.txt
+
+      - name: Commit version changes to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml installer.iss Cargo.lock assets/version.txt
+          git commit -m "release: v${{ steps.version.outputs.VERSION }}"
+          git push origin main
 
       - name: Upload to Release
         shell: bash
