@@ -21,14 +21,17 @@ pub const UPDATE_STATUS_PORTABLE_FOUND: usize = 1;
 pub const UPDATE_STATUS_INSTALLED_READY: usize = 2;
 pub const UPDATE_STATUS_ERROR: usize = 3;
 
-const VERSION_HOST: &str = "raw.githubusercontent.com";
-const VERSION_PATH: &str = "/a145789/traffic-monitor/main/assets/version.txt";
+const VERSION_HOST: &str = "github.com";
+const VERSION_PATH: &str = "/a145789/traffic-monitor/releases/latest/download/version.txt";
 const DOWNLOAD_HOST: &str = "github.com";
+const PROXY_HOST: &str = "ghproxy.cn";
+const GITHUB_BASE: &str = "https://github.com/a145789/traffic-monitor";
 const RELEASE_PAGE_URL: &str = "https://github.com/a145789/traffic-monitor/releases";
 const TEMP_FILE_NAME: &str = "traffic-monitor-setup-temp.exe";
 const HTTP_OK: u32 = 200;
 
 const AUTO_CHECK_COOLDOWN_SECS: u64 = 3600;
+const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 
 static LAST_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 static LATEST_VERSION: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
@@ -42,7 +45,7 @@ struct WinHttpHandles {
 
 impl Drop for WinHttpHandles {
     fn drop(&mut self) {
-        // SAFETY: handles are valid pointers obtained from successful WinHTTP API calls.
+        // SAFETY: 句柄来自成功的 WinHTTP API 调用，均为有效指针。
         unsafe {
             if !self.h_request.is_null() {
                 let _ = WinHttpCloseHandle(self.h_request);
@@ -64,10 +67,14 @@ struct BcryptHandles {
 
 impl Drop for BcryptHandles {
     fn drop(&mut self) {
-        // SAFETY: handles are valid from successful BCrypt API calls.
+        // SAFETY: 句柄来自成功的 BCrypt API 调用，均有效。
         unsafe {
-            let _ = BCryptDestroyHash(self.h_hash);
-            let _ = BCryptCloseAlgorithmProvider(self.h_alg, 0);
+            if self.h_hash != BCRYPT_HASH_HANDLE::default() {
+                let _ = BCryptDestroyHash(self.h_hash);
+            }
+            if self.h_alg != BCRYPT_ALG_HANDLE::default() {
+                let _ = BCryptCloseAlgorithmProvider(self.h_alg, 0);
+            }
         }
     }
 }
@@ -89,36 +96,60 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
     let host_wide = to_wide(host);
     let path_wide = to_wide(path);
 
-    // SAFETY: All pointers are valid for the duration of the calls.
-    unsafe {
-        let h_session = WinHttpOpen(
+    // RAII 守卫：Drop 会关闭所有非空句柄。
+    let mut handles = WinHttpHandles {
+        h_request: std::ptr::null_mut(),
+        h_connect: std::ptr::null_mut(),
+        h_session: std::ptr::null_mut(),
+    };
+
+    // SAFETY:
+    // agent 是有效的 NUL 终止宽字符串（来自 to_wide）。
+    // 所有输出参数均在栈上分配且对齐正确。
+    // WinHttpOpen 返回 HINTERNET 或失败时返回 null。
+    handles.h_session = unsafe {
+        WinHttpOpen(
             Some(&PCWSTR(agent.as_ptr())),
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             None,
             None,
             0,
-        );
-        if h_session.is_null() {
-            return Err("WinHttpOpen returned null".to_string());
-        }
+        )
+    };
+    if handles.h_session.is_null() {
+        return Err("WinHttpOpen returned null".to_string());
+    }
 
-        // Set 10-second timeouts to prevent thread hang.
-        let _ = WinHttpSetTimeouts(h_session, 10000, 10000, 10000, 10000);
+    // SAFETY:
+    // handles.h_session 是 WinHttpOpen 返回的有效 HINTERNET。
+    // 所有超时值均为正 i32 毫秒数。
+    unsafe {
+        let _ = WinHttpSetTimeouts(handles.h_session, 10000, 10000, 10000, 10000);
+    }
 
-        let port = if secure {
-            INTERNET_DEFAULT_HTTPS_PORT
-        } else {
-            INTERNET_DEFAULT_HTTP_PORT
-        };
+    let port = if secure {
+        INTERNET_DEFAULT_HTTPS_PORT
+    } else {
+        INTERNET_DEFAULT_HTTP_PORT
+    };
 
-        let h_connect = WinHttpConnect(h_session, PCWSTR(host_wide.as_ptr()), port, 0);
-        if h_connect.is_null() {
-            let _ = WinHttpCloseHandle(h_session);
-            return Err("WinHttpConnect returned null".to_string());
-        }
+    // SAFETY:
+    // handles.h_session 有效；host_wide 是有效的 NUL 终止宽字符串。
+    // WinHttpConnect 返回 HINTERNET 或失败时返回 null。
+    handles.h_connect =
+        unsafe { WinHttpConnect(handles.h_session, PCWSTR(host_wide.as_ptr()), port, 0) };
+    if handles.h_connect.is_null() {
+        return Err("WinHttpConnect returned null".to_string());
+    }
 
-        let h_request = WinHttpOpenRequest(
-            h_connect,
+    // SAFETY:
+    // handles.h_connect 来自 WinHttpConnect，有效。
+    // path_wide 是有效的 NUL 终止宽字符串。
+    // 其余参数使用安全默认值（None/null）。
+    // WinHttpOpenRequest 返回 HINTERNET 或失败时返回 null。
+    handles.h_request = unsafe {
+        WinHttpOpenRequest(
+            handles.h_connect,
             w!("GET"),
             PCWSTR(path_wide.as_ptr()),
             None,
@@ -129,30 +160,38 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
             } else {
                 Default::default()
             },
-        );
-        if h_request.is_null() {
-            let _ = WinHttpCloseHandle(h_connect);
-            let _ = WinHttpCloseHandle(h_session);
-            return Err("WinHttpOpenRequest returned null".to_string());
-        }
+        )
+    };
+    if handles.h_request.is_null() {
+        return Err("WinHttpOpenRequest returned null".to_string());
+    }
 
-        let _guard = WinHttpHandles {
-            h_request,
-            h_connect,
-            h_session,
-        };
-
-        WinHttpSendRequest(h_request, None, Some(std::ptr::null()), 0, 0, 0)
+    // SAFETY:
+    // handles.h_request 来自 WinHttpOpenRequest，有效。
+    // GET 请求无附加缓冲区（lpOptional 为 null，dwOptionalLength 为 0）。
+    unsafe {
+        WinHttpSendRequest(handles.h_request, None, Some(std::ptr::null()), 0, 0, 0)
             .map_err(|e| format!("WinHttpSendRequest failed: {e:?}"))?;
+    }
 
-        WinHttpReceiveResponse(h_request, std::ptr::null_mut())
+    // SAFETY:
+    // handles.h_request 有效；lpBuffersReceived 为 null（由 API 内部分配）。
+    unsafe {
+        WinHttpReceiveResponse(handles.h_request, std::ptr::null_mut())
             .map_err(|e| format!("WinHttpReceiveResponse failed: {e:?}"))?;
+    }
 
-        // Check status code
-        let mut status_code: u32 = 0;
-        let mut status_code_size = std::mem::size_of::<u32>() as u32;
+    let mut status_code: u32 = 0;
+    let mut status_code_size = std::mem::size_of::<u32>() as u32;
+
+    // SAFETY:
+    // handles.h_request 有效。
+    // &mut status_code 转换为 *mut _ 提供有效的 u32 缓冲区。
+    // status_code_size 与缓冲区大小匹配。
+    // lpwszName 为 null（查询主头部）。
+    unsafe {
         WinHttpQueryHeaders(
-            h_request,
+            handles.h_request,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             None,
             Some(&mut status_code as *mut u32 as *mut _),
@@ -160,60 +199,99 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
             std::ptr::null_mut(),
         )
         .map_err(|e| format!("WinHttpQueryHeaders failed: {e:?}"))?;
-
-        if status_code != HTTP_OK {
-            return Err(format!("HTTP status: {status_code}"));
-        }
-
-        let mut response = Vec::new();
-        loop {
-            let mut available: u32 = 0;
-            WinHttpQueryDataAvailable(h_request, &mut available)
-                .map_err(|e| format!("WinHttpQueryDataAvailable failed: {e:?}"))?;
-            if available == 0 {
-                break;
-            }
-            let mut buf = vec![0u8; available as usize];
-            let mut read: u32 = 0;
-            WinHttpReadData(h_request, buf.as_mut_ptr() as *mut _, available, &mut read)
-                .map_err(|e| format!("WinHttpReadData failed: {e:?}"))?;
-            if read == 0 {
-                break;
-            }
-            response.extend_from_slice(&buf[..read as usize]);
-        }
-
-        Ok(response)
     }
+
+    if status_code != HTTP_OK {
+        return Err(format!("HTTP status: {status_code}"));
+    }
+
+    let mut response = Vec::new();
+    loop {
+        let mut available: u32 = 0;
+
+        // SAFETY:
+        // handles.h_request 有效。
+        // &mut available 是有效的 u32 输出参数。
+        unsafe {
+            WinHttpQueryDataAvailable(handles.h_request, &mut available)
+                .map_err(|e| format!("WinHttpQueryDataAvailable failed: {e:?}"))?;
+        }
+
+        if available == 0 {
+            break;
+        }
+
+        let mut buf = vec![0u8; available as usize];
+        let mut read: u32 = 0;
+
+        // SAFETY:
+        // handles.h_request 有效。
+        // buf 已分配 `available` 字节；as_mut_ptr() 返回有效的可写指针。
+        // lpdwNumberOfBytesRead 是有效的 u32 输出参数。
+        unsafe {
+            WinHttpReadData(
+                handles.h_request,
+                buf.as_mut_ptr() as *mut _,
+                available,
+                &mut read,
+            )
+            .map_err(|e| format!("WinHttpReadData failed: {e:?}"))?;
+        }
+
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..read as usize]);
+    }
+
+    Ok(response)
 }
 
 fn compute_sha256_hex(data: &[u8]) -> Result<String, String> {
-    // SAFETY: CNG API calls with properly typed handles.
-    unsafe {
-        let mut h_alg = BCRYPT_ALG_HANDLE::default();
-        let status = BCryptOpenAlgorithmProvider(
+    let mut h_alg = BCRYPT_ALG_HANDLE::default();
+
+    // SAFETY:
+    // BCRYPT_SHA256_ALGORITHM 是有效的算法标识符。
+    // &mut h_alg 是算法句柄的输出参数。
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(
             &mut h_alg,
             BCRYPT_SHA256_ALGORITHM,
             None,
             Default::default(),
-        );
-        check_status(status.0, "BCryptOpenAlgorithmProvider")?;
+        )
+    };
+    check_status(status.0, "BCryptOpenAlgorithmProvider")?;
 
-        let mut h_hash = BCRYPT_HASH_HANDLE::default();
-        let status = BCryptCreateHash(h_alg, &mut h_hash, None, None, 0);
-        check_status(status.0, "BCryptCreateHash")?;
+    // RAII 守卫：Drop 依次关闭 h_hash（非默认值时）和 h_alg。
+    let mut guard = BcryptHandles {
+        h_hash: BCRYPT_HASH_HANDLE::default(),
+        h_alg,
+    };
 
-        let _guard = BcryptHandles { h_hash, h_alg };
+    let mut h_hash = BCRYPT_HASH_HANDLE::default();
 
-        let status = BCryptHashData(h_hash, data, 0);
-        check_status(status.0, "BCryptHashData")?;
+    // SAFETY:
+    // guard.h_alg 来自 BCryptOpenAlgorithmProvider，有效。
+    // &mut h_hash 是输出参数；SHA-256 无需密钥或 IV。
+    let status = unsafe { BCryptCreateHash(guard.h_alg, &mut h_hash, None, None, 0) };
+    check_status(status.0, "BCryptCreateHash")?;
+    guard.h_hash = h_hash;
 
-        let mut hash_bytes = [0u8; 32];
-        let status = BCryptFinishHash(h_hash, &mut hash_bytes, 0);
-        check_status(status.0, "BCryptFinishHash")?;
+    // SAFETY:
+    // h_hash 来自 BCryptCreateHash，有效。
+    // data 是有效的字节切片（Rust 切片保证）。
+    let status = unsafe { BCryptHashData(h_hash, data, 0) };
+    check_status(status.0, "BCryptHashData")?;
 
-        Ok(format_hex(&hash_bytes))
-    }
+    let mut hash_bytes = [0u8; 32];
+
+    // SAFETY:
+    // h_hash 有效；hash_bytes 是 32 字节缓冲区，匹配 SHA-256 输出大小。
+    let status = unsafe { BCryptFinishHash(h_hash, &mut hash_bytes, 0) };
+    check_status(status.0, "BCryptFinishHash")?;
+
+    Ok(format_hex(&hash_bytes))
 }
 
 fn format_hex(bytes: &[u8]) -> String {
@@ -227,10 +305,60 @@ fn format_hex(bytes: &[u8]) -> String {
 fn compute_sha256_hex_file(path: &std::path::Path) -> Result<String, String> {
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("Failed to open file for hashing: {e}"))?;
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut data)
-        .map_err(|e| format!("Failed to read file for hashing: {e}"))?;
-    compute_sha256_hex(&data)
+
+    let mut h_alg = BCRYPT_ALG_HANDLE::default();
+
+    // SAFETY:
+    // BCRYPT_SHA256_ALGORITHM 是有效的算法标识符。
+    // &mut h_alg 是算法句柄的输出参数。
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(
+            &mut h_alg,
+            BCRYPT_SHA256_ALGORITHM,
+            None,
+            Default::default(),
+        )
+    };
+    check_status(status.0, "BCryptOpenAlgorithmProvider")?;
+
+    // RAII 守卫：Drop 依次关闭 h_hash（非默认值时）和 h_alg。
+    let mut guard = BcryptHandles {
+        h_hash: BCRYPT_HASH_HANDLE::default(),
+        h_alg,
+    };
+
+    let mut h_hash = BCRYPT_HASH_HANDLE::default();
+
+    // SAFETY:
+    // guard.h_alg 来自 BCryptOpenAlgorithmProvider，有效。
+    // &mut h_hash 是输出参数；SHA-256 无需密钥或 IV。
+    let status = unsafe { BCryptCreateHash(guard.h_alg, &mut h_hash, None, None, 0) };
+    check_status(status.0, "BCryptCreateHash")?;
+    guard.h_hash = h_hash;
+
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .map_err(|e| format!("Failed to read file for hashing: {e}"))?;
+        if n == 0 {
+            break;
+        }
+
+        // SAFETY:
+        // h_hash 来自 BCryptCreateHash，有效。
+        // buf[..n] 是从文件读取的 n 字节有效切片。
+        let status = unsafe { BCryptHashData(h_hash, &buf[..n], 0) };
+        check_status(status.0, "BCryptHashData")?;
+    }
+
+    let mut hash_bytes = [0u8; 32];
+
+    // SAFETY:
+    // h_hash 有效；hash_bytes 是 32 字节缓冲区，匹配 SHA-256 输出大小。
+    let status = unsafe { BCryptFinishHash(h_hash, &mut hash_bytes, 0) };
+    check_status(status.0, "BCryptFinishHash")?;
+
+    Ok(format_hex(&hash_bytes))
 }
 
 fn compare_versions(current: &str, latest: &str) -> bool {
@@ -246,17 +374,10 @@ fn parse_version(v: &str) -> Vec<u32> {
 
 pub fn is_installed_version() -> bool {
     match std::env::current_exe() {
-        Ok(exe) => {
-            let has_unins = match exe.parent() {
-                Some(dir) => dir.join("unins000.exe").exists(),
-                None => false,
-            };
-            let in_program_files = exe
-                .to_string_lossy()
-                .to_lowercase()
-                .contains("program files");
-            has_unins && in_program_files
-        }
+        Ok(exe) => match exe.parent() {
+            Some(dir) => dir.join("unins000.exe").exists(),
+            None => false,
+        },
         Err(_) => false,
     }
 }
@@ -270,6 +391,9 @@ pub fn load_auto_update_enabled() -> bool {
     let value_name: Vec<u16> = "EnableAutoUpdate\0".encode_utf16().collect();
     let mut hkey = Default::default();
 
+    // SAFETY:
+    // key_path 是有效的 NUL 终止 UTF-16 注册表路径字符串。
+    // &mut hkey 是键句柄的输出参数。
     let open_ok = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -285,6 +409,11 @@ pub fn load_auto_update_enabled() -> bool {
         let _key_guard = crate::ffi_guard::RegKey::new(hkey);
         let mut dword: u32 = 0;
         let mut size = std::mem::size_of::<u32>() as u32;
+
+        // SAFETY:
+        // hkey 来自 RegOpenKeyExW，有效（生命周期由 RegKey RAII 守卫）。
+        // value_name 是有效的 NUL 终止 UTF-16 字符串。
+        // &mut dword 转换为 *mut u8 提供有效的 4 字节缓冲区；size 匹配。
         let result = unsafe {
             RegQueryValueExW(
                 hkey,
@@ -314,6 +443,9 @@ pub fn save_auto_update_enabled(enabled: bool) {
     let mut hkey = Default::default();
     let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
 
+    // SAFETY:
+    // key_path 是有效的 NUL 终止 UTF-16 注册表路径字符串。
+    // &mut hkey 和 &mut disposition 均为输出参数。
     let open_ok = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -332,6 +464,11 @@ pub fn save_auto_update_enabled(enabled: bool) {
     if open_ok {
         let _key_guard = crate::ffi_guard::RegKey::new(hkey);
         let dword: u32 = if enabled { 1 } else { 0 };
+
+        // SAFETY:
+        // hkey 来自 RegCreateKeyExW，有效（生命周期由 RegKey RAII 守卫）。
+        // value_name 是有效的 NUL 终止 UTF-16 字符串。
+        // from_raw_parts：&dword 是有效的 u32 引用；size 匹配 std::mem::size_of::<u32>()。
         unsafe {
             let _ = RegSetValueExW(
                 hkey,
@@ -356,17 +493,18 @@ pub fn start_auto_check(hwnd: HWND) {
         return;
     }
 
+    if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     {
         let last = LAST_CHECK_TIME.lock().unwrap();
         if let Some(t) = *last {
             if t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS {
+                UPDATE_IN_PROGRESS.store(false, Ordering::Release);
                 return;
             }
         }
-    }
-
-    if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
-        return;
     }
 
     let hwnd_raw: isize = hwnd.0 as isize;
@@ -403,7 +541,7 @@ pub fn start_manual_check(hwnd: HWND) {
 }
 
 fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
-    let result = do_update_check(is_manual);
+    let result = do_update_check();
     let is_error = matches!(result, CheckResult::Error);
 
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
@@ -430,9 +568,19 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
         }
     }
 
-    if !is_manual && !is_error {
+    if !is_manual {
         let mut last = LAST_CHECK_TIME.lock().unwrap();
-        *last = Some(Instant::now());
+        if is_error {
+            // Offset the timestamp so only a short cooldown remains.
+            *last = Some(
+                Instant::now()
+                    - std::time::Duration::from_secs(
+                        AUTO_CHECK_COOLDOWN_SECS - AUTO_CHECK_ERROR_COOLDOWN_SECS,
+                    ),
+            );
+        } else {
+            *last = Some(Instant::now());
+        }
     }
 
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
@@ -445,10 +593,22 @@ enum CheckResult {
     Error,
 }
 
-fn do_update_check(_is_manual: bool) -> CheckResult {
-    let response = match fetch_url(VERSION_HOST, VERSION_PATH, true) {
-        Ok(data) => data,
-        Err(_) => return CheckResult::Error,
+fn do_update_check() -> CheckResult {
+    let mut response = match fetch_url(VERSION_HOST, VERSION_PATH, true) {
+        Ok(data) => Some(data),
+        Err(_) => None,
+    };
+
+    if response.is_none() {
+        let proxy_path = format!("/{GITHUB_BASE}/releases/latest/download/version.txt");
+        if let Ok(data) = fetch_url(PROXY_HOST, &proxy_path, true) {
+            response = Some(data);
+        }
+    }
+
+    let response = match response {
+        Some(data) => data,
+        None => return CheckResult::Error,
     };
 
     let text = match String::from_utf8(response) {
@@ -492,11 +652,23 @@ fn do_update_check(_is_manual: bool) -> CheckResult {
         }
     }
 
-    let installer_data = match fetch_url(DOWNLOAD_HOST, &download_path, true) {
-        Ok(data) => data,
-        Err(_) => {
-            return CheckResult::Error;
+    let mut installer_data = match fetch_url(DOWNLOAD_HOST, &download_path, true) {
+        Ok(data) => Some(data),
+        Err(_) => None,
+    };
+
+    if installer_data.is_none() {
+        let proxy_path = format!(
+            "/{GITHUB_BASE}/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
+        );
+        if let Ok(data) = fetch_url(PROXY_HOST, &proxy_path, true) {
+            installer_data = Some(data);
         }
+    }
+
+    let installer_data = match installer_data {
+        Some(data) => data,
+        None => return CheckResult::Error,
     };
 
     let actual_hash_hex = match compute_sha256_hex(&installer_data) {
@@ -518,7 +690,7 @@ fn do_update_check(_is_manual: bool) -> CheckResult {
 }
 
 fn post_update_status(hwnd: HWND, status: usize) {
-    // SAFETY: hwnd is the valid main window handle, PostMessageW is thread-safe.
+    // SAFETY: hwnd 是有效的主窗口句柄，PostMessageW 线程安全。
     unsafe {
         let _ = PostMessageW(Some(hwnd), WM_USER_UPDATE_READY, WPARAM(status), LPARAM(0));
     }
@@ -555,7 +727,7 @@ pub fn handle_update_ready(hwnd: HWND, status: usize) {
 fn show_info(msg: &str) {
     let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
     let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: title and msg_wide are valid null-terminated wide strings.
+    // SAFETY: title 和 msg_wide 均为有效的 NUL 终止宽字符串。
     unsafe {
         MessageBoxW(
             None,
@@ -569,7 +741,7 @@ fn show_info(msg: &str) {
 fn show_error(msg: &str) {
     let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
     let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: title and msg_wide are valid null-terminated wide strings.
+    // SAFETY: title 和 msg_wide 均为有效的 NUL 终止宽字符串。
     unsafe {
         MessageBoxW(
             None,
@@ -583,7 +755,7 @@ fn show_error(msg: &str) {
 fn show_yes_no(msg: &str) -> bool {
     let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
     let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: title and msg_wide are valid null-terminated wide strings.
+    // SAFETY: title 和 msg_wide 均为有效的 NUL 终止宽字符串。
     let result = unsafe {
         MessageBoxW(
             None,
@@ -597,7 +769,7 @@ fn show_yes_no(msg: &str) -> bool {
 
 fn open_url(url: &str) {
     let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: url_wide is a valid null-terminated wide string.
+    // SAFETY: url_wide 是有效的 NUL 终止宽字符串。
     unsafe {
         let _ = ShellExecuteW(
             None,
@@ -626,17 +798,17 @@ fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
         ..Default::default()
     };
 
-    // SAFETY: sei is properly initialized, path_wide and verb_wide are valid.
+    // SAFETY: sei 已正确初始化，path_wide 和 verb_wide 均有效。
     let ok = unsafe { ShellExecuteExW(&mut sei) };
 
     if ok.is_ok() && sei.hInstApp.0 as usize > 32 {
         remove_tray_icon();
-        // SAFETY: PostQuitMessage is safe from the main thread.
+        // SAFETY: PostQuitMessage 从主线程调用是安全的。
         unsafe {
             PostQuitMessage(0);
         }
     } else {
-        // SAFETY: GetLastError is valid immediately after ShellExecuteExW failure.
+        // SAFETY: GetLastError 在 ShellExecuteExW 失败后立即调用，结果有效。
         let err = unsafe { GetLastError() };
         if err == ERROR_CANCELLED {
             // User denied UAC, keep running
