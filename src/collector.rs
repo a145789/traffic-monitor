@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -37,6 +38,10 @@ static INTERFACE_HISTORY: LazyLock<Mutex<HashMap<u64, (u64, u64)>>> =
 type BlacklistCache = Option<(Vec<u64>, Instant)>;
 static VIRTUAL_BLACKLIST: LazyLock<Mutex<BlacklistCache>> = LazyLock::new(|| Mutex::new(None));
 const BLACKLIST_REFRESH_SECS: u64 = 30;
+
+thread_local! {
+    static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
+}
 
 pub fn init_network_listener(hwnd: HWND) {
     MAIN_HWND_NETWORK.store(hwnd.0, Ordering::Release);
@@ -143,7 +148,8 @@ pub fn collect_network() {
     if result.0 == 0 && !table.is_null() {
         let table_wrapper = MibTable(table);
         let virtual_blacklist = get_virtual_blacklist();
-        let mut current_data: HashMap<u64, (u64, u64)> = HashMap::new();
+        let mut current_data = CURRENT_DATA.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        current_data.clear();
         let mut has_up_interface = false;
 
         for row in table_wrapper.rows() {
@@ -167,8 +173,10 @@ pub fn collect_network() {
 
         if !NET_INITIALIZED.load(Ordering::Acquire) {
             let mut history = INTERFACE_HISTORY.lock().unwrap();
-            *history = current_data;
+            std::mem::swap(&mut *history, &mut current_data);
             NET_INITIALIZED.store(true, Ordering::Release);
+            drop(history);
+            CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
             return;
         }
 
@@ -192,7 +200,7 @@ pub fn collect_network() {
             }
         }
 
-        *history = current_data;
+        std::mem::swap(&mut *history, &mut current_data);
         drop(history);
 
         NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
@@ -233,6 +241,8 @@ pub fn collect_network() {
                 }
             }
         }
+
+        CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
     }
 }
 

@@ -189,8 +189,27 @@ unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
     if ptr.is_null() {
         return false;
     }
-    let expected: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
-    for (i, &expected_char) in expected.iter().enumerate() {
+    const EXPECTED: &[u16] = &[
+        b'I' as u16,
+        b'm' as u16,
+        b'm' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        b's' as u16,
+        b'i' as u16,
+        b'v' as u16,
+        b'e' as u16,
+        b'C' as u16,
+        b'o' as u16,
+        b'l' as u16,
+        b'o' as u16,
+        b'r' as u16,
+        b'S' as u16,
+        b'e' as u16,
+        b't' as u16,
+        0,
+    ];
+    for (i, &expected_char) in EXPECTED.iter().enumerate() {
         // SAFETY: 调用者保证 ptr 指向有效的 NUL 结尾 UTF-16 序列，按偏移遍历安全。
         let actual_char = unsafe { *ptr.add(i) };
         if actual_char != expected_char {
