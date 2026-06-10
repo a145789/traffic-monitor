@@ -34,7 +34,7 @@ static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 static INTERFACE_HISTORY: LazyLock<Mutex<HashMap<u64, (u64, u64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::with_capacity(16)));
 type BlacklistCache = Option<(Vec<u64>, Instant)>;
 static VIRTUAL_BLACKLIST: LazyLock<Mutex<BlacklistCache>> = LazyLock::new(|| Mutex::new(None));
 const BLACKLIST_REFRESH_SECS: u64 = 30;
