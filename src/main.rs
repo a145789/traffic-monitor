@@ -180,6 +180,17 @@ fn resume_system(hwnd: HWND, reset_backoff: bool) {
     }
 }
 
+const fn utf16<const N: usize>(s: &str) -> [u16; N] {
+    let mut buf = [0u16; N];
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        buf[i] = bytes[i] as u16;
+        i += 1;
+    }
+    buf
+}
+
 /// # Safety
 ///
 /// 调用者必须保证 `lparam` 指向一个有效的、以 NUL 结尾的 UTF-16 宽字符序列。
@@ -189,8 +200,8 @@ unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
     if ptr.is_null() {
         return false;
     }
-    let expected: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
-    for (i, &expected_char) in expected.iter().enumerate() {
+    const EXPECTED: &[u16] = &utf16::<18>("ImmersiveColorSet\0");
+    for (i, &expected_char) in EXPECTED.iter().enumerate() {
         // SAFETY: 调用者保证 ptr 指向有效的 NUL 结尾 UTF-16 序列，按偏移遍历安全。
         let actual_char = unsafe { *ptr.add(i) };
         if actual_char != expected_char {
