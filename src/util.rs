@@ -42,6 +42,7 @@ pub fn reg_read_dword(hkey_root: HKEY, subkey: &str, value_name: &str) -> Option
     let val_name = to_wide(value_name);
     let mut hkey = Default::default();
 
+    // SAFETY: key_path 以 NUL 结尾，hkey 为栈上变量，成功后由 RegKey RAII 守卫接管释放。
     let open_ok = unsafe {
         RegOpenKeyExW(
             hkey_root,
@@ -58,6 +59,8 @@ pub fn reg_read_dword(hkey_root: HKEY, subkey: &str, value_name: &str) -> Option
         let mut dword: u32 = 0;
         let mut size = std::mem::size_of::<u32>() as u32;
 
+        // SAFETY: hkey 有效（生命周期由 _key_guard 保护），val_name 以 NUL 结尾，
+        // dword 和 size 为栈变量，size 与缓冲区大小匹配。
         let result = unsafe {
             RegQueryValueExW(
                 hkey,
@@ -82,6 +85,8 @@ pub fn reg_write_dword(hkey_root: HKEY, subkey: &str, value_name: &str, value: u
     let mut hkey = Default::default();
     let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
 
+    // SAFETY: key_path 以 NUL 结尾，hkey 和 disposition 为栈上变量，
+    // 成功后句柄由 RegKey RAII 守卫接管释放。
     let open_ok = unsafe {
         RegCreateKeyExW(
             hkey_root,
@@ -99,6 +104,8 @@ pub fn reg_write_dword(hkey_root: HKEY, subkey: &str, value_name: &str, value: u
 
     if open_ok {
         let _key_guard = crate::ffi_guard::RegKey::new(hkey);
+        // SAFETY: hkey 有效（生命周期由 _key_guard 保护），val_name 以 NUL 结尾，
+        // from_raw_parts 将 &u32 转换为合法字节切片，长度正确。
         unsafe {
             RegSetValueExW(
                 hkey,

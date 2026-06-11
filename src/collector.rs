@@ -395,10 +395,12 @@ fn get_virtual_blacklist() -> Vec<u64> {
             list
         }
         None => VIRTUAL_BLACKLIST.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|(l, _)| l.clone())
-                .unwrap_or_default()
+            let mut cache = cell.borrow_mut();
+            let old_list = cache.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+            // Update timestamp on failure so we don't retry GetAdaptersAddresses
+            // on every tick; reuse the old list (or empty) for 30s.
+            *cache = Some((old_list.clone(), Instant::now()));
+            old_list
         }),
     }
 }
