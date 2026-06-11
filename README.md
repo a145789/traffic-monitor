@@ -1,7 +1,10 @@
 # Traffic Monitor
 
-> ⚡ **纯 Vibe Coding 项目**
-> Powered by `deepseek v4 pro mimo 2.5 pro`
+> [!NOTE]
+> ⚡ **Vibe Coding 项目**
+>
+> Powered by `deepseek v4 pro` & `mimo 2.5 pro`
+>
 > Code Reviewed by `qcode` & `Gemini 3.5 Flash`
 
 Windows 任务栏系统监控小组件，实时显示 CPU、内存、网速信息。纯 Rust 实现，无配置文件，轻量高效。
