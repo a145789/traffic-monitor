@@ -6,13 +6,14 @@ use windows::Win32::Graphics::Gdi::{
     FONT_QUALITY, FillRect, GetTextExtentPoint32W, GetWindowDC, HBITMAP, HBRUSH, HDC, HFONT,
     HGDIOBJ, LOGFONTW, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
+use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, CPU_USAGE, DISPLAY_HEIGHT,
     DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
     MOUSE_IS_CHARGING, MOUSE_ONLINE, NET_SPEED_DOWN, NET_SPEED_UP, SHOW_MOUSE_INFO,
 };
-use crate::ffi_guard::RegKey;
+use crate::util::{reg_read_dword, to_wide};
 
 pub struct Renderer {
     hdc_mem: HDC,
@@ -26,7 +27,6 @@ pub struct Renderer {
     width: i32,
     height: i32,
     arrow_width: i32,
-    wide_buf: Vec<u16>,
 }
 
 impl Renderer {
@@ -84,7 +84,6 @@ impl Renderer {
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
             arrow_width,
-            wide_buf: Vec::with_capacity(32),
         }
     }
 
@@ -96,66 +95,65 @@ impl Renderer {
         }
     }
 
-    #[inline]
-    fn wide(&mut self, s: &str) -> &mut [u16] {
-        self.wide_buf.clear();
-        self.wide_buf.extend(s.encode_utf16());
-        self.wide_buf.push(0);
-        &mut self.wide_buf
+    fn wide<'a>(buf: &'a mut Vec<u16>, s: &str) -> &'a mut [u16] {
+        buf.clear();
+        buf.extend(s.encode_utf16());
+        buf.push(0);
+        buf
     }
 
-    fn format_cpu_mem_wide(&mut self, label: &str, value: u32) -> &mut [u16] {
-        self.wide_buf.clear();
-        push_ascii(&mut self.wide_buf, label);
-        push_ascii(&mut self.wide_buf, ": ");
-        write_u32(&mut self.wide_buf, value);
-        push_ascii(&mut self.wide_buf, "%");
-        self.wide_buf.push(0);
-        &mut self.wide_buf
+    fn format_cpu_mem_wide<'a>(buf: &'a mut Vec<u16>, label: &str, value: u32) -> &'a mut [u16] {
+        buf.clear();
+        push_ascii(buf, label);
+        push_ascii(buf, ": ");
+        write_u32(buf, value);
+        push_ascii(buf, "%");
+        buf.push(0);
+        buf
     }
 
-    fn format_percent_wide(&mut self, value: u32) -> &mut [u16] {
-        self.wide_buf.clear();
-        write_u32(&mut self.wide_buf, value);
-        push_ascii(&mut self.wide_buf, "%");
-        self.wide_buf.push(0);
-        &mut self.wide_buf
+    fn format_percent_wide<'a>(buf: &'a mut Vec<u16>, value: u32) -> &'a mut [u16] {
+        buf.clear();
+        write_u32(buf, value);
+        push_ascii(buf, "%");
+        buf.push(0);
+        buf
     }
 
-    fn format_mouse_battery_wide(&mut self, value: u32) -> &mut [u16] {
-        self.wide_buf.clear();
+    fn format_mouse_battery_wide<'a>(buf: &'a mut Vec<u16>, value: u32) -> &'a mut [u16] {
+        buf.clear();
         // U+1F5B1 (🖱️) 的 UTF-16 代理对
-        self.wide_buf.push(0xD83D);
-        self.wide_buf.push(0xDDB1);
-        self.wide_buf.push(b' ' as u16);
-        write_u32(&mut self.wide_buf, value);
-        push_ascii(&mut self.wide_buf, "%");
-        self.wide_buf.push(0);
-        &mut self.wide_buf
+        buf.push(0xD83D);
+        buf.push(0xDDB1);
+        buf.push(b' ' as u16);
+        write_u32(buf, value);
+        push_ascii(buf, "%");
+        buf.push(0);
+        buf
     }
 
-    fn format_dpi_wide(&mut self, value: u32) -> &mut [u16] {
-        self.wide_buf.clear();
-        push_ascii(&mut self.wide_buf, "DPI: ");
-        write_u32(&mut self.wide_buf, value);
-        self.wide_buf.push(0);
-        &mut self.wide_buf
+    fn format_dpi_wide<'a>(buf: &'a mut Vec<u16>, value: u32) -> &'a mut [u16] {
+        buf.clear();
+        push_ascii(buf, "DPI: ");
+        write_u32(buf, value);
+        buf.push(0);
+        buf
     }
 
-    fn format_speed_wide(&mut self, bytes_per_sec: u32) -> &mut [u16] {
-        self.wide_buf.clear();
+    fn format_speed_wide<'a>(buf: &'a mut Vec<u16>, bytes_per_sec: u32) -> &'a mut [u16] {
+        buf.clear();
         if bytes_per_sec < 1024 {
-            write_u32(&mut self.wide_buf, bytes_per_sec);
-            push_ascii(&mut self.wide_buf, " B/s");
+            write_u32(buf, bytes_per_sec);
+            push_ascii(buf, " B/s");
         } else if bytes_per_sec < 1024 * 1024 {
-            write_fixed1(&mut self.wide_buf, bytes_per_sec as f64 / 1024.0);
-            push_ascii(&mut self.wide_buf, " KB/s");
+            write_fixed1(buf, bytes_per_sec as f64 / 1024.0);
+            push_ascii(buf, " KB/s");
         } else {
-            write_fixed1(&mut self.wide_buf, bytes_per_sec as f64 / (1024.0 * 1024.0));
-            push_ascii(&mut self.wide_buf, " MB/s");
+            write_fixed1(buf, bytes_per_sec as f64 / (1024.0 * 1024.0));
+            push_ascii(buf, " MB/s");
         }
-        self.wide_buf.push(0);
-        &mut self.wide_buf
+        buf.push(0);
+        buf
     }
 
     pub fn render(&mut self, hdc: HDC) {
@@ -179,6 +177,8 @@ impl Renderer {
         let half_height = self.height / 2;
         let scale = self.width as f64 / DISPLAY_WIDTH as f64;
 
+        let mut buf = Vec::with_capacity(32);
+
         // 1. 绘制第三列 (网速) - 最右列
         // 箭头左对齐，数值右对齐 — 表格效果
         let col_gap = (13.0 * scale).round() as i32;
@@ -199,7 +199,7 @@ impl Renderer {
                 right: arrow_right,
                 bottom: half_height,
             };
-            let up_arrow = self.wide("\u{2191}");
+            let up_arrow = Self::wide(&mut buf, "\u{2191}");
             let _ = DrawTextW(
                 hdc_mem,
                 up_arrow,
@@ -214,7 +214,7 @@ impl Renderer {
                 right: speed_right,
                 bottom: half_height,
             };
-            let up_val = self.format_speed_wide(speed_up);
+            let up_val = Self::format_speed_wide(&mut buf, speed_up);
             let _ = DrawTextW(
                 hdc_mem,
                 up_val,
@@ -229,7 +229,7 @@ impl Renderer {
                 right: arrow_right,
                 bottom: self.height,
             };
-            let down_arrow = self.wide("\u{2193}");
+            let down_arrow = Self::wide(&mut buf, "\u{2193}");
             let _ = DrawTextW(
                 hdc_mem,
                 down_arrow,
@@ -244,7 +244,7 @@ impl Renderer {
                 right: speed_right,
                 bottom: self.height,
             };
-            let down_val = self.format_speed_wide(speed_down);
+            let down_val = Self::format_speed_wide(&mut buf, speed_down);
             let _ = DrawTextW(
                 hdc_mem,
                 down_val,
@@ -267,7 +267,7 @@ impl Renderer {
                             right: mouse_right,
                             bottom: half_height,
                         };
-                        let mouse_wide = self.wide("\u{1F5B1}");
+                        let mouse_wide = Self::wide(&mut buf, "\u{1F5B1}");
                         let _ = DrawTextW(
                             hdc_mem,
                             mouse_wide,
@@ -278,7 +278,7 @@ impl Renderer {
                         // 用红色画电量数字，左侧相对偏移 16 像素
                         let battery_color = COLORREF(COLOR_LOW_BATTERY);
                         SetTextColor(hdc_mem, battery_color);
-                        let battery_wide = self.format_percent_wide(battery);
+                        let battery_wide = Self::format_percent_wide(&mut buf, battery);
                         let mut rc_bat = RECT {
                             left: mouse_left + (16.0 * scale).round() as i32,
                             top: 0,
@@ -295,7 +295,7 @@ impl Renderer {
                         // 恢复颜色
                         SetTextColor(hdc_mem, self.text_color);
                     } else {
-                        let mouse_wide = self.format_mouse_battery_wide(battery);
+                        let mouse_wide = Self::format_mouse_battery_wide(&mut buf, battery);
                         let mut rc_mouse = RECT {
                             left: mouse_left,
                             top: 0,
@@ -312,7 +312,7 @@ impl Renderer {
 
                     // 第二行：DPI
                     let h = self.height;
-                    let dpi_wide = self.format_dpi_wide(dpi);
+                    let dpi_wide = Self::format_dpi_wide(&mut buf, dpi);
                     let mut rc_dpi = RECT {
                         left: mouse_left,
                         top: half_height,
@@ -334,7 +334,7 @@ impl Renderer {
                         right: mouse_right,
                         bottom: half_height,
                     };
-                    let mouse_wide = self.wide(mouse_text);
+                    let mouse_wide = Self::wide(&mut buf, mouse_text);
                     let _ = DrawTextW(
                         hdc_mem,
                         mouse_wide,
@@ -349,7 +349,7 @@ impl Renderer {
                         right: mouse_right,
                         bottom: self.height,
                     };
-                    let dpi_wide = self.wide(dpi_text);
+                    let dpi_wide = Self::wide(&mut buf, dpi_text);
                     let _ = DrawTextW(
                         hdc_mem,
                         dpi_wide,
@@ -367,7 +367,7 @@ impl Renderer {
             };
             let cpu_left = cpu_right - (76.0 * scale).round() as i32;
 
-            let cpu_wide = self.format_cpu_mem_wide("CPU", cpu);
+            let cpu_wide = Self::format_cpu_mem_wide(&mut buf, "CPU", cpu);
             let mut rc_cpu = RECT {
                 left: cpu_left,
                 top: 0,
@@ -382,7 +382,7 @@ impl Renderer {
             );
 
             let h = self.height;
-            let mem_wide = self.format_cpu_mem_wide("MEM", mem);
+            let mem_wide = Self::format_cpu_mem_wide(&mut buf, "MEM", mem);
             let mut rc_mem = RECT {
                 left: cpu_left,
                 top: half_height,
@@ -465,7 +465,7 @@ impl Renderer {
 
         let arrow_width = {
             let hdc_mem = self.hdc_mem;
-            let arrow_text = self.wide("\u{2191} ");
+            let arrow_text = to_wide("\u{2191} ");
             let arrow_len = arrow_text.len() - 1;
             let mut size = SIZE::default();
             // SAFETY: hdc_mem 有效，arrow_text 以 NUL 结尾，size 在栈上。
@@ -510,63 +510,14 @@ fn create_font(size: i32) -> HFONT {
     unsafe { CreateFontIndirectW(&lf) }
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 pub fn is_system_light_theme() -> bool {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
-    };
-    use windows::core::PCWSTR;
-
-    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
-        .encode_utf16()
-        .collect();
-    let value_name: Vec<u16> = "SystemUsesLightTheme\0".encode_utf16().collect();
-    let mut hkey = Default::default();
-
-    // SAFETY:
-    // 1. HKEY_CURRENT_USER 是预定义且系统保证有效的注册表根键。
-    // 2. key_path 已转换为以 NUL 结尾的 UTF-16 宽字符数组，确保传入 RegOpenKeyExW 的路径在调用期间内存合法。
-    // 3. 栈上 hkey 变量的地址合法，成功打开的句柄将通过 RegKey 进行 RAII 自动生命周期释放。
-    let open_ok = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = RegKey::new(hkey);
-        let mut value: u32 = 0;
-        let mut value_size = std::mem::size_of::<u32>() as u32;
-
-        // SAFETY:
-        // 1. hkey 是先前成功打开的合法键句柄。
-        // 2. value_name 指向以 NUL 结尾的合法宽字符数组指针。
-        // 3. value_size 初始化为 value (u32) 的大小 4 字节，系统在写入时不会发生缓冲区溢出，内存访问是完全合法的。
-        let query_ok = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(value_name.as_ptr()),
-                None,
-                None,
-                Some(&mut value as *mut u32 as *mut u8),
-                Some(&mut value_size),
-            )
-            .is_ok()
-        };
-
-        if query_ok {
-            return value == 1;
-        }
-    }
-    false
+    reg_read_dword(
+        HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        "SystemUsesLightTheme",
+    )
+    .map(|v| v == 1)
+    .unwrap_or(false)
 }
 
 fn push_ascii(buf: &mut Vec<u16>, s: &str) {

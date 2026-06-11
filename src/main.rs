@@ -7,6 +7,7 @@ mod mouse_hid;
 mod renderer;
 mod tray;
 mod update;
+mod util;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
@@ -28,12 +29,12 @@ use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetDesktopWindow,
     GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP, IsWindow,
-    KillTimer, LWA_COLORKEY, MB_ICONERROR, MB_OK, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
-    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_TIMER, WM_WTSSESSION_CHANGE, WS_CHILD, WS_EX_LAYERED, WS_VISIBLE,
+    KillTimer, LWA_COLORKEY, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
+    RegisterWindowMessageW, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED,
+    WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WS_CHILD,
+    WS_EX_LAYERED, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -44,8 +45,9 @@ use crate::collector::{
 use crate::config::{
     COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
     FULLSCREEN, GAP, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
-    MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SUSPENDED, TIMER_ID_CPU_MEM, TIMER_ID_NETWORK,
-    TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
+    MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SUSPENDED, TIMER_ID_CPU_MEM,
+    TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK,
+    TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::mouse_hid::{
     WM_USER_MOUSE_STATUS, WM_USER_MOUSE_UPDATE, check_mouse_available, start_mouse_thread,
@@ -59,6 +61,7 @@ use crate::tray::{
 use crate::update::{
     WM_USER_UPDATE_READY, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
 };
+use crate::util::show_error;
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
 const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 1;
@@ -109,22 +112,6 @@ fn get_taskbar_hwnd() -> Option<HWND> {
 
 // MutexGuard 定义已提取至 ffi_guard 模块中进行共用。
 
-fn show_error(msg: &str) {
-    let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
-    let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY:
-    // title 和 msg_wide 均为当前分配的以 NUL 结尾的合法宽字符数组指针。
-    // MessageBoxW 将安全弹出窗口通知用户。
-    unsafe {
-        MessageBoxW(
-            None,
-            windows::core::PCWSTR(msg_wide.as_ptr()),
-            windows::core::PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONERROR,
-        );
-    }
-}
-
 fn stop_and_join_mouse_thread() {
     stop_mouse_thread();
     MOUSE_THREAD.with(|m| {
@@ -147,10 +134,11 @@ fn suspend_system(hwnd: HWND) {
     SUSPENDED.store(true, Ordering::Release);
     // SAFETY:
     // hwnd 是操作系统分配的有效主窗口句柄。
-    // 在系统休眠或锁屏时安全关闭两个监测定时器。
+    // 在系统休眠或锁屏时安全关闭所有监测定时器。
     unsafe {
         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
+        KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
     }
     stop_and_join_mouse_thread();
     trim_working_set();
@@ -170,6 +158,12 @@ fn resume_system(hwnd: HWND, reset_backoff: bool) {
     // SAFETY: hwnd 是系统分配的有效主窗口句柄。
     unsafe {
         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
+        let _ = SetTimer(
+            Some(hwnd),
+            TIMER_ID_FULLSCREEN,
+            TIMER_INTERVAL_FULLSCREEN,
+            None,
+        );
     }
     if !FULLSCREEN.load(Ordering::Acquire) {
         // SAFETY: hwnd 有效，定时器 ID 合法。
@@ -180,6 +174,8 @@ fn resume_system(hwnd: HWND, reset_backoff: bool) {
     }
 }
 
+/// Converts an ASCII string to a fixed-size UTF-16 array. Only works for ASCII; non-ASCII bytes
+/// will produce incorrect results.
 const fn utf16<const N: usize>(s: &str) -> [u16; N] {
     let mut buf = [0u16; N];
     let bytes = s.as_bytes();
@@ -411,6 +407,12 @@ fn main() {
 
     // SAFETY: hwnd 有效，创建初始定时器。
     unsafe {
+        let _ = SetTimer(
+            Some(hwnd),
+            TIMER_ID_FULLSCREEN,
+            TIMER_INTERVAL_FULLSCREEN,
+            None,
+        );
         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
     }
@@ -596,6 +598,12 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
         };
         // SAFETY: hwnd 有效，重建网络定时器。
         unsafe {
+            let _ = SetTimer(
+                Some(hwnd),
+                TIMER_ID_FULLSCREEN,
+                TIMER_INTERVAL_FULLSCREEN,
+                None,
+            );
             let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
         }
         if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
@@ -611,8 +619,12 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
 
 fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     match wparam.0 {
+        TIMER_ID_FULLSCREEN => {
+            if !SUSPENDED.load(Ordering::Acquire) {
+                check_fullscreen(hwnd);
+            }
+        }
         TIMER_ID_NETWORK => {
-            check_fullscreen(hwnd);
             if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
                 update_taskbar_position(hwnd);
                 collect_network();
@@ -819,7 +831,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
         WM_CLOSE => {
             remove_tray_icon();
-            stop_mouse_thread();
+            stop_and_join_mouse_thread();
             // SAFETY: PostQuitMessage 向当前线程投递 WM_QUIT。
             unsafe {
                 PostQuitMessage(0);

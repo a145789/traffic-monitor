@@ -18,6 +18,7 @@ use crate::config::{
     WINDOW_CLASS, WINDOW_TITLE,
 };
 use crate::ffi_guard::{MenuGuard, RegKey};
+use crate::util::{reg_read_dword, reg_write_dword};
 use std::cell::RefCell;
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
@@ -438,94 +439,24 @@ fn toggle_auto_update() {
 }
 
 pub fn load_show_mouse_info() -> bool {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
-    };
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
-    let key_path: Vec<u16> = "Software\\Traffic Monitor\0".encode_utf16().collect();
-    let value_name: Vec<u16> = "ShowMouseInfo\0".encode_utf16().collect();
-    let mut hkey = Default::default();
-
-    // SAFETY: key_path 以 NUL 结尾，hkey 在栈上分配，成功后由 RegKey 管理以自动释放句柄。
-    let open_ok = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = RegKey::new(hkey);
-        let mut dword: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-
-        // SAFETY: hkey 为已验证有效的注册表键句柄，dword 和 size 均为栈上分配的变量，且 dword 缓冲区大小与 size 一致。
-        let result = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(value_name.as_ptr()),
-                None,
-                None,
-                Some(&mut dword as *mut u32 as *mut u8),
-                Some(&mut size),
-            )
-        };
-        if result.is_ok() {
-            return dword != 0;
-        }
-    }
-
-    false
+    reg_read_dword(
+        HKEY_CURRENT_USER,
+        "Software\\Traffic Monitor",
+        "ShowMouseInfo",
+    )
+    .map(|v| v != 0)
+    .unwrap_or(false)
 }
 
 pub fn save_show_mouse_info(show: bool) {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, RegCreateKeyExW,
-        RegSetValueExW,
-    };
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
-    let key_path: Vec<u16> = "Software\\Traffic Monitor\0".encode_utf16().collect();
-    let value_name: Vec<u16> = "ShowMouseInfo\0".encode_utf16().collect();
-    let mut hkey = Default::default();
-    let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
-
-    // SAFETY: key_path 以 NUL 结尾，hkey 和 disposition 均在栈上分配，成功后句柄由 RegKey 自动接管释放。
-    let open_ok = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            None,
-            None,
-            Default::default(),
-            KEY_WRITE,
-            None,
-            &mut hkey,
-            Some(&mut disposition),
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = RegKey::new(hkey);
-        let dword: u32 = if show { 1 } else { 0 };
-
-        // SAFETY: hkey 为已验证有效的注册表键句柄，value_name 以 NUL 结尾，
-        // 通过 std::slice::from_raw_parts 安全将栈上 dword 的指针转换为字节切片，且长度正确。
-        unsafe {
-            let _ = RegSetValueExW(
-                hkey,
-                PCWSTR(value_name.as_ptr()),
-                Some(0),
-                REG_DWORD,
-                Some(std::slice::from_raw_parts(
-                    &dword as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )),
-            );
-        }
-    }
+    reg_write_dword(
+        HKEY_CURRENT_USER,
+        "Software\\Traffic Monitor",
+        "ShowMouseInfo",
+        if show { 1 } else { 0 },
+    );
 }

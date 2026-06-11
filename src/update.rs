@@ -4,15 +4,17 @@ use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::Security::Cryptography::*;
+use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW, PostMessageW, PostQuitMessage,
-    SW_SHOWNORMAL, WM_USER,
+    MB_ICONINFORMATION, MB_YESNO, MessageBoxW, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
+    WM_USER,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::config::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
+use crate::util::{reg_read_dword, reg_write_dword, show_error, show_info, to_wide};
 
 pub const WM_USER_UPDATE_READY: u32 = WM_USER + 5;
 
@@ -85,10 +87,6 @@ fn check_status(status: i32, fn_name: &str) -> Result<(), String> {
     } else {
         Err(format!("{fn_name} failed: 0x{status:08X}"))
     }
-}
-
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
@@ -295,11 +293,12 @@ fn compute_sha256_hex(data: &[u8]) -> Result<String, String> {
 }
 
 fn format_hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join("")
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
 }
 
 fn compute_sha256_hex_file(path: &std::path::Path) -> Result<String, String> {
@@ -383,109 +382,30 @@ pub fn is_installed_version() -> bool {
 }
 
 pub fn load_auto_update_enabled() -> bool {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
-    };
-
-    let key_path: Vec<u16> = "Software\\Traffic Monitor\0".encode_utf16().collect();
-    let value_name: Vec<u16> = "EnableAutoUpdate\0".encode_utf16().collect();
-    let mut hkey = Default::default();
-
-    // SAFETY:
-    // key_path 是有效的 NUL 终止 UTF-16 注册表路径字符串。
-    // &mut hkey 是键句柄的输出参数。
-    let open_ok = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = crate::ffi_guard::RegKey::new(hkey);
-        let mut dword: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-
-        // SAFETY:
-        // hkey 来自 RegOpenKeyExW，有效（生命周期由 RegKey RAII 守卫）。
-        // value_name 是有效的 NUL 终止 UTF-16 字符串。
-        // &mut dword 转换为 *mut u8 提供有效的 4 字节缓冲区；size 匹配。
-        let result = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(value_name.as_ptr()),
-                None,
-                None,
-                Some(&mut dword as *mut u32 as *mut u8),
-                Some(&mut size),
-            )
-        };
-        if result.is_ok() {
-            return dword != 0;
-        }
-    }
-
-    true
+    reg_read_dword(
+        HKEY_CURRENT_USER,
+        "Software\\Traffic Monitor",
+        "EnableAutoUpdate",
+    )
+    .map(|v| v != 0)
+    .unwrap_or(true)
 }
 
 pub fn save_auto_update_enabled(enabled: bool) {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, RegCreateKeyExW,
-        RegSetValueExW,
-    };
-
-    let key_path: Vec<u16> = "Software\\Traffic Monitor\0".encode_utf16().collect();
-    let value_name: Vec<u16> = "EnableAutoUpdate\0".encode_utf16().collect();
-    let mut hkey = Default::default();
-    let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
-
-    // SAFETY:
-    // key_path 是有效的 NUL 终止 UTF-16 注册表路径字符串。
-    // &mut hkey 和 &mut disposition 均为输出参数。
-    let open_ok = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            None,
-            None,
-            Default::default(),
-            KEY_WRITE,
-            None,
-            &mut hkey,
-            Some(&mut disposition),
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = crate::ffi_guard::RegKey::new(hkey);
-        let dword: u32 = if enabled { 1 } else { 0 };
-
-        // SAFETY:
-        // hkey 来自 RegCreateKeyExW，有效（生命周期由 RegKey RAII 守卫）。
-        // value_name 是有效的 NUL 终止 UTF-16 字符串。
-        // from_raw_parts：&dword 是有效的 u32 引用；size 匹配 std::mem::size_of::<u32>()。
-        unsafe {
-            let _ = RegSetValueExW(
-                hkey,
-                PCWSTR(value_name.as_ptr()),
-                Some(0),
-                REG_DWORD,
-                Some(std::slice::from_raw_parts(
-                    &dword as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )),
-            );
-        }
-    }
+    reg_write_dword(
+        HKEY_CURRENT_USER,
+        "Software\\Traffic Monitor",
+        "EnableAutoUpdate",
+        if enabled { 1 } else { 0 },
+    );
 }
 
 fn get_temp_installer_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(TEMP_FILE_NAME)
+    let local_appdata = std::env::var("LOCALAPPDATA")
+        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+    std::path::PathBuf::from(local_appdata)
+        .join("Traffic Monitor")
+        .join(TEMP_FILE_NAME)
 }
 
 pub fn start_auto_check(hwnd: HWND) {
@@ -677,7 +597,15 @@ fn do_update_check() -> CheckResult {
     }
 
     if std::fs::write(&temp_path, &installer_data).is_err() {
-        return CheckResult::Error;
+        // Try creating the parent directory and retry once.
+        if let Some(parent) = temp_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            if std::fs::write(&temp_path, &installer_data).is_err() {
+                return CheckResult::Error;
+            }
+        } else {
+            return CheckResult::Error;
+        }
     }
 
     CheckResult::InstalledReady(latest_version, temp_path_str)
@@ -719,38 +647,9 @@ pub fn handle_update_ready(hwnd: HWND, status: usize) {
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
 }
 
-fn show_info(msg: &str) {
-    let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
-    let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: title 和 msg_wide 均为有效的 NUL 终止宽字符串。
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(msg_wide.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
-
-fn show_error(msg: &str) {
-    let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
-    let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: title 和 msg_wide 均为有效的 NUL 终止宽字符串。
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(msg_wide.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONERROR,
-        );
-    }
-}
-
 fn show_yes_no(msg: &str) -> bool {
-    let title: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
-    let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: title 和 msg_wide 均为有效的 NUL 终止宽字符串。
+    let title = to_wide("Traffic Monitor");
+    let msg_wide = to_wide(msg);
     let result = unsafe {
         MessageBoxW(
             None,
