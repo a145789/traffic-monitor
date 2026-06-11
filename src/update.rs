@@ -683,11 +683,15 @@ fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
         .collect();
 
     let verb_wide: Vec<u16> = "runas\0".encode_utf16().collect();
+    let params_wide: Vec<u16> = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART\0"
+        .encode_utf16()
+        .collect();
 
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         lpVerb: PCWSTR(verb_wide.as_ptr()),
         lpFile: PCWSTR(path_wide.as_ptr()),
+        lpParameters: PCWSTR(params_wide.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };

@@ -37,7 +37,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\traffic-monitor.exe"; \
 Description: "启动 Traffic Monitor"; \
-Flags: nowait postinstall skipifsilent
+Flags: nowait postinstall
 
 [Code]
 function InitializeSetup(): Boolean;
