@@ -15,7 +15,7 @@ use windows::core::{PCWSTR, PWSTR};
 use crate::config::{
     APP_NAME, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE, MENU_ID_AUTO_UPDATE_TOGGLE,
     MENU_ID_CHECK_UPDATE_MANUAL, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, SHOW_MOUSE_INFO,
-    WINDOW_CLASS, WINDOW_TITLE,
+    UPDATE_IN_PROGRESS, WINDOW_CLASS, WINDOW_TITLE,
 };
 use crate::ffi_guard::{MenuGuard, RegKey};
 use crate::util::{reg_read_dword, reg_write_dword};
@@ -220,11 +220,20 @@ pub fn show_context_menu(hwnd: HWND) {
     }
 
     // 5. Manual check update
-    let check_update_text: Vec<u16> = "检查更新...\0".encode_utf16().collect();
+    let update_in_progress = UPDATE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+    let check_update_text: Vec<u16> = if update_in_progress {
+        "检查更新中...\0".encode_utf16().collect()
+    } else {
+        "检查更新...\0".encode_utf16().collect()
+    };
     let mut check_update_item = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: MFS_UNCHECKED,
+        fState: if update_in_progress {
+            MFS_DISABLED
+        } else {
+            MFS_UNCHECKED
+        },
         wID: MENU_ID_CHECK_UPDATE_MANUAL,
         ..Default::default()
     };
