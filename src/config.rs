@@ -11,9 +11,11 @@ pub const GAP: i32 = -3;
 
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
+pub const TIMER_ID_FULLSCREEN: usize = 3;
 
 pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
 pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
+pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
 pub const MOUSE_VIDS: [u16; 2] = [0xA8A4, 0xA8A5];

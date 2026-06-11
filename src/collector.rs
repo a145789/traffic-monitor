@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -33,14 +32,13 @@ static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-static INTERFACE_HISTORY: LazyLock<Mutex<HashMap<u64, (u64, u64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::with_capacity(16)));
 type BlacklistCache = Option<(Vec<u64>, Instant)>;
-static VIRTUAL_BLACKLIST: LazyLock<Mutex<BlacklistCache>> = LazyLock::new(|| Mutex::new(None));
 const BLACKLIST_REFRESH_SECS: u64 = 30;
 
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
+    static INTERFACE_HISTORY: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
+    static VIRTUAL_BLACKLIST: RefCell<BlacklistCache> = RefCell::new(None);
 }
 
 pub fn init_network_listener(hwnd: HWND) {
@@ -172,36 +170,37 @@ pub fn collect_network() {
         }
 
         if !NET_INITIALIZED.load(Ordering::Acquire) {
-            let mut history = INTERFACE_HISTORY.lock().unwrap();
-            std::mem::swap(&mut *history, &mut current_data);
+            INTERFACE_HISTORY.with(|cell| {
+                let mut history = cell.borrow_mut();
+                std::mem::swap(&mut *history, &mut current_data);
+            });
             NET_INITIALIZED.store(true, Ordering::Release);
-            drop(history);
             CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
             return;
         }
-
-        let mut history = INTERFACE_HISTORY.lock().unwrap();
 
         let mut max_total: u64 = 0;
         let mut best_speed_down: u32 = 0;
         let mut best_speed_up: u32 = 0;
 
-        for (luid, (in_octets, out_octets)) in &current_data {
-            if let Some(&(prev_in, prev_out)) = history.get(luid) {
-                let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
-                let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
-                let total = speed_down as u64 + speed_up as u64;
+        INTERFACE_HISTORY.with(|cell| {
+            let mut history = cell.borrow_mut();
+            for (luid, (in_octets, out_octets)) in &current_data {
+                if let Some(&(prev_in, prev_out)) = history.get(luid) {
+                    let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
+                    let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
+                    let total = speed_down as u64 + speed_up as u64;
 
-                if total > max_total {
-                    max_total = total;
-                    best_speed_down = speed_down;
-                    best_speed_up = speed_up;
+                    if total > max_total {
+                        max_total = total;
+                        best_speed_down = speed_down;
+                        best_speed_up = speed_up;
+                    }
                 }
             }
-        }
 
-        std::mem::swap(&mut *history, &mut current_data);
-        drop(history);
+            std::mem::swap(&mut *history, &mut current_data);
+        });
 
         NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
         NET_SPEED_UP.store(best_speed_up, Ordering::Release);
@@ -373,24 +372,36 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
 
 fn get_virtual_blacklist() -> Vec<u64> {
     {
-        let cache = VIRTUAL_BLACKLIST.lock().unwrap();
-        if let Some((list, last_refresh)) = cache.as_ref()
-            && last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS
-        {
-            return list.clone();
+        let skip = VIRTUAL_BLACKLIST.with(|cell| {
+            let cache = cell.borrow();
+            if let Some((list, last_refresh)) = cache.as_ref()
+                && last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS
+            {
+                return Some(list.clone());
+            }
+            None
+        });
+        if let Some(list) = skip {
+            return list;
         }
     }
 
     let new_list = build_virtual_blacklist();
     match new_list {
         Some(list) => {
-            *VIRTUAL_BLACKLIST.lock().unwrap() = Some((list.clone(), Instant::now()));
+            VIRTUAL_BLACKLIST.with(|cell| {
+                *cell.borrow_mut() = Some((list.clone(), Instant::now()));
+            });
             list
         }
-        None => {
-            let cache = VIRTUAL_BLACKLIST.lock().unwrap();
-            cache.as_ref().map(|(l, _)| l.clone()).unwrap_or_default()
-        }
+        None => VIRTUAL_BLACKLIST.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            let old_list = cache.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+            // Update timestamp on failure so we don't retry GetAdaptersAddresses
+            // on every tick; reuse the old list (or empty) for 30s.
+            *cache = Some((old_list.clone(), Instant::now()));
+            old_list
+        }),
     }
 }
 
