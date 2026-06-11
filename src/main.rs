@@ -46,8 +46,8 @@ use crate::config::{
     COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
     FULLSCREEN, GAP, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
     MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SUSPENDED, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK,
-    TIMER_INTERVAL_NETWORK_BACKOFF,
+    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN,
+    TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::mouse_hid::{
     WM_USER_MOUSE_STATUS, WM_USER_MOUSE_UPDATE, check_mouse_available, start_mouse_thread,
@@ -431,6 +431,14 @@ fn main() {
     init_cleanup_temp();
     start_auto_check(hwnd);
 
+    // SAFETY:
+    // hwnd 由 CreateWindowExW 返回，经 is_invalid() 校验通过，为当前进程的有效主窗口句柄。
+    // TIMER_ID_INIT_TRIM (99) 为唯一常量，不与已有定时器 ID (1/2/3) 冲突。
+    // 一次性定时器在 10 秒后触发 trim_working_set()，释放初始化阶段遗留的冷代码页。
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_ID_INIT_TRIM, 10000, None);
+    }
+
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
 
     // SAFETY: msg 由操作系统填充，消息循环是标准 Win32 模式。
@@ -619,6 +627,16 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
 
 fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     match wparam.0 {
+        TIMER_ID_INIT_TRIM => {
+            trim_working_set();
+            // SAFETY:
+            // hwnd 来自窗口过程，为操作系统分配的有效窗口句柄。
+            // TIMER_ID_INIT_TRIM 为本次启动时已创建的定时器 ID。
+            // KillTimer 对已销毁或不存在的定时器仅返回错误，不会触发 UB。
+            unsafe {
+                KillTimer(Some(hwnd), TIMER_ID_INIT_TRIM).ok();
+            }
+        }
         TIMER_ID_FULLSCREEN => {
             if !SUSPENDED.load(Ordering::Acquire) {
                 check_fullscreen(hwnd);

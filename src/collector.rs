@@ -38,7 +38,7 @@ const BLACKLIST_REFRESH_SECS: u64 = 30;
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
-    static VIRTUAL_BLACKLIST: RefCell<BlacklistCache> = RefCell::new(None);
+    static VIRTUAL_BLACKLIST: RefCell<BlacklistCache> = const { RefCell::new(None) };
 }
 
 pub fn init_network_listener(hwnd: HWND) {

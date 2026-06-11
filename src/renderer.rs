@@ -112,7 +112,7 @@ impl Renderer {
         buf
     }
 
-    fn format_percent_wide<'a>(buf: &'a mut Vec<u16>, value: u32) -> &'a mut [u16] {
+    fn format_percent_wide(buf: &mut Vec<u16>, value: u32) -> &mut [u16] {
         buf.clear();
         write_u32(buf, value);
         push_ascii(buf, "%");
@@ -120,7 +120,7 @@ impl Renderer {
         buf
     }
 
-    fn format_mouse_battery_wide<'a>(buf: &'a mut Vec<u16>, value: u32) -> &'a mut [u16] {
+    fn format_mouse_battery_wide(buf: &mut Vec<u16>, value: u32) -> &mut [u16] {
         buf.clear();
         // U+1F5B1 (🖱️) 的 UTF-16 代理对
         buf.push(0xD83D);
@@ -132,7 +132,7 @@ impl Renderer {
         buf
     }
 
-    fn format_dpi_wide<'a>(buf: &'a mut Vec<u16>, value: u32) -> &'a mut [u16] {
+    fn format_dpi_wide(buf: &mut Vec<u16>, value: u32) -> &mut [u16] {
         buf.clear();
         push_ascii(buf, "DPI: ");
         write_u32(buf, value);
@@ -140,7 +140,7 @@ impl Renderer {
         buf
     }
 
-    fn format_speed_wide<'a>(buf: &'a mut Vec<u16>, bytes_per_sec: u32) -> &'a mut [u16] {
+    fn format_speed_wide(buf: &mut Vec<u16>, bytes_per_sec: u32) -> &mut [u16] {
         buf.clear();
         if bytes_per_sec < 1024 {
             write_u32(buf, bytes_per_sec);
