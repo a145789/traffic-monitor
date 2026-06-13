@@ -408,5 +408,14 @@ mod tests {
         buf[8] = 1;
         buf[10] = 0;
         assert_eq!(parse_dpi_response(&buf), Err(()));
+
+        // Stage out of bounds: MODE2 stage_raw = 10 => active_stage = 9,
+        // offset 23 + 9*2 = 41 exceeds the 35-byte buffer.
+        let mut buf = [0u8; 35];
+        buf[0] = 0x55;
+        buf[1] = RESP_DPI_MODE2;
+        buf[8] = 0;
+        buf[10] = 10;
+        assert_eq!(parse_dpi_response(&buf), Err(()));
     }
 }
