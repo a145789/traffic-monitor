@@ -219,17 +219,19 @@ fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
 
     let mut buf = [0u8; 65];
     match device.read_timeout(&mut buf, 500) {
-        Ok(n) if n >= 10 => {
-            let base = find_base_offset(&buf[..n]).ok_or(())?;
-            if n < base + 10 || buf[base + OFFSET_RESPONSE_TYPE] != RESP_BATTERY {
-                return Err(());
-            }
-            let level = buf[base + OFFSET_BATTERY_LEVEL] as u32;
-            let charging = buf[base + OFFSET_BATTERY_CHARGING] != 0;
-            Ok((level.min(100), charging))
-        }
+        Ok(n) if n >= 10 => parse_battery_response(&buf[..n]),
         _ => Err(()),
     }
+}
+
+fn parse_battery_response(buf: &[u8]) -> Result<(u32, bool), ()> {
+    let base = find_base_offset(buf).ok_or(())?;
+    if buf.len() < base + 10 || buf[base + OFFSET_RESPONSE_TYPE] != RESP_BATTERY {
+        return Err(());
+    }
+    let level = buf[base + OFFSET_BATTERY_LEVEL] as u32;
+    let charging = buf[base + OFFSET_BATTERY_CHARGING] != 0;
+    Ok((level.min(100), charging))
 }
 
 fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
@@ -243,54 +245,54 @@ fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
 
     let mut buf = [0u8; 65];
     match device.read_timeout(&mut buf, 3000) {
-        Ok(n) if n >= 35 => {
-            let base = find_base_offset(&buf[..n]).ok_or(())?;
-            if n < base + 35 {
-                return Err(());
-            }
-            let d = &buf[base..n];
-
-            if d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE1
-                && d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE2
-            {
-                return Err(());
-            }
-
-            let active_mode: u32 = if d[OFFSET_DPI_ACTIVE_MODE] == 0 {
-                ACTIVE_MODE_2
-            } else {
-                ACTIVE_MODE_1
-            };
-            let stage_raw = d[OFFSET_DPI_ACTIVE_STAGE];
-            if stage_raw == 0 {
-                return Err(());
-            }
-            let active_stage = stage_raw as usize - 1;
-
-            let raw_dpi = if active_mode == ACTIVE_MODE_1 {
-                let offset = DPI_MODE1_OFFSET + active_stage * 2;
-                if d.len() <= offset + 1 {
-                    return Err(());
-                }
-                (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
-            } else {
-                let offset = DPI_MODE2_OFFSET + active_stage * 2;
-                if d.len() <= offset + 1 {
-                    return Err(());
-                }
-                (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
-            };
-
-            let mut dpi = (raw_dpi as f64 / DPI_SCALE_FACTOR).round() as u32;
-
-            if active_mode == ACTIVE_MODE_2 {
-                dpi = ((dpi as f64 / 100.0).round() as u32) * 100;
-            }
-
-            Ok(dpi)
-        }
+        Ok(n) if n >= 35 => parse_dpi_response(&buf[..n]),
         _ => Err(()),
     }
+}
+
+fn parse_dpi_response(buf: &[u8]) -> Result<u32, ()> {
+    let base = find_base_offset(buf).ok_or(())?;
+    if buf.len() < base + 35 {
+        return Err(());
+    }
+    let d = &buf[base..];
+
+    if d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE1 && d[OFFSET_RESPONSE_TYPE] != RESP_DPI_MODE2 {
+        return Err(());
+    }
+
+    let active_mode: u32 = if d[OFFSET_DPI_ACTIVE_MODE] == 0 {
+        ACTIVE_MODE_2
+    } else {
+        ACTIVE_MODE_1
+    };
+    let stage_raw = d[OFFSET_DPI_ACTIVE_STAGE];
+    if stage_raw == 0 {
+        return Err(());
+    }
+    let active_stage = stage_raw as usize - 1;
+
+    let raw_dpi = if active_mode == ACTIVE_MODE_1 {
+        let offset = DPI_MODE1_OFFSET + active_stage * 2;
+        if d.len() <= offset + 1 {
+            return Err(());
+        }
+        (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
+    } else {
+        let offset = DPI_MODE2_OFFSET + active_stage * 2;
+        if d.len() <= offset + 1 {
+            return Err(());
+        }
+        (d[offset] as u16) | ((d[offset + 1] as u16) << 8)
+    };
+
+    let mut dpi = (raw_dpi as f64 / DPI_SCALE_FACTOR).round() as u32;
+
+    if active_mode == ACTIVE_MODE_2 {
+        dpi = ((dpi as f64 / 100.0).round() as u32) * 100;
+    }
+
+    Ok(dpi)
 }
 
 fn handle_mouse_offline() {
@@ -308,5 +310,112 @@ fn handle_mouse_offline() {
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_USER_MOUSE_STATUS, WPARAM(0), LPARAM(0));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_base_offset() {
+        assert_eq!(find_base_offset(&[0x55, 0x30]), Some(0));
+        assert_eq!(find_base_offset(&[0xAA, 0x30]), Some(0));
+        assert_eq!(find_base_offset(&[0x00, 0x55, 0x30]), Some(1));
+        assert_eq!(find_base_offset(&[0x00, 0xAA, 0x30]), Some(1));
+        assert_eq!(find_base_offset(&[0x00, 0x00, 0x55]), None);
+        assert_eq!(find_base_offset(&[]), None);
+    }
+
+    #[test]
+    fn test_parse_battery_response() {
+        let buf = [0x55, RESP_BATTERY, 0, 0, 0, 0, 0, 0, 75, 1];
+        assert_eq!(parse_battery_response(&buf), Ok((75, true)));
+
+        let mut buf2 = buf;
+        buf2[9] = 0;
+        assert_eq!(parse_battery_response(&buf2), Ok((75, false)));
+
+        let mut buf3 = buf;
+        buf3[8] = 150;
+        assert_eq!(parse_battery_response(&buf3), Ok((100, true)));
+
+        let mut bad_type = buf;
+        bad_type[1] = 0xFF;
+        assert_eq!(parse_battery_response(&bad_type), Err(()));
+
+        assert_eq!(
+            parse_battery_response(&[0x55, RESP_BATTERY, 0, 0, 0, 0, 0, 0, 75]),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_response_mode1() {
+        let mut buf = [0u8; 35];
+        buf[0] = 0x55;
+        buf[1] = RESP_DPI_MODE1;
+        buf[8] = 1;
+        buf[10] = 1;
+        // raw_dpi = 1173 => 1173 / 1.173 = 1000
+        buf[11] = 0x95;
+        buf[12] = 0x04;
+        assert_eq!(parse_dpi_response(&buf), Ok(1000));
+    }
+
+    #[test]
+    fn test_parse_dpi_response_mode2() {
+        let mut buf = [0u8; 35];
+        buf[0] = 0x55;
+        buf[1] = RESP_DPI_MODE2;
+        buf[8] = 0;
+        buf[10] = 1;
+        // raw_dpi = 1232 => 1232 / 1.173 ≈ 1050 => rounded to 1100
+        buf[DPI_MODE2_OFFSET] = 0xD0;
+        buf[DPI_MODE2_OFFSET + 1] = 0x04;
+        assert_eq!(parse_dpi_response(&buf), Ok(1100));
+    }
+
+    #[test]
+    fn test_parse_dpi_response_base_offset() {
+        let mut buf = [0u8; 36];
+        buf[1] = 0x55;
+        buf[2] = RESP_DPI_MODE1;
+        buf[9] = 1;
+        buf[11] = 1;
+        buf[12] = 0x95;
+        buf[13] = 0x04;
+        assert_eq!(parse_dpi_response(&buf), Ok(1000));
+    }
+
+    #[test]
+    fn test_parse_dpi_response_errors() {
+        // Too short
+        assert_eq!(parse_dpi_response(&[0x55; 34]), Err(()));
+
+        // Wrong response type
+        let mut buf = [0u8; 35];
+        buf[0] = 0x55;
+        buf[1] = 0xFF;
+        buf[8] = 1;
+        buf[10] = 1;
+        assert_eq!(parse_dpi_response(&buf), Err(()));
+
+        // Stage 0
+        let mut buf = [0u8; 35];
+        buf[0] = 0x55;
+        buf[1] = RESP_DPI_MODE1;
+        buf[8] = 1;
+        buf[10] = 0;
+        assert_eq!(parse_dpi_response(&buf), Err(()));
+
+        // Stage out of bounds: MODE2 stage_raw = 10 => active_stage = 9,
+        // offset 23 + 9*2 = 41 exceeds the 35-byte buffer.
+        let mut buf = [0u8; 35];
+        buf[0] = 0x55;
+        buf[1] = RESP_DPI_MODE2;
+        buf[8] = 0;
+        buf[10] = 10;
+        assert_eq!(parse_dpi_response(&buf), Err(()));
     }
 }
