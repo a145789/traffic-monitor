@@ -418,6 +418,7 @@ impl Renderer {
         let scale = dpi as f64 / 96.0;
         let width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
         let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
+        let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
 
         // 1. 创建符合新大小的 Compatible Bitmap
         // SAFETY: null_mut 句柄获取临时屏幕 HDC。
@@ -431,29 +432,36 @@ impl Renderer {
             let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
         }
 
-        // 2. 将新位图选入内存 DC，销毁旧位图
-        if !new_bitmap.is_invalid() {
-            // SAFETY: hdc_mem 和 new_bitmap 有效，选入新位图并销毁旧位图。
-            let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.into()) };
-            unsafe {
-                let _ = DeleteObject(old_bitmap);
-            }
-            self.hbitmap = new_bitmap;
+        if new_bitmap.is_invalid() {
+            // 位图创建失败时保持旧尺寸与旧位图，避免 BitBlt 源/目标大小不匹配。
+            return;
         }
 
-        // 3. 重新创建并选择字体（不设上限）
-        let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
+        // 2. 重新创建并选择字体（不设上限）
         let new_font = create_font(font_size);
-        if !new_font.is_invalid() {
-            // SAFETY: hdc_mem 和 new_font 有效，选入新字体并销毁旧字体。
-            let old_font = unsafe { SelectObject(self.hdc_mem, new_font.into()) };
+        if new_font.is_invalid() {
+            // 字体创建失败时释放已创建的新位图，保持旧状态不变。
             unsafe {
-                let _ = DeleteObject(old_font);
+                let _ = DeleteObject(new_bitmap.into());
             }
-            self.hfont = new_font;
+            return;
         }
 
-        // 4. 更新相关属性
+        // 3. 新 GDI 资源都已就绪，一次性更新内存 DC 与属性，确保状态一致。
+        // SAFETY: hdc_mem 和 new_bitmap 有效，选入新位图并销毁旧位图。
+        let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.into()) };
+        unsafe {
+            let _ = DeleteObject(old_bitmap);
+        }
+        self.hbitmap = new_bitmap;
+
+        // SAFETY: hdc_mem 和 new_font 有效，选入新字体并销毁旧字体。
+        let old_font = unsafe { SelectObject(self.hdc_mem, new_font.into()) };
+        unsafe {
+            let _ = DeleteObject(old_font);
+        }
+        self.hfont = new_font;
+
         self.font_size = font_size;
         self.width = width;
         self.height = height;
@@ -549,4 +557,54 @@ fn write_fixed1(buf: &mut Vec<u16>, val: f64) {
     write_u32(buf, int_part);
     buf.push(b'.' as u16);
     buf.push((b'0' + frac as u8) as u16);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide_to_string(wide: &[u16]) -> String {
+        String::from_utf16_lossy(wide.strip_suffix(&[0]).unwrap_or(wide))
+    }
+
+    #[test]
+    fn test_format_speed_wide_boundaries() {
+        let mut buf = Vec::with_capacity(32);
+
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 0)),
+            "0 B/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 512)),
+            "512 B/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1023)),
+            "1023 B/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024)),
+            "1.0 KB/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 1)),
+            "1024.0 KB/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024)),
+            "1.0 MB/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                1024 * 1024 * 10 + 1024 * 512
+            )),
+            "10.5 MB/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, u32::MAX)),
+            "4096.0 MB/s"
+        );
+    }
 }
