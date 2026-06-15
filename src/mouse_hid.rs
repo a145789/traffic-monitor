@@ -10,9 +10,9 @@ use crate::config::{
     HID_DPI_SYNC_SETTLE_MS, HID_DRAIN_MAX_ITERATIONS, MOUSE_BATTERY_LEVEL,
     MOUSE_BATTERY_WARMUP_SENTINEL, MOUSE_DPI_VALUE, MOUSE_FAIL_THRESHOLD,
     MOUSE_FAST_RETRY_INTERVAL, MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID,
-    MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE, MOUSE_SUSPENDED_POLL_INTERVAL,
-    MOUSE_THREAD_START_DELAY, MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS,
-    MOUSE_WARMUP_POLL_INTERVAL, MOUSE_WARMUP_SUCCESS_THRESHOLD, SUSPENDED,
+    MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE, MOUSE_STARTUP_GRACE_PERIOD_SECS,
+    MOUSE_SUSPENDED_POLL_INTERVAL, MOUSE_THREAD_START_DELAY, MOUSE_USAGE, MOUSE_USAGE_PAGE,
+    MOUSE_VIDS, MOUSE_WARMUP_POLL_INTERVAL, MOUSE_WARMUP_SUCCESS_THRESHOLD, SUSPENDED,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -227,8 +227,9 @@ fn mouse_worker_loop() {
                     success_count = 0;
                 }
                 // 线程刚启动（如解锁、退出全屏）时 HID 栈可能尚未就绪，
-                // 在 30 秒初始化宽限期内即使失败也坚持快速重试，避免在系统就绪慢时误判离线而进入 300s 离线等待。
-                let is_grace_period = start_time.elapsed().as_secs() < 30;
+                // 在初始化宽限期内即使失败也坚持快速重试，避免在系统就绪慢时误判离线而进入 300s 离线等待。
+                let is_grace_period =
+                    start_time.elapsed().as_secs() < MOUSE_STARTUP_GRACE_PERIOD_SECS;
                 let retry_interval = if count >= MOUSE_FAIL_THRESHOLD && !is_grace_period {
                     MOUSE_POLL_INTERVAL_OFFLINE
                 } else {

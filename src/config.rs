@@ -54,6 +54,8 @@ pub const MOUSE_WARMUP_POLL_INTERVAL: u64 = 10;
 pub const HID_DRAIN_MAX_ITERATIONS: u32 = 128;
 /// 鼠标电量未就绪/预热态的哨兵值。
 pub const MOUSE_BATTERY_WARMUP_SENTINEL: u32 = u32::MAX;
+/// 鼠标线程启动/系统唤醒后的初始化宽限期（秒）。
+pub const MOUSE_STARTUP_GRACE_PERIOD_SECS: u64 = 30;
 
 pub const DPI_SCALE_FACTOR: f64 = 1.173;
 
