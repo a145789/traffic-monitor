@@ -119,6 +119,10 @@ fn stop_and_join_mouse_thread() {
             let _ = handle.join();
         }
     });
+    // 线程停止后立即清零鼠标状态，避免恢复期间短暂显示陈旧值。
+    MOUSE_ONLINE.store(false, Ordering::Release);
+    MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
+    MOUSE_DPI_VALUE.store(0, Ordering::Release);
 }
 
 fn restart_mouse_thread() {
