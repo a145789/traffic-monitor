@@ -251,7 +251,9 @@ fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
             {
                 match device_info.open_device(api) {
                     Ok(dev) => {
-                        dev.set_blocking_mode(false).ok()?;
+                        if dev.set_blocking_mode(false).is_err() {
+                            continue;
+                        }
                         return Some(dev);
                     }
                     Err(_) => continue,
