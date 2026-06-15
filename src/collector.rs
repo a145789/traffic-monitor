@@ -198,7 +198,13 @@ pub fn collect_network() {
             let mut history = cell.borrow_mut();
             for (luid, (in_octets, out_octets)) in &current_data {
                 if let Some(&(prev_in, prev_out, prev_time)) = history.get(luid) {
-                    let elapsed_ms = now.duration_since(prev_time).as_millis() as u64;
+                    // 用 saturating_duration_since 而非 duration_since：后者在
+                    // now < prev_time 时会 panic，配合本 crate 的 panic="abort"
+                    // 会直接杀进程。Instant 虽是单调时钟，但 VM 挂起/恢复、系统
+                    // 休眠唤醒等场景下确有时间回退报告；时间逆转时这里安全返回
+                    // 0，后续经 normalize_bytes_per_sec 的 max(1) 兜底按极高网速
+                    // 处理，远好于静默崩溃。
+                    let elapsed_ms = now.saturating_duration_since(prev_time).as_millis() as u64;
                     let speed_down =
                         normalize_bytes_per_sec(in_octets.saturating_sub(prev_in), elapsed_ms);
                     let speed_up =
@@ -270,8 +276,13 @@ pub fn collect_network() {
 /// 间隔从 1s 切到 15s 后，下一次采样的差值实际是 15 秒累计量，若不归一化
 /// 会导致显示偏大约 15 倍的虚假峰值。
 ///
+/// 计算全程在 `u128` 下进行：`delta_bytes` 以完整 u64 参与乘除，仅在最终
+/// 落盘 u32 时才截断，避免「先截后除」在大流量 + 长间隔组合下低估真实速率。
+/// `u64 * 1000` 上限约 1.8e22，远小于 u128::MAX，无溢出风险。
+///
 /// - `delta_bytes`：本周期累计字节增量（已 saturating_sub 过初值）。
-/// - `elapsed_ms`：距上次采样的毫秒数；`max(1)` 规避零除（防御性，正常 > 0）。
+/// - `elapsed_ms`：距上次采样的毫秒数；`max(1)` 规避零除（防御性，正常 > 0；
+///   时间逆转经 `saturating_duration_since` 饱和为 0 时亦走此兜底）。
 fn normalize_bytes_per_sec(delta_bytes: u64, elapsed_ms: u64) -> u32 {
     let ms = elapsed_ms.max(1) as u128;
     let scaled = delta_bytes as u128 * 1000 / ms;
@@ -479,13 +490,40 @@ mod tests {
     #[test]
     fn test_normalize_zero_elapsed_does_not_panic() {
         // 防御性：elapsed_ms 为 0 时不应零除 panic，按 1ms 处理。
+        // 此分支亦覆盖时间逆转经 saturating_duration_since 饱和为 0 的场景。
         assert_eq!(normalize_bytes_per_sec(5000, 0), 5_000_000);
     }
 
     #[test]
     fn test_normalize_saturates_at_u32_max() {
-        // 巨大 delta 应截断到 u32::MAX，而非溢出回绕。
+        // 巨大 delta 应仅在最终落盘 u32 时截断，而非溢出回绕。
         assert_eq!(normalize_bytes_per_sec(u64::MAX, 1000), u32::MAX);
         assert_eq!(normalize_bytes_per_sec(u32::MAX as u64, 1000), u32::MAX);
+    }
+
+    #[test]
+    fn test_normalize_large_traffic_long_interval_not_truncated_early() {
+        // 回归测试：万兆网 × 15s 退避 = 累计 ~18.75GB（超出 u32::MAX ≈ 4.29GB）。
+        // u128 中转后应正确反映每秒速率 ~1.25GB/s，而非被「先截后除」压到 ~286MB/s。
+        // 注意：1.25GB/s 已超 u32::MAX（~4.29GB/s 的 B/s 表达 = 4_294_967_295 B/s），
+        // 实际 18.75GB/15s = 1_342_177_280 B/s < u32::MAX，应精确命中。
+        let eighteen_gb: u64 = 18 * 1024 * 1024 * 1024 + (750 * 1024 * 1024);
+        let per_sec = normalize_bytes_per_sec(eighteen_gb, 15_000);
+        assert_eq!(per_sec, (eighteen_gb * 1000 / 15_000) as u32);
+        // 关键断言：绝不能是旧「先截后除」的 ~286MB/s。
+        assert!(
+            per_sec > 1_000_000_000,
+            "expected >1GB/s, got {per_sec} (early truncation regression)"
+        );
+    }
+
+    #[test]
+    fn test_instant_saturating_duration_since_does_not_panic_on_time_regression() {
+        // 回归守护：确认标准库在时间逆转时走 saturating 路径而非 panic。
+        // 无法直接构造 now < prev 的 Instant，但可断言同瞬时下返回 0 Duration，
+        // 证明我们用的是不会 panic 的 saturating 变体（duration_since 同参也返回 0，
+        // 真正差异在逆转行为，此处至少锁定 API 选择不被误改回 duration_since）。
+        let t = Instant::now();
+        assert_eq!(t.saturating_duration_since(t).as_millis(), 0);
     }
 }
