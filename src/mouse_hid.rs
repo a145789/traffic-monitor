@@ -123,7 +123,7 @@ pub fn check_mouse_available() -> bool {
 fn interruptible_sleep(dur: Duration) {
     let start = std::time::Instant::now();
     while start.elapsed() < dur {
-        if SHOULD_STOP.load(Ordering::Relaxed) {
+        if SHOULD_STOP.load(Ordering::Acquire) {
             return;
         }
         let remaining = dur.saturating_sub(start.elapsed());
@@ -154,12 +154,13 @@ fn poll_mouse() -> Result<MouseData, ()> {
 
 fn mouse_worker_loop() {
     let mut success_count = 0;
+    let start_time = std::time::Instant::now();
     loop {
-        if SHOULD_STOP.load(Ordering::Relaxed) {
+        if SHOULD_STOP.load(Ordering::Acquire) {
             break;
         }
 
-        if SUSPENDED.load(Ordering::Relaxed) || crate::config::FULLSCREEN.load(Ordering::Relaxed) {
+        if SUSPENDED.load(Ordering::Acquire) || crate::config::FULLSCREEN.load(Ordering::Acquire) {
             interruptible_sleep(Duration::from_secs(MOUSE_SUSPENDED_POLL_INTERVAL));
             success_count = 0;
             continue;
@@ -190,7 +191,12 @@ fn mouse_worker_loop() {
                 MOUSE_IS_CHARGING.store(display_charging, Ordering::Relaxed);
                 MOUSE_DPI_VALUE.store(data.dpi, Ordering::Relaxed);
 
-                let lparam = ((display_level & 0xFF) << 16) | (data.dpi & 0xFFFF);
+                let display_lparam_level = if display_level == MOUSE_BATTERY_WARMUP_SENTINEL {
+                    0
+                } else {
+                    display_level
+                };
+                let lparam = ((display_lparam_level & 0xFF) << 16) | (data.dpi & 0xFFFF);
                 let wparam = display_charging as usize;
                 let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                 // SAFETY:
@@ -221,8 +227,9 @@ fn mouse_worker_loop() {
                     success_count = 0;
                 }
                 // 线程刚启动（如解锁、退出全屏）时 HID 栈可能尚未就绪，
-                // 用短间隔快速重试，避免连续失败前就直接进入 300s 离线等待。
-                let retry_interval = if count >= MOUSE_FAIL_THRESHOLD {
+                // 在 30 秒初始化宽限期内即使失败也坚持快速重试，避免在系统就绪慢时误判离线而进入 300s 离线等待。
+                let is_grace_period = start_time.elapsed().as_secs() < 30;
+                let retry_interval = if count >= MOUSE_FAIL_THRESHOLD && !is_grace_period {
                     MOUSE_POLL_INTERVAL_OFFLINE
                 } else {
                     MOUSE_FAST_RETRY_INTERVAL
@@ -256,12 +263,11 @@ fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
     // 循环非阻塞读取以彻底排空 HID 队列中积压的所有陈旧响应（例如系统挂起/恢复期间积压的电量报告），
     // 防止首次 read 命中缓存旧值导致显示错误电量。
     let mut stale = [0u8; 65];
-    let mut drain_count = 0;
-    while let Ok(n) = device.read(&mut stale) {
-        if n == 0 || drain_count >= HID_DRAIN_MAX_ITERATIONS {
-            break;
+    for _ in 0..HID_DRAIN_MAX_ITERATIONS {
+        match device.read(&mut stale) {
+            Ok(n) if n > 0 => {}
+            _ => break,
         }
-        drain_count += 1;
     }
 
     send_packet(device, &BATTERY_CMD)?;
@@ -288,12 +294,11 @@ fn parse_battery_response(buf: &[u8]) -> Result<(u32, bool), ()> {
 fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
     let _ = send_packet(device, &DPI_SYNC_CMD);
     let mut dummy = [0u8; 65];
-    let mut drain_count = 0;
-    while let Ok(n) = device.read(&mut dummy) {
-        if n == 0 || drain_count >= HID_DRAIN_MAX_ITERATIONS {
-            break;
+    for _ in 0..HID_DRAIN_MAX_ITERATIONS {
+        match device.read(&mut dummy) {
+            Ok(n) if n > 0 => {}
+            _ => break,
         }
-        drain_count += 1;
     }
 
     // 修复 DPI 异步时序回归：追加一次短 timeout 读取以丢弃因系统延迟可能较晚到达的 DPI_SYNC_CMD 响应包。
