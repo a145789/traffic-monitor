@@ -213,6 +213,11 @@ fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
 }
 
 fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
+    // 排空 HID 队列中可能残留的陈旧响应（例如系统挂起/恢复期间积压的电量报告），
+    // 防止首次 read 命中缓存旧值导致显示错误电量。与 query_mouse_dpi 的排空逻辑对称。
+    let mut stale = [0u8; 65];
+    let _ = device.read_timeout(&mut stale, 100);
+
     send_packet(device, &BATTERY_CMD)?;
 
     thread::sleep(Duration::from_millis(100));
