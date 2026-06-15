@@ -6,9 +6,11 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::{
-    DPI_SCALE_FACTOR, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_FAIL_THRESHOLD,
-    MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID, MOUSE_POLL_INTERVAL_OFFLINE,
-    MOUSE_POLL_INTERVAL_ONLINE, MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
+    DPI_SCALE_FACTOR, HID_BATTERY_DRAIN_TIMEOUT_MS, HID_BATTERY_READ_TIMEOUT_MS, HID_CMD_SETTLE_MS,
+    HID_DPI_DRAIN_TIMEOUT_MS, HID_DPI_READ_TIMEOUT_MS, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
+    MOUSE_FAIL_THRESHOLD, MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID, MOUSE_POLL_INTERVAL_OFFLINE,
+    MOUSE_POLL_INTERVAL_ONLINE, MOUSE_SUSPENDED_POLL_INTERVAL, MOUSE_THREAD_START_DELAY,
+    MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -99,7 +101,7 @@ pub fn start_mouse_thread() -> thread::JoinHandle<()> {
     thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(|| {
-            interruptible_sleep(Duration::from_secs(2));
+            interruptible_sleep(Duration::from_secs(MOUSE_THREAD_START_DELAY));
             mouse_worker_loop();
         })
         .expect("Failed to spawn mouse thread")
@@ -155,7 +157,7 @@ fn mouse_worker_loop() {
         }
 
         if SUSPENDED.load(Ordering::Relaxed) || crate::config::FULLSCREEN.load(Ordering::Relaxed) {
-            interruptible_sleep(Duration::from_secs(5));
+            interruptible_sleep(Duration::from_secs(MOUSE_SUSPENDED_POLL_INTERVAL));
             continue;
         }
 
@@ -213,12 +215,17 @@ fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
 }
 
 fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
+    // 排空 HID 队列中可能残留的陈旧响应（例如系统挂起/恢复期间积压的电量报告），
+    // 防止首次 read 命中缓存旧值导致显示错误电量。与 query_mouse_dpi 的排空逻辑对称。
+    let mut stale = [0u8; 65];
+    let _ = device.read_timeout(&mut stale, HID_BATTERY_DRAIN_TIMEOUT_MS);
+
     send_packet(device, &BATTERY_CMD)?;
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(HID_CMD_SETTLE_MS as u64));
 
     let mut buf = [0u8; 65];
-    match device.read_timeout(&mut buf, 500) {
+    match device.read_timeout(&mut buf, HID_BATTERY_READ_TIMEOUT_MS) {
         Ok(n) if n >= 10 => parse_battery_response(&buf[..n]),
         _ => Err(()),
     }
@@ -237,14 +244,14 @@ fn parse_battery_response(buf: &[u8]) -> Result<(u32, bool), ()> {
 fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
     let _ = send_packet(device, &DPI_SYNC_CMD);
     let mut dummy = [0u8; 65];
-    let _ = device.read_timeout(&mut dummy, 200);
+    let _ = device.read_timeout(&mut dummy, HID_DPI_DRAIN_TIMEOUT_MS);
 
     send_packet(device, &DPI_CMD)?;
 
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(HID_CMD_SETTLE_MS as u64));
 
     let mut buf = [0u8; 65];
-    match device.read_timeout(&mut buf, 3000) {
+    match device.read_timeout(&mut buf, HID_DPI_READ_TIMEOUT_MS) {
         Ok(n) if n >= 35 => parse_dpi_response(&buf[..n]),
         _ => Err(()),
     }
