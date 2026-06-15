@@ -35,9 +35,14 @@ static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr:
 type BlacklistCache = Option<(Vec<u64>, Instant)>;
 const BLACKLIST_REFRESH_SECS: u64 = 30;
 
+/// 上次采样的 (入站字节, 出站字节, 采样时刻)。
+/// 时刻用于在采样间隔波动时（例如断网退避从 1s 切到 15s）把累计差值
+/// 归一化为"每秒字节"，避免恢复瞬间显示偏大 N 倍的虚假峰值。
+type Sample = (u64, u64, Instant);
+
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
-    static INTERFACE_HISTORY: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
+    static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
     static VIRTUAL_BLACKLIST: RefCell<BlacklistCache> = const { RefCell::new(None) };
 }
 
@@ -170,9 +175,14 @@ pub fn collect_network() {
         }
 
         if !NET_INITIALIZED.load(Ordering::Acquire) {
+            // 首次采样：仅记录基线字节与时刻，不计算速率。
+            let now = Instant::now();
             INTERFACE_HISTORY.with(|cell| {
                 let mut history = cell.borrow_mut();
-                std::mem::swap(&mut *history, &mut current_data);
+                history.clear();
+                for (luid, (in_octets, out_octets)) in &current_data {
+                    history.insert(*luid, (*in_octets, *out_octets, now));
+                }
             });
             NET_INITIALIZED.store(true, Ordering::Release);
             CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
@@ -182,13 +192,17 @@ pub fn collect_network() {
         let mut max_total: u64 = 0;
         let mut best_speed_down: u32 = 0;
         let mut best_speed_up: u32 = 0;
+        let now = Instant::now();
 
         INTERFACE_HISTORY.with(|cell| {
             let mut history = cell.borrow_mut();
             for (luid, (in_octets, out_octets)) in &current_data {
-                if let Some(&(prev_in, prev_out)) = history.get(luid) {
-                    let speed_down = in_octets.saturating_sub(prev_in).min(u32::MAX as u64) as u32;
-                    let speed_up = out_octets.saturating_sub(prev_out).min(u32::MAX as u64) as u32;
+                if let Some(&(prev_in, prev_out, prev_time)) = history.get(luid) {
+                    let elapsed_ms = now.duration_since(prev_time).as_millis() as u64;
+                    let speed_down =
+                        normalize_bytes_per_sec(in_octets.saturating_sub(prev_in), elapsed_ms);
+                    let speed_up =
+                        normalize_bytes_per_sec(out_octets.saturating_sub(prev_out), elapsed_ms);
                     let total = speed_down as u64 + speed_up as u64;
 
                     if total > max_total {
@@ -199,7 +213,12 @@ pub fn collect_network() {
                 }
             }
 
-            std::mem::swap(&mut *history, &mut current_data);
+            // 用本次采样数据覆盖历史，附带采样时刻用于下次归一化。
+            for (luid, (in_octets, out_octets)) in &current_data {
+                history.insert(*luid, (*in_octets, *out_octets, now));
+            }
+            // 清除已离线网卡的历史，防止陈旧 LUID 残留。
+            history.retain(|luid, _| current_data.contains_key(luid));
         });
 
         NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
@@ -243,6 +262,22 @@ pub fn collect_network() {
 
         CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
     }
+}
+
+/// 将"累计字节差值"按实际经过的毫秒数归一化为"每秒字节"。
+///
+/// 正常采样间隔恒为 1 秒时，结果与直接相减一致；但当断网退避把 timer
+/// 间隔从 1s 切到 15s 后，下一次采样的差值实际是 15 秒累计量，若不归一化
+/// 会导致显示偏大约 15 倍的虚假峰值。
+///
+/// - `delta_bytes`：本周期累计字节增量（已 saturating_sub 过初值）。
+/// - `elapsed_ms`：距上次采样的毫秒数；`max(1)` 规避零除（防御性，正常 > 0）。
+fn normalize_bytes_per_sec(delta_bytes: u64, elapsed_ms: u64) -> u32 {
+    let ms = elapsed_ms.max(1);
+    // 最终结果存入 u32，先截断 delta 到 u32 范围；delta * 1000 上限约 4.3e12，
+    // 远小于 u64::MAX，乘法不会溢出。
+    let delta = delta_bytes.min(u32::MAX as u64);
+    ((delta * 1000) / ms).min(u32::MAX as u64) as u32
 }
 
 fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
@@ -411,5 +446,48 @@ pub fn trim_working_set() {
     // 2. 将 (usize::MAX, usize::MAX) 传给 SetProcessWorkingSetSize 是系统约定的资源清理命令，旨在临时将进程工作集内存刷回磁盘，属于纯系统级配置，不存在内存越界写入危险。
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_one_second_interval_matches_raw_delta() {
+        // 正常 1s 间隔：归一化结果应与原始字节差值相等。
+        assert_eq!(normalize_bytes_per_sec(0, 1000), 0);
+        assert_eq!(normalize_bytes_per_sec(1_500_000, 1000), 1_500_000);
+    }
+
+    #[test]
+    fn test_normalize_backoff_interval_no_inflation() {
+        // 断网退避后 15s 间隔：15s 内累计 15MB，应为 ~1MB/s，而非 15MB/s。
+        let fifteen_mb = 15 * 1024 * 1024;
+        let per_sec = normalize_bytes_per_sec(fifteen_mb, 15_000);
+        assert_eq!(per_sec, 1024 * 1024);
+
+        // 同样速率在 1s 间隔下应得相同结果——归一化后与采样周期无关。
+        assert_eq!(normalize_bytes_per_sec(1024 * 1024, 1000), per_sec);
+    }
+
+    #[test]
+    fn test_normalize_fractional_interval() {
+        // 非整秒间隔（如 1500ms）应正确按比例换算。
+        // 1500ms 传 3000 字节 => 2000 B/s。
+        assert_eq!(normalize_bytes_per_sec(3000, 1500), 2000);
+    }
+
+    #[test]
+    fn test_normalize_zero_elapsed_does_not_panic() {
+        // 防御性：elapsed_ms 为 0 时不应零除 panic，按 1ms 处理。
+        assert_eq!(normalize_bytes_per_sec(5000, 0), 5_000_000);
+    }
+
+    #[test]
+    fn test_normalize_saturates_at_u32_max() {
+        // 巨大 delta 应截断到 u32::MAX，而非溢出回绕。
+        assert_eq!(normalize_bytes_per_sec(u64::MAX, 1000), u32::MAX);
+        assert_eq!(normalize_bytes_per_sec(u32::MAX as u64, 1000), u32::MAX);
     }
 }
