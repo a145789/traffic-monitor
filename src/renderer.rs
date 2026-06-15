@@ -259,7 +259,22 @@ impl Renderer {
 
                 if mouse_online {
                     // 第一行：鼠标电量
-                    if battery < 20 && !charging {
+                    if battery == 0 {
+                        // 预热期或未获取到有效电量时显示 🖱️ --
+                        let mut rc_mouse = RECT {
+                            left: mouse_left,
+                            top: 0,
+                            right: mouse_right,
+                            bottom: half_height,
+                        };
+                        let mouse_wide = Self::wide(&mut buf, "\u{1F5B1} --");
+                        let _ = DrawTextW(
+                            hdc_mem,
+                            mouse_wide,
+                            &mut rc_mouse,
+                            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                        );
+                    } else if battery < 20 && !charging {
                         // 画图标 🖱️
                         let mut rc_mouse = RECT {
                             left: mouse_left,
