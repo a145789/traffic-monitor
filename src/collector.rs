@@ -273,11 +273,9 @@ pub fn collect_network() {
 /// - `delta_bytes`：本周期累计字节增量（已 saturating_sub 过初值）。
 /// - `elapsed_ms`：距上次采样的毫秒数；`max(1)` 规避零除（防御性，正常 > 0）。
 fn normalize_bytes_per_sec(delta_bytes: u64, elapsed_ms: u64) -> u32 {
-    let ms = elapsed_ms.max(1);
-    // 最终结果存入 u32，先截断 delta 到 u32 范围；delta * 1000 上限约 4.3e12，
-    // 远小于 u64::MAX，乘法不会溢出。
-    let delta = delta_bytes.min(u32::MAX as u64);
-    ((delta * 1000) / ms).min(u32::MAX as u64) as u32
+    let ms = elapsed_ms.max(1) as u128;
+    let scaled = delta_bytes as u128 * 1000 / ms;
+    scaled.min(u32::MAX as u128) as u32
 }
 
 fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
