@@ -10,8 +10,9 @@ use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, CPU_USAGE, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
-    MOUSE_IS_CHARGING, MOUSE_ONLINE, NET_SPEED_DOWN, NET_SPEED_UP, SHOW_MOUSE_INFO,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, MOUSE_BATTERY_LEVEL, MOUSE_BATTERY_WARMUP_SENTINEL,
+    MOUSE_DPI_VALUE, MOUSE_IS_CHARGING, MOUSE_ONLINE, NET_SPEED_DOWN, NET_SPEED_UP,
+    SHOW_MOUSE_INFO,
 };
 use crate::util::{reg_read_dword, to_wide};
 
@@ -258,15 +259,26 @@ impl Renderer {
                 let mouse_left = mouse_right - (62.0 * scale).round() as i32;
 
                 if mouse_online {
+                    // 统一的鼠标电量显示区域 RECT
+                    let mut rc_mouse = RECT {
+                        left: mouse_left,
+                        top: 0,
+                        right: mouse_right,
+                        bottom: half_height,
+                    };
+
                     // 第一行：鼠标电量
-                    if battery < 20 && !charging {
+                    if battery == MOUSE_BATTERY_WARMUP_SENTINEL {
+                        // 预热期或未获取到有效电量时显示 🖱️ --
+                        let mouse_wide = Self::wide(&mut buf, "\u{1F5B1} --");
+                        let _ = DrawTextW(
+                            hdc_mem,
+                            mouse_wide,
+                            &mut rc_mouse,
+                            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
+                        );
+                    } else if battery < 20 && !charging {
                         // 画图标 🖱️
-                        let mut rc_mouse = RECT {
-                            left: mouse_left,
-                            top: 0,
-                            right: mouse_right,
-                            bottom: half_height,
-                        };
                         let mouse_wide = Self::wide(&mut buf, "\u{1F5B1}");
                         let _ = DrawTextW(
                             hdc_mem,
@@ -296,12 +308,6 @@ impl Renderer {
                         SetTextColor(hdc_mem, self.text_color);
                     } else {
                         let mouse_wide = Self::format_mouse_battery_wide(&mut buf, battery);
-                        let mut rc_mouse = RECT {
-                            left: mouse_left,
-                            top: 0,
-                            right: mouse_right,
-                            bottom: half_height,
-                        };
                         let _ = DrawTextW(
                             hdc_mem,
                             mouse_wide,

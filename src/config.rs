@@ -39,14 +39,23 @@ pub const MOUSE_SUSPENDED_POLL_INTERVAL: u64 = 5;
 /// HID 通信时序常量（毫秒）。read_timeout 签名为 i32，故用 i32 类型。
 /// 命令发送后等待设备响应的固定 sleep。
 pub const HID_CMD_SETTLE_MS: i32 = 100;
-/// 电量查询：发送命令前 drain 残留报告的超时上界。
-pub const HID_BATTERY_DRAIN_TIMEOUT_MS: i32 = 100;
 /// 电量查询：等待实时响应的读取超时。
 pub const HID_BATTERY_READ_TIMEOUT_MS: i32 = 500;
-/// DPI 查询：发送命令前 drain 残留报告的超时上界。
-pub const HID_DPI_DRAIN_TIMEOUT_MS: i32 = 200;
 /// DPI 查询：等待实时响应的读取超时（DPI 响应包较大，需更长窗口）。
 pub const HID_DPI_READ_TIMEOUT_MS: i32 = 3000;
+/// DPI drain 后追加的兜底读取超时（毫秒），用于丢弃延迟到达的 DPI_SYNC_CMD 响应。
+pub const HID_DPI_SYNC_SETTLE_MS: i32 = 50;
+
+/// 鼠标预热阶段的快速轮询次数阈值。
+pub const MOUSE_WARMUP_SUCCESS_THRESHOLD: u32 = 3;
+/// 鼠标预热阶段的快速轮询间隔（秒）。
+pub const MOUSE_WARMUP_POLL_INTERVAL: u64 = 10;
+/// HID 通信中排空缓冲区的最大迭代次数上限。
+pub const HID_DRAIN_MAX_ITERATIONS: u32 = 128;
+/// 鼠标电量未就绪/预热态的哨兵值。
+pub const MOUSE_BATTERY_WARMUP_SENTINEL: u32 = u32::MAX;
+/// 鼠标线程启动/系统唤醒后的初始化宽限期（秒）。
+pub const MOUSE_STARTUP_GRACE_PERIOD_SECS: u64 = 30;
 
 pub const DPI_SCALE_FACTOR: f64 = 1.173;
 
