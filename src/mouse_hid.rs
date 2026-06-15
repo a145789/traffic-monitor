@@ -214,8 +214,12 @@ fn mouse_worker_loop() {
                 interruptible_sleep(Duration::from_secs(sleep_secs));
             }
             Err(()) => {
-                success_count = 0;
                 let count = handle_mouse_offline();
+                // 只有真正判定为离线（连续失败达到阈值）时才重置预热计数，
+                // 避免单次偶发通信抖动导致电量显示重新闪回 "--"。
+                if count >= MOUSE_FAIL_THRESHOLD {
+                    success_count = 0;
+                }
                 // 线程刚启动（如解锁、退出全屏）时 HID 栈可能尚未就绪，
                 // 用短间隔快速重试，避免连续失败前就直接进入 300s 离线等待。
                 let retry_interval = if count >= MOUSE_FAIL_THRESHOLD {
