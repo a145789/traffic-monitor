@@ -242,18 +242,22 @@ fn mouse_worker_loop() {
 }
 
 fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
-    for device_info in api.device_list() {
-        if MOUSE_VIDS.contains(&device_info.vendor_id())
-            && device_info.product_id() == MOUSE_PID
-            && device_info.usage_page() == MOUSE_USAGE_PAGE
-            && device_info.usage() == MOUSE_USAGE
-        {
-            match device_info.open_device(api) {
-                Ok(dev) => {
-                    dev.set_blocking_mode(false).ok()?;
-                    return Some(dev);
+    for &target_vid in &MOUSE_VIDS {
+        for device_info in api.device_list() {
+            if device_info.vendor_id() == target_vid
+                && device_info.product_id() == MOUSE_PID
+                && device_info.usage_page() == MOUSE_USAGE_PAGE
+                && device_info.usage() == MOUSE_USAGE
+            {
+                match device_info.open_device(api) {
+                    Ok(dev) => {
+                        if dev.set_blocking_mode(false).is_err() {
+                            continue;
+                        }
+                        return Some(dev);
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
         }
     }

@@ -19,6 +19,9 @@ pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
 pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
+// MOUSE_VIDS 的数组顺序代表设备匹配优先级。
+// 0xA8A4 (有线直连) 优先于 0xA8A5 (2.4G 无线接收器)，
+// 确保双模共存的场景下优先锁定能正常通信的有线设备。
 pub const MOUSE_VIDS: [u16; 2] = [0xA8A4, 0xA8A5];
 pub const MOUSE_PID: u16 = 0x2255;
 pub const MOUSE_USAGE_PAGE: u16 = 0xFF01;
