@@ -8,6 +8,13 @@ if (!newVersion) {
   process.exit(1);
 }
 
+// Validate semver format
+const semverRegex = /^\d+\.\d+\.\d+$/;
+if (!semverRegex.test(newVersion)) {
+  console.error(`Error: Invalid version format "${newVersion}". Expected semver format: x.y.z`);
+  process.exit(1);
+}
+
 // Check current branch
 console.log("Checking current branch...");
 const currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf-8" }).trim();
@@ -26,6 +33,30 @@ if (gitStatus) {
   process.exit(1);
 }
 
+// Check version is greater than current
+console.log("Checking version increment...");
+const currentVersion = readFileSync("Cargo.toml", "utf-8").match(/^version\s*=\s*"(\d+\.\d+\.\d+)"/m)?.[1];
+if (!currentVersion) {
+  console.error("Error: Cannot read current version from Cargo.toml");
+  process.exit(1);
+}
+const [curMajor, curMinor, curPatch] = currentVersion.split(".").map(Number);
+const [newMajor, newMinor, newPatch] = newVersion.split(".").map(Number);
+if (newMajor < curMajor || (newMajor === curMajor && newMinor < curMinor) || (newMajor === curMajor && newMinor === curMinor && newPatch <= curPatch)) {
+  console.error(`Error: New version (${newVersion}) must be greater than current version (${currentVersion})`);
+  process.exit(1);
+}
+
+// Check tag does not exist
+console.log("Checking tag does not exist...");
+try {
+  execSync(`git rev-parse v${newVersion}`, { encoding: "utf-8", stdio: "pipe" });
+  console.error(`Error: Tag v${newVersion} already exists`);
+  process.exit(1);
+} catch {
+  // Tag does not exist, good to proceed
+}
+
 // Update Cargo.toml
 console.log(`Updating Cargo.toml to ${newVersion}...`);
 let cargo = readFileSync("Cargo.toml", "utf-8");
@@ -38,12 +69,24 @@ let iss = readFileSync("installer.iss", "utf-8");
 iss = iss.replace(/^AppVersion=.*/m, `AppVersion=${newVersion}`);
 writeFileSync("installer.iss", iss);
 
+// Run clippy to catch common mistakes
+console.log("Running clippy...");
+execSync("cargo clippy -- -D warnings", { stdio: "inherit" });
+
+// Run tests
+console.log("Running tests...");
+execSync("cargo test", { stdio: "inherit" });
+
+// Build release to verify current code compiles before modifying dependencies
+console.log("Building release (pre-guard)...");
+execSync("cargo build --release", { stdio: "inherit" });
+
 // Update Cargo.lock to reflect the new version
 console.log("Updating Cargo.lock...");
 execSync("cargo update --workspace", { stdio: "inherit" });
 
-// Build release to verify everything compiles
-console.log("Building release (verification)...");
+// Build release again to verify updated dependencies compile
+console.log("Building release (post-update verification)...");
 execSync("cargo build --release", { stdio: "inherit" });
 
 // Git commit
