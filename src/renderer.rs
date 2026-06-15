@@ -10,8 +10,9 @@ use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, COLOR_LOW_BATTERY, CPU_USAGE, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
-    MOUSE_IS_CHARGING, MOUSE_ONLINE, NET_SPEED_DOWN, NET_SPEED_UP, SHOW_MOUSE_INFO,
+    DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, MOUSE_BATTERY_LEVEL, MOUSE_BATTERY_WARMUP_SENTINEL,
+    MOUSE_DPI_VALUE, MOUSE_IS_CHARGING, MOUSE_ONLINE, NET_SPEED_DOWN, NET_SPEED_UP,
+    SHOW_MOUSE_INFO,
 };
 use crate::util::{reg_read_dword, to_wide};
 
@@ -259,7 +260,7 @@ impl Renderer {
 
                 if mouse_online {
                     // 第一行：鼠标电量
-                    if battery == 0 {
+                    if battery == MOUSE_BATTERY_WARMUP_SENTINEL {
                         // 预热期或未获取到有效电量时显示 🖱️ --
                         let mut rc_mouse = RECT {
                             left: mouse_left,

@@ -44,6 +44,15 @@ pub const HID_BATTERY_READ_TIMEOUT_MS: i32 = 500;
 /// DPI 查询：等待实时响应的读取超时（DPI 响应包较大，需更长窗口）。
 pub const HID_DPI_READ_TIMEOUT_MS: i32 = 3000;
 
+/// 鼠标预热阶段的快速轮询次数阈值。
+pub const MOUSE_WARMUP_SUCCESS_THRESHOLD: u32 = 3;
+/// 鼠标预热阶段的快速轮询间隔（秒）。
+pub const MOUSE_WARMUP_POLL_INTERVAL: u64 = 10;
+/// HID 通信中排空缓冲区的最大迭代次数上限。
+pub const HID_DRAIN_MAX_ITERATIONS: u32 = 128;
+/// 鼠标电量未就绪/预热态的哨兵值。
+pub const MOUSE_BATTERY_WARMUP_SENTINEL: u32 = u32::MAX;
+
 pub const DPI_SCALE_FACTOR: f64 = 1.173;
 
 pub const COLOR_KEY: u32 = 0x00FF00FF;

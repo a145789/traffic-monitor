@@ -7,10 +7,11 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::{
     DPI_SCALE_FACTOR, HID_BATTERY_READ_TIMEOUT_MS, HID_CMD_SETTLE_MS, HID_DPI_READ_TIMEOUT_MS,
-    MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE, MOUSE_FAIL_THRESHOLD, MOUSE_FAST_RETRY_INTERVAL,
-    MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID, MOUSE_POLL_INTERVAL_OFFLINE,
-    MOUSE_POLL_INTERVAL_ONLINE, MOUSE_SUSPENDED_POLL_INTERVAL, MOUSE_THREAD_START_DELAY,
-    MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
+    HID_DRAIN_MAX_ITERATIONS, MOUSE_BATTERY_LEVEL, MOUSE_BATTERY_WARMUP_SENTINEL, MOUSE_DPI_VALUE,
+    MOUSE_FAIL_THRESHOLD, MOUSE_FAST_RETRY_INTERVAL, MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID,
+    MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE, MOUSE_SUSPENDED_POLL_INTERVAL,
+    MOUSE_THREAD_START_DELAY, MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS,
+    MOUSE_WARMUP_POLL_INTERVAL, MOUSE_WARMUP_SUCCESS_THRESHOLD, SUSPENDED,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -172,8 +173,12 @@ fn mouse_worker_loop() {
 
                 // 只有当 success_count > 1 时（即从第二次成功查询开始），才信任并写入电量值，
                 // 从而避开启动/唤醒后第一次查询可能得到的固件硬编码默认值（例如 80%）。
-                // 在此之前，电量维持初始值 0，界面渲染为 "--"。
-                let display_level = if success_count > 1 { data.level } else { 0 };
+                // 在此之前，电量维持预热哨兵值 MOUSE_BATTERY_WARMUP_SENTINEL，界面渲染为 "--"。
+                let display_level = if success_count > 1 {
+                    data.level
+                } else {
+                    MOUSE_BATTERY_WARMUP_SENTINEL
+                };
                 let display_charging = if success_count > 1 {
                     data.charging
                 } else {
@@ -199,9 +204,9 @@ fn mouse_worker_loop() {
                     );
                 }
 
-                let sleep_secs = if success_count <= 3 {
-                    // 前 3 次成功采用短轮询（如 10 秒），给刚唤醒的设备足够时间稳定数值。
-                    10
+                let sleep_secs = if success_count <= MOUSE_WARMUP_SUCCESS_THRESHOLD {
+                    // 前几项成功采用短轮询（如 10 秒），给刚唤醒的设备足够时间稳定数值。
+                    MOUSE_WARMUP_POLL_INTERVAL
                 } else {
                     MOUSE_POLL_INTERVAL_ONLINE
                 };
@@ -248,7 +253,7 @@ fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
     let mut stale = [0u8; 65];
     let mut drain_count = 0;
     while let Ok(n) = device.read(&mut stale) {
-        if n == 0 || drain_count >= 128 {
+        if n == 0 || drain_count >= HID_DRAIN_MAX_ITERATIONS {
             break;
         }
         drain_count += 1;
@@ -280,11 +285,14 @@ fn query_mouse_dpi(device: &HidDevice) -> Result<u32, ()> {
     let mut dummy = [0u8; 65];
     let mut drain_count = 0;
     while let Ok(n) = device.read(&mut dummy) {
-        if n == 0 || drain_count >= 128 {
+        if n == 0 || drain_count >= HID_DRAIN_MAX_ITERATIONS {
             break;
         }
         drain_count += 1;
     }
+
+    // 修复 DPI 异步时序回归：追加一次短 timeout 读取以丢弃因系统延迟可能较晚到达的 DPI_SYNC_CMD 响应包。
+    let _ = device.read_timeout(&mut dummy, 50);
 
     send_packet(device, &DPI_CMD)?;
 
