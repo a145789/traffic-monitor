@@ -8,9 +8,9 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 use crate::config::{
     DPI_SCALE_FACTOR, HID_BATTERY_DRAIN_TIMEOUT_MS, HID_BATTERY_READ_TIMEOUT_MS, HID_CMD_SETTLE_MS,
     HID_DPI_DRAIN_TIMEOUT_MS, HID_DPI_READ_TIMEOUT_MS, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
-    MOUSE_FAIL_THRESHOLD, MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID, MOUSE_POLL_INTERVAL_OFFLINE,
-    MOUSE_POLL_INTERVAL_ONLINE, MOUSE_SUSPENDED_POLL_INTERVAL, MOUSE_THREAD_START_DELAY,
-    MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
+    MOUSE_FAIL_THRESHOLD, MOUSE_FAST_RETRY_INTERVAL, MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID,
+    MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE, MOUSE_SUSPENDED_POLL_INTERVAL,
+    MOUSE_THREAD_START_DELAY, MOUSE_USAGE, MOUSE_USAGE_PAGE, MOUSE_VIDS, SUSPENDED,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -188,8 +188,15 @@ fn mouse_worker_loop() {
                 interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_ONLINE));
             }
             Err(()) => {
-                handle_mouse_offline();
-                interruptible_sleep(Duration::from_secs(MOUSE_POLL_INTERVAL_OFFLINE));
+                let count = handle_mouse_offline();
+                // 线程刚启动（如解锁、退出全屏）时 HID 栈可能尚未就绪，
+                // 用短间隔快速重试，避免连续失败前就直接进入 300s 离线等待。
+                let retry_interval = if count >= MOUSE_FAIL_THRESHOLD {
+                    MOUSE_POLL_INTERVAL_OFFLINE
+                } else {
+                    MOUSE_FAST_RETRY_INTERVAL
+                };
+                interruptible_sleep(Duration::from_secs(retry_interval));
             }
         }
     }
@@ -302,7 +309,7 @@ fn parse_dpi_response(buf: &[u8]) -> Result<u32, ()> {
     Ok(dpi)
 }
 
-fn handle_mouse_offline() {
+fn handle_mouse_offline() -> u32 {
     let count = FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
     if count >= MOUSE_FAIL_THRESHOLD {
@@ -318,6 +325,8 @@ fn handle_mouse_offline() {
             let _ = PostMessageW(Some(hwnd), WM_USER_MOUSE_STATUS, WPARAM(0), LPARAM(0));
         }
     }
+
+    count
 }
 
 #[cfg(test)]

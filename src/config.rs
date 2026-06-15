@@ -27,6 +27,9 @@ pub const MOUSE_USAGE: u16 = 0x0010;
 pub const MOUSE_POLL_INTERVAL_ONLINE: u64 = 180;
 pub const MOUSE_POLL_INTERVAL_OFFLINE: u64 = 300;
 pub const MOUSE_FAIL_THRESHOLD: u32 = 2;
+/// 鼠标线程启动后、尚未达到离线阈值前的快速重试间隔（秒）。
+/// 用于解锁/全屏退出等场景下 HID 栈尚未就绪时，避免直接进入 300s 长间隔。
+pub const MOUSE_FAST_RETRY_INTERVAL: u64 = 5;
 
 /// 鼠标线程启动后的初始等待（秒），给 HID 栈一点稳定时间。
 pub const MOUSE_THREAD_START_DELAY: u64 = 2;
