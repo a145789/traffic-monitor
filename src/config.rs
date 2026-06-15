@@ -28,6 +28,23 @@ pub const MOUSE_POLL_INTERVAL_ONLINE: u64 = 180;
 pub const MOUSE_POLL_INTERVAL_OFFLINE: u64 = 300;
 pub const MOUSE_FAIL_THRESHOLD: u32 = 2;
 
+/// 鼠标线程启动后的初始等待（秒），给 HID 栈一点稳定时间。
+pub const MOUSE_THREAD_START_DELAY: u64 = 2;
+/// 系统挂起/全屏期间鼠标线程的空转轮询节奏（秒）。
+pub const MOUSE_SUSPENDED_POLL_INTERVAL: u64 = 5;
+
+/// HID 通信时序常量（毫秒）。read_timeout 签名为 i32，故用 i32 类型。
+/// 命令发送后等待设备响应的固定 sleep。
+pub const HID_CMD_SETTLE_MS: i32 = 100;
+/// 电量查询：发送命令前 drain 残留报告的超时上界。
+pub const HID_BATTERY_DRAIN_TIMEOUT_MS: i32 = 100;
+/// 电量查询：等待实时响应的读取超时。
+pub const HID_BATTERY_READ_TIMEOUT_MS: i32 = 500;
+/// DPI 查询：发送命令前 drain 残留报告的超时上界。
+pub const HID_DPI_DRAIN_TIMEOUT_MS: i32 = 200;
+/// DPI 查询：等待实时响应的读取超时（DPI 响应包较大，需更长窗口）。
+pub const HID_DPI_READ_TIMEOUT_MS: i32 = 3000;
+
 pub const DPI_SCALE_FACTOR: f64 = 1.173;
 
 pub const COLOR_KEY: u32 = 0x00FF00FF;
