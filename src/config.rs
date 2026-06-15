@@ -43,6 +43,8 @@ pub const HID_CMD_SETTLE_MS: i32 = 100;
 pub const HID_BATTERY_READ_TIMEOUT_MS: i32 = 500;
 /// DPI 查询：等待实时响应的读取超时（DPI 响应包较大，需更长窗口）。
 pub const HID_DPI_READ_TIMEOUT_MS: i32 = 3000;
+/// DPI drain 后追加的兜底读取超时（毫秒），用于丢弃延迟到达的 DPI_SYNC_CMD 响应。
+pub const HID_DPI_SYNC_SETTLE_MS: i32 = 50;
 
 /// 鼠标预热阶段的快速轮询次数阈值。
 pub const MOUSE_WARMUP_SUCCESS_THRESHOLD: u32 = 3;

@@ -259,15 +259,17 @@ impl Renderer {
                 let mouse_left = mouse_right - (62.0 * scale).round() as i32;
 
                 if mouse_online {
+                    // 统一的鼠标电量显示区域 RECT
+                    let mut rc_mouse = RECT {
+                        left: mouse_left,
+                        top: 0,
+                        right: mouse_right,
+                        bottom: half_height,
+                    };
+
                     // 第一行：鼠标电量
                     if battery == MOUSE_BATTERY_WARMUP_SENTINEL {
                         // 预热期或未获取到有效电量时显示 🖱️ --
-                        let mut rc_mouse = RECT {
-                            left: mouse_left,
-                            top: 0,
-                            right: mouse_right,
-                            bottom: half_height,
-                        };
                         let mouse_wide = Self::wide(&mut buf, "\u{1F5B1} --");
                         let _ = DrawTextW(
                             hdc_mem,
@@ -277,12 +279,6 @@ impl Renderer {
                         );
                     } else if battery < 20 && !charging {
                         // 画图标 🖱️
-                        let mut rc_mouse = RECT {
-                            left: mouse_left,
-                            top: 0,
-                            right: mouse_right,
-                            bottom: half_height,
-                        };
                         let mouse_wide = Self::wide(&mut buf, "\u{1F5B1}");
                         let _ = DrawTextW(
                             hdc_mem,
@@ -312,12 +308,6 @@ impl Renderer {
                         SetTextColor(hdc_mem, self.text_color);
                     } else {
                         let mouse_wide = Self::format_mouse_battery_wide(&mut buf, battery);
-                        let mut rc_mouse = RECT {
-                            left: mouse_left,
-                            top: 0,
-                            right: mouse_right,
-                            bottom: half_height,
-                        };
                         let _ = DrawTextW(
                             hdc_mem,
                             mouse_wide,
