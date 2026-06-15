@@ -136,6 +136,7 @@ fn restart_mouse_thread() {
 
 fn suspend_system(hwnd: HWND) {
     SUSPENDED.store(true, Ordering::Release);
+    FULLSCREEN.store(false, Ordering::Release);
     // SAFETY:
     // hwnd 是操作系统分配的有效主窗口句柄。
     // 在系统休眠或锁屏时安全关闭所有监测定时器。
