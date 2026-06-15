@@ -142,36 +142,14 @@ struct MouseData {
 
 fn poll_mouse() -> Result<MouseData, ()> {
     let api = HidApi::new().map_err(|_| ())?;
-
-    for device_info in api.device_list() {
-        if !MOUSE_VIDS.contains(&device_info.vendor_id())
-            || device_info.product_id() != MOUSE_PID
-            || device_info.usage_page() != MOUSE_USAGE_PAGE
-            || device_info.usage() != MOUSE_USAGE
-        {
-            continue;
-        }
-
-        let device = match device_info.open_device(&api) {
-            Ok(dev) => dev,
-            Err(_) => continue,
-        };
-        if device.set_blocking_mode(false).is_err() {
-            continue;
-        }
-
-        if let (Ok((level, charging)), Ok(dpi)) =
-            (query_mouse_battery(&device), query_mouse_dpi(&device))
-        {
-            return Ok(MouseData {
-                level,
-                charging,
-                dpi,
-            });
-        }
-    }
-
-    Err(())
+    let device = find_mouse_device(&api).ok_or(())?;
+    let (level, charging) = query_mouse_battery(&device)?;
+    let dpi = query_mouse_dpi(&device)?;
+    Ok(MouseData {
+        level,
+        charging,
+        dpi,
+    })
 }
 
 fn mouse_worker_loop() {
@@ -264,18 +242,20 @@ fn mouse_worker_loop() {
 }
 
 fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
-    for device_info in api.device_list() {
-        if MOUSE_VIDS.contains(&device_info.vendor_id())
-            && device_info.product_id() == MOUSE_PID
-            && device_info.usage_page() == MOUSE_USAGE_PAGE
-            && device_info.usage() == MOUSE_USAGE
-        {
-            match device_info.open_device(api) {
-                Ok(dev) => {
-                    dev.set_blocking_mode(false).ok()?;
-                    return Some(dev);
+    for &target_vid in &MOUSE_VIDS {
+        for device_info in api.device_list() {
+            if device_info.vendor_id() == target_vid
+                && device_info.product_id() == MOUSE_PID
+                && device_info.usage_page() == MOUSE_USAGE_PAGE
+                && device_info.usage() == MOUSE_USAGE
+            {
+                match device_info.open_device(api) {
+                    Ok(dev) => {
+                        dev.set_blocking_mode(false).ok()?;
+                        return Some(dev);
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
         }
     }
