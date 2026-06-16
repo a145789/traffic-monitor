@@ -3,7 +3,6 @@
 mod collector;
 mod config;
 mod ffi_guard;
-mod mouse_hid;
 mod renderer;
 mod tray;
 mod update;
@@ -44,19 +43,13 @@ use crate::collector::{
 };
 use crate::config::{
     COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
-    FULLSCREEN, GAP, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
-    MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SKIP_WARMUP, SUSPENDED, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN,
-    TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
-};
-use crate::mouse_hid::{
-    WM_USER_MOUSE_STATUS, WM_USER_MOUSE_UPDATE, check_mouse_available, start_mouse_thread,
-    stop_mouse_thread,
+    FULLSCREEN, GAP, NETWORK_BACKOFF, SUSPENDED, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN,
+    TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK,
+    TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::renderer::Renderer;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
-    save_show_mouse_info,
 };
 use crate::update::{
     WM_USER_UPDATE_READY, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
@@ -83,7 +76,6 @@ struct POWERBROADCAST_SETTING {
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
-    static MOUSE_THREAD: RefCell<Option<std::thread::JoinHandle<()>>> = const { RefCell::new(None) };
 }
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
@@ -112,28 +104,6 @@ fn get_taskbar_hwnd() -> Option<HWND> {
 
 // MutexGuard 定义已提取至 ffi_guard 模块中进行共用。
 
-fn stop_and_join_mouse_thread() {
-    stop_mouse_thread();
-    MOUSE_THREAD.with(|m| {
-        if let Some(handle) = m.borrow_mut().take() {
-            let _ = handle.join();
-        }
-    });
-    // 线程停止后立即清零鼠标状态，避免恢复期间短暂显示陈旧值。
-    MOUSE_ONLINE.store(false, Ordering::Release);
-    MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
-    MOUSE_DPI_VALUE.store(0, Ordering::Release);
-}
-
-fn restart_mouse_thread() {
-    stop_and_join_mouse_thread();
-    if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-        MOUSE_THREAD.with(|m| {
-            *m.borrow_mut() = Some(start_mouse_thread());
-        });
-    }
-}
-
 fn suspend_system(hwnd: HWND) {
     SUSPENDED.store(true, Ordering::Release);
     FULLSCREEN.store(false, Ordering::Release);
@@ -145,7 +115,6 @@ fn suspend_system(hwnd: HWND) {
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
     }
-    stop_and_join_mouse_thread();
     trim_working_set();
 }
 
@@ -175,7 +144,6 @@ fn resume_system(hwnd: HWND, reset_backoff: bool) {
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
         }
-        restart_mouse_thread();
     }
 }
 
@@ -231,8 +199,6 @@ fn check_fullscreen(hwnd: HWND) {
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             }
-            SKIP_WARMUP.store(true, Ordering::Release);
-            restart_mouse_thread();
         }
         return;
     }
@@ -278,14 +244,11 @@ fn check_fullscreen(hwnd: HWND) {
         unsafe {
             KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         }
-        stop_and_join_mouse_thread();
     } else if !should_suspend && was {
         // SAFETY: hwnd 有效，重建定时器。
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
         }
-        SKIP_WARMUP.store(true, Ordering::Release);
-        restart_mouse_thread();
     }
 }
 
@@ -364,7 +327,6 @@ fn main() {
         }
     };
 
-    mouse_hid::init(hwnd);
     init_network_listener(hwnd);
 
     // SAFETY: "TaskbarCreated" 是 Windows 约定的常量字符串。
@@ -387,9 +349,6 @@ fn main() {
         show_error("Failed to embed in taskbar. Make sure explorer.exe is running.");
         return;
     }
-
-    let persisted = tray::load_show_mouse_info();
-    SHOW_MOUSE_INFO.store(persisted, Ordering::Release);
 
     let auto_update = load_auto_update_enabled();
     ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Release);
@@ -424,12 +383,6 @@ fn main() {
         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
     }
 
-    if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-        MOUSE_THREAD.with(|m| {
-            *m.borrow_mut() = Some(start_mouse_thread());
-        });
-    }
-
     // SAFETY: hwnd 有效，注册会话通知。
     unsafe {
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
@@ -455,8 +408,6 @@ fn main() {
             windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
         }
     }
-
-    stop_and_join_mouse_thread();
 
     // SAFETY: hwnd 有效，注销会话通知。
     unsafe {
@@ -626,7 +577,6 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             }
-            restart_mouse_thread();
         }
     }
     LRESULT(0)
@@ -718,46 +668,7 @@ fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
 
 fn handle_command(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     let menu_id = (wparam.0 & 0xFFFF) as u32;
-    if menu_id == MENU_ID_SHOW_MOUSE {
-        let current_state = SHOW_MOUSE_INFO.load(Ordering::Acquire);
-        if !current_state {
-            if check_mouse_available() {
-                SHOW_MOUSE_INFO.store(true, Ordering::Release);
-                save_show_mouse_info(true);
-                SKIP_WARMUP.store(true, Ordering::Release);
-                restart_mouse_thread();
-                // SAFETY: hwnd 有效，刷新鼠标列显示。
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-            } else {
-                show_error("未检测到物理鼠标或鼠标不支持");
-            }
-        } else {
-            SHOW_MOUSE_INFO.store(false, Ordering::Release);
-            save_show_mouse_info(false);
-            stop_and_join_mouse_thread();
-            MOUSE_ONLINE.store(false, Ordering::Release);
-            // SAFETY: hwnd 有效，清除鼠标列。
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
-        }
-    } else if menu_id == MENU_ID_RESTART_HID {
-        if SHOW_MOUSE_INFO.load(Ordering::Acquire) {
-            MOUSE_ONLINE.store(false, Ordering::Release);
-            MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
-            MOUSE_DPI_VALUE.store(0, Ordering::Release);
-            SKIP_WARMUP.store(true, Ordering::Release);
-            restart_mouse_thread();
-            // SAFETY: hwnd 有效，重启 HID 后刷新界面。
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
-        }
-    } else {
-        tray::handle_menu_command(hwnd, menu_id);
-    }
+    tray::handle_menu_command(hwnd, menu_id);
     LRESULT(0)
 }
 
@@ -787,14 +698,6 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         WM_TIMER => handle_timer(hwnd, wparam),
-
-        WM_USER_MOUSE_UPDATE | WM_USER_MOUSE_STATUS => {
-            // SAFETY: hwnd 有效，刷新鼠标信息显示。
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
-            LRESULT(0)
-        }
 
         WM_USER_NETWORK_DISCONNECTED => {
             if !SUSPENDED.load(Ordering::Acquire) {
@@ -858,7 +761,6 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
         WM_CLOSE => {
             remove_tray_icon();
-            stop_and_join_mouse_thread();
             // SAFETY: PostQuitMessage 向当前线程投递 WM_QUIT。
             unsafe {
                 PostQuitMessage(0);
