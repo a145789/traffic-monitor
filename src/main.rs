@@ -43,9 +43,9 @@ use crate::collector::{
 };
 use crate::config::{
     COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
-    FULLSCREEN, GAP, NETWORK_BACKOFF, SUSPENDED, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN,
-    TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK,
-    TIMER_INTERVAL_NETWORK_BACKOFF,
+    FULLSCREEN, GAP, LOWORD_MASK, NETWORK_BACKOFF, SUSPENDED, TIMER_ID_CPU_MEM,
+    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN,
+    TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::renderer::Renderer;
 use crate::tray::{
@@ -763,13 +763,13 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         WM_COMMAND => {
-            let menu_id = (wparam.0 & 0xFFFF) as u32;
+            let menu_id = (wparam.0 as u32) & LOWORD_MASK;
             tray::handle_menu_command(hwnd, menu_id);
             LRESULT(0)
         }
 
         x if x == WM_APP_TRAY => {
-            let event = (lparam.0 & 0xFFFF) as u32;
+            let event = (lparam.0 as u32) & LOWORD_MASK;
             if event == WM_CONTEXTMENU {
                 tray::show_context_menu(hwnd);
             }

@@ -33,6 +33,9 @@ pub static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub const MENU_ID_AUTO_UPDATE_TOGGLE: u32 = 1005;
 pub const MENU_ID_CHECK_UPDATE_MANUAL: u32 = 1006;
 
+/// 从 WPARAM/LPARAM 提取低 16 位（LOWORD）的掩码，用于菜单 ID 与托盘事件。
+pub const LOWORD_MASK: u32 = 0xFFFF;
+
 pub static NET_SPEED_UP: AtomicU32 = AtomicU32::new(0);
 pub static NET_SPEED_DOWN: AtomicU32 = AtomicU32::new(0);
 
