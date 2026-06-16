@@ -724,6 +724,7 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             if check_mouse_available() {
                 SHOW_MOUSE_INFO.store(true, Ordering::Release);
                 save_show_mouse_info(true);
+                SKIP_WARMUP.store(true, Ordering::Release);
                 restart_mouse_thread();
                 // SAFETY: hwnd 有效，刷新鼠标列显示。
                 unsafe {

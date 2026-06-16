@@ -13,7 +13,7 @@ use crate::config::{
     MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE, MOUSE_STARTUP_GRACE_PERIOD_SECS,
     MOUSE_SUSPENDED_POLL_INTERVAL, MOUSE_THREAD_START_DELAY, MOUSE_USAGE, MOUSE_USAGE_PAGE,
     MOUSE_VIDS, MOUSE_WARMUP_POLL_INTERVAL, MOUSE_WARMUP_SUCCESS_THRESHOLD, SKIP_WARMUP, SUSPENDED,
-    VID_WIRELESS,
+    VID_WIRED, VID_WIRELESS,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -162,7 +162,9 @@ fn poll_mouse() -> Result<MouseData, ()> {
 
     // USB 充电 fallback：有线设备在充电时固件可能返回硬编码的 100%，
     // 若 2.4G 接收器同时在线，通过它获取真实电量。
-    if let Some((level, true)) = battery
+    // 仅当 primary 确实是有线设备时才触发，避免纯无线模式下对同一设备冗余查询。
+    if primary.vid == VID_WIRED
+        && let Some((level, true)) = battery
         && level >= 100
         && let Some(wireless) = devices.iter().find(|d| d.vid == VID_WIRELESS)
         && let Ok((real_level, _)) = query_mouse_battery(&wireless.device)
@@ -185,6 +187,9 @@ fn mouse_worker_loop(skip_warmup: bool) {
     // 从而跳过预热丢弃，立即展示电量数据。
     let warmup_base: u32 = if skip_warmup { 1 } else { 0 };
     let mut success_count: u32 = warmup_base;
+    // 首次达到信任状态后置位，之后离线/挂起重置统一回到 0，
+    // 避免 skip_warmup 线程运行数小时后因设备休眠再唤醒而闪现虚假电量。
+    let mut warmup_phase_done = false;
     let start_time = std::time::Instant::now();
     loop {
         if SHOULD_STOP.load(Ordering::Acquire) {
@@ -193,7 +198,7 @@ fn mouse_worker_loop(skip_warmup: bool) {
 
         if SUSPENDED.load(Ordering::Acquire) || crate::config::FULLSCREEN.load(Ordering::Acquire) {
             interruptible_sleep(Duration::from_secs(MOUSE_SUSPENDED_POLL_INTERVAL));
-            success_count = warmup_base;
+            success_count = if warmup_phase_done { 0 } else { warmup_base };
             continue;
         }
 
@@ -207,6 +212,9 @@ fn mouse_worker_loop(skip_warmup: bool) {
                 // 从而避开启动/唤醒后第一次查询可能得到的固件硬编码默认值（例如 80%）。
                 // skip_warmup 场景下 success_count 从 1 起步，首次成功即满足 > 1。
                 let trusted = success_count > 1;
+                if trusted {
+                    warmup_phase_done = true;
+                }
 
                 // 电量：仅在有数据时更新原子变量，DPI 失败不会清空已有电量。
                 if let Some((level, charging)) = data.battery {
@@ -263,7 +271,7 @@ fn mouse_worker_loop(skip_warmup: bool) {
                 // 只有真正判定为离线（连续失败达到阈值）时才重置预热计数，
                 // 避免单次偶发通信抖动导致电量显示重新闪回 "--"。
                 if count >= MOUSE_FAIL_THRESHOLD {
-                    success_count = warmup_base;
+                    success_count = if warmup_phase_done { 0 } else { warmup_base };
                 }
                 // 线程刚启动（如解锁、退出全屏）时 HID 栈可能尚未就绪，
                 // 在初始化宽限期内即使失败也坚持快速重试，避免在系统就绪慢时误判离线而进入 300s 离线等待。
