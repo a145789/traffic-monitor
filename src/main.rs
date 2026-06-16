@@ -45,7 +45,7 @@ use crate::collector::{
 use crate::config::{
     COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
     FULLSCREEN, GAP, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, MOUSE_BATTERY_LEVEL, MOUSE_DPI_VALUE,
-    MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SUSPENDED, TIMER_ID_CPU_MEM,
+    MOUSE_ONLINE, NETWORK_BACKOFF, SHOW_MOUSE_INFO, SKIP_WARMUP, SUSPENDED, TIMER_ID_CPU_MEM,
     TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN,
     TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
 };
@@ -231,6 +231,7 @@ fn check_fullscreen(hwnd: HWND) {
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
             }
+            SKIP_WARMUP.store(true, Ordering::Release);
             restart_mouse_thread();
         }
         return;
@@ -283,6 +284,7 @@ fn check_fullscreen(hwnd: HWND) {
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
         }
+        SKIP_WARMUP.store(true, Ordering::Release);
         restart_mouse_thread();
     }
 }
@@ -745,6 +747,7 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             MOUSE_ONLINE.store(false, Ordering::Release);
             MOUSE_BATTERY_LEVEL.store(0, Ordering::Release);
             MOUSE_DPI_VALUE.store(0, Ordering::Release);
+            SKIP_WARMUP.store(true, Ordering::Release);
             restart_mouse_thread();
             // SAFETY: hwnd 有效，重启 HID 后刷新界面。
             unsafe {

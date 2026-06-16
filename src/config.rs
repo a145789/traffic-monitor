@@ -19,10 +19,12 @@ pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
 pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
+pub const VID_WIRED: u16 = 0xA8A4;
+pub const VID_WIRELESS: u16 = 0xA8A5;
 // MOUSE_VIDS 的数组顺序代表设备匹配优先级。
-// 0xA8A4 (有线直连) 优先于 0xA8A5 (2.4G 无线接收器)，
+// VID_WIRED (有线直连) 优先于 VID_WIRELESS (2.4G 无线接收器)，
 // 确保双模共存的场景下优先锁定能正常通信的有线设备。
-pub const MOUSE_VIDS: [u16; 2] = [0xA8A4, 0xA8A5];
+pub const MOUSE_VIDS: [u16; 2] = [VID_WIRED, VID_WIRELESS];
 pub const MOUSE_PID: u16 = 0x2255;
 pub const MOUSE_USAGE_PAGE: u16 = 0xFF01;
 pub const MOUSE_USAGE: u16 = 0x0010;
@@ -44,8 +46,8 @@ pub const MOUSE_SUSPENDED_POLL_INTERVAL: u64 = 5;
 pub const HID_CMD_SETTLE_MS: i32 = 100;
 /// 电量查询：等待实时响应的读取超时。
 pub const HID_BATTERY_READ_TIMEOUT_MS: i32 = 500;
-/// DPI 查询：等待实时响应的读取超时（DPI 响应包较大，需更长窗口）。
-pub const HID_DPI_READ_TIMEOUT_MS: i32 = 3000;
+/// DPI 查询：等待实时响应的读取超时。
+pub const HID_DPI_READ_TIMEOUT_MS: i32 = 800;
 /// DPI drain 后追加的兜底读取超时（毫秒），用于丢弃延迟到达的 DPI_SYNC_CMD 响应。
 pub const HID_DPI_SYNC_SETTLE_MS: i32 = 50;
 
@@ -72,6 +74,8 @@ pub const FONT_BASE_SIZE: i32 = 13;
 pub static MOUSE_ONLINE: AtomicBool = AtomicBool::new(false);
 pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
 pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+/// 手动重置或退出全屏时设为 true，跳过预热丢弃和启动延迟，由 start_mouse_thread 读取并自动清除。
+pub static SKIP_WARMUP: AtomicBool = AtomicBool::new(false);
 pub static SHOW_MOUSE_INFO: AtomicBool = AtomicBool::new(false);
 pub static ENABLE_AUTO_UPDATE: AtomicBool = AtomicBool::new(true);
 pub static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);

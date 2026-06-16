@@ -12,7 +12,8 @@ use crate::config::{
     MOUSE_FAST_RETRY_INTERVAL, MOUSE_IS_CHARGING, MOUSE_ONLINE, MOUSE_PID,
     MOUSE_POLL_INTERVAL_OFFLINE, MOUSE_POLL_INTERVAL_ONLINE, MOUSE_STARTUP_GRACE_PERIOD_SECS,
     MOUSE_SUSPENDED_POLL_INTERVAL, MOUSE_THREAD_START_DELAY, MOUSE_USAGE, MOUSE_USAGE_PAGE,
-    MOUSE_VIDS, MOUSE_WARMUP_POLL_INTERVAL, MOUSE_WARMUP_SUCCESS_THRESHOLD, SUSPENDED,
+    MOUSE_VIDS, MOUSE_WARMUP_POLL_INTERVAL, MOUSE_WARMUP_SUCCESS_THRESHOLD, SKIP_WARMUP, SUSPENDED,
+    VID_WIRELESS,
 };
 
 pub const WM_USER_MOUSE_UPDATE: u32 = WM_USER + 1;
@@ -93,6 +94,11 @@ fn find_base_offset(buf: &[u8]) -> Option<usize> {
     None
 }
 
+struct FoundDevice {
+    device: HidDevice,
+    vid: u16,
+}
+
 pub fn init(hwnd: HWND) {
     MAIN_HWND.store(hwnd.0, Ordering::Relaxed);
 }
@@ -100,11 +106,14 @@ pub fn init(hwnd: HWND) {
 pub fn start_mouse_thread() -> thread::JoinHandle<()> {
     SHOULD_STOP.store(false, Ordering::Release);
     FAIL_COUNT.store(0, Ordering::Relaxed);
+    let skip_warmup = SKIP_WARMUP.swap(false, Ordering::AcqRel);
     thread::Builder::new()
         .stack_size(64 * 1024)
-        .spawn(|| {
-            interruptible_sleep(Duration::from_secs(MOUSE_THREAD_START_DELAY));
-            mouse_worker_loop();
+        .spawn(move || {
+            if !skip_warmup {
+                interruptible_sleep(Duration::from_secs(MOUSE_THREAD_START_DELAY));
+            }
+            mouse_worker_loop(skip_warmup);
         })
         .expect("Failed to spawn mouse thread")
 }
@@ -115,7 +124,7 @@ pub fn stop_mouse_thread() {
 
 pub fn check_mouse_available() -> bool {
     match HidApi::new() {
-        Ok(api) => find_mouse_device(&api).is_some(),
+        Ok(api) => !find_mouse_devices(&api).is_empty(),
         Err(_) => false,
     }
 }
@@ -135,25 +144,47 @@ fn interruptible_sleep(dur: Duration) {
 }
 
 struct MouseData {
-    level: u32,
-    charging: bool,
-    dpi: u32,
+    battery: Option<(u32, bool)>,
+    dpi: Option<u32>,
 }
 
 fn poll_mouse() -> Result<MouseData, ()> {
     let api = HidApi::new().map_err(|_| ())?;
-    let device = find_mouse_device(&api).ok_or(())?;
-    let (level, charging) = query_mouse_battery(&device)?;
-    let dpi = query_mouse_dpi(&device)?;
-    Ok(MouseData {
-        level,
-        charging,
-        dpi,
-    })
+    let devices = find_mouse_devices(&api);
+    if devices.is_empty() {
+        return Err(());
+    }
+
+    let primary = &devices[0];
+
+    // 电量和 DPI 独立查询，一个失败不影响另一个。
+    let mut battery = query_mouse_battery(&primary.device).ok();
+
+    // USB 充电 fallback：有线设备在充电时固件可能返回硬编码的 100%，
+    // 若 2.4G 接收器同时在线，通过它获取真实电量。
+    if let Some((level, true)) = battery
+        && level >= 100
+        && let Some(wireless) = devices.iter().find(|d| d.vid == VID_WIRELESS)
+        && let Ok((real_level, _)) = query_mouse_battery(&wireless.device)
+    {
+        battery = Some((real_level, true));
+    }
+
+    let dpi = query_mouse_dpi(&primary.device).ok();
+
+    // 电量和 DPI 均失败才视为整体失败（设备不可达）。
+    if battery.is_none() && dpi.is_none() {
+        return Err(());
+    }
+
+    Ok(MouseData { battery, dpi })
 }
 
-fn mouse_worker_loop() {
-    let mut success_count = 0;
+fn mouse_worker_loop(skip_warmup: bool) {
+    // skip_warmup 时从 1 开始：第一次成功后 +1 变为 2，满足 > 1 的信任条件，
+    // 从而跳过预热丢弃，立即展示电量数据。
+    let warmup_base: u32 = if skip_warmup { 1 } else { 0 };
+    let mut success_count: u32 = warmup_base;
     let start_time = std::time::Instant::now();
     loop {
         if SHOULD_STOP.load(Ordering::Acquire) {
@@ -162,7 +193,7 @@ fn mouse_worker_loop() {
 
         if SUSPENDED.load(Ordering::Acquire) || crate::config::FULLSCREEN.load(Ordering::Acquire) {
             interruptible_sleep(Duration::from_secs(MOUSE_SUSPENDED_POLL_INTERVAL));
-            success_count = 0;
+            success_count = warmup_base;
             continue;
         }
 
@@ -171,33 +202,40 @@ fn mouse_worker_loop() {
                 FAIL_COUNT.store(0, Ordering::Relaxed);
                 MOUSE_ONLINE.store(true, Ordering::Relaxed);
 
-                success_count += 1;
-
-                // 只有当 success_count > 1 时（即从第二次成功查询开始），才信任并写入电量值，
+                success_count = success_count.saturating_add(1);
+                // 只有当 success_count > 1 时（即从第二次成功查询开始），才信任电量值，
                 // 从而避开启动/唤醒后第一次查询可能得到的固件硬编码默认值（例如 80%）。
-                // 在此之前，电量维持预热哨兵值 MOUSE_BATTERY_WARMUP_SENTINEL，界面渲染为 "--"。
-                let display_level = if success_count > 1 {
-                    data.level
-                } else {
-                    MOUSE_BATTERY_WARMUP_SENTINEL
-                };
-                let display_charging = if success_count > 1 {
-                    data.charging
-                } else {
-                    false
-                };
+                // skip_warmup 场景下 success_count 从 1 起步，首次成功即满足 > 1。
+                let trusted = success_count > 1;
 
-                MOUSE_BATTERY_LEVEL.store(display_level, Ordering::Relaxed);
-                MOUSE_IS_CHARGING.store(display_charging, Ordering::Relaxed);
-                MOUSE_DPI_VALUE.store(data.dpi, Ordering::Relaxed);
+                // 电量：仅在有数据时更新原子变量，DPI 失败不会清空已有电量。
+                if let Some((level, charging)) = data.battery {
+                    let display_level = if trusted {
+                        level
+                    } else {
+                        MOUSE_BATTERY_WARMUP_SENTINEL
+                    };
+                    let display_charging = trusted && charging;
+                    MOUSE_BATTERY_LEVEL.store(display_level, Ordering::Relaxed);
+                    MOUSE_IS_CHARGING.store(display_charging, Ordering::Relaxed);
+                }
 
-                let display_lparam_level = if display_level == MOUSE_BATTERY_WARMUP_SENTINEL {
+                // DPI：仅在有数据时更新原子变量，电量失败不会清空已有 DPI。
+                if let Some(dpi) = data.dpi {
+                    MOUSE_DPI_VALUE.store(dpi, Ordering::Relaxed);
+                }
+
+                // 从原子变量读取当前值构造消息参数，保证 PostMessage 内容一致。
+                let current_level = MOUSE_BATTERY_LEVEL.load(Ordering::Relaxed);
+                let current_charging = MOUSE_IS_CHARGING.load(Ordering::Relaxed);
+                let current_dpi = MOUSE_DPI_VALUE.load(Ordering::Relaxed);
+                let display_lparam_level = if current_level == MOUSE_BATTERY_WARMUP_SENTINEL {
                     0
                 } else {
-                    display_level
+                    current_level
                 };
-                let lparam = ((display_lparam_level & 0xFF) << 16) | (data.dpi & 0xFFFF);
-                let wparam = display_charging as usize;
+                let lparam = ((display_lparam_level & 0xFF) << 16) | (current_dpi & 0xFFFF);
+                let wparam = current_charging as usize;
                 let hwnd = HWND(MAIN_HWND.load(Ordering::Relaxed));
                 // SAFETY:
                 // hwnd 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
@@ -211,8 +249,9 @@ fn mouse_worker_loop() {
                     );
                 }
 
-                let sleep_secs = if success_count <= MOUSE_WARMUP_SUCCESS_THRESHOLD {
-                    // 前几项成功采用短轮询（如 10 秒），给刚唤醒的设备足够时间稳定数值。
+                let sleep_secs = if !skip_warmup && success_count <= MOUSE_WARMUP_SUCCESS_THRESHOLD
+                {
+                    // 冷启动预热期采用短轮询，给刚唤醒的设备足够时间稳定数值。
                     MOUSE_WARMUP_POLL_INTERVAL
                 } else {
                     MOUSE_POLL_INTERVAL_ONLINE
@@ -224,7 +263,7 @@ fn mouse_worker_loop() {
                 // 只有真正判定为离线（连续失败达到阈值）时才重置预热计数，
                 // 避免单次偶发通信抖动导致电量显示重新闪回 "--"。
                 if count >= MOUSE_FAIL_THRESHOLD {
-                    success_count = 0;
+                    success_count = warmup_base;
                 }
                 // 线程刚启动（如解锁、退出全屏）时 HID 栈可能尚未就绪，
                 // 在初始化宽限期内即使失败也坚持快速重试，避免在系统就绪慢时误判离线而进入 300s 离线等待。
@@ -241,7 +280,8 @@ fn mouse_worker_loop() {
     }
 }
 
-fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
+fn find_mouse_devices(api: &HidApi) -> Vec<FoundDevice> {
+    let mut devices = Vec::new();
     for &target_vid in &MOUSE_VIDS {
         for device_info in api.device_list() {
             if device_info.vendor_id() == target_vid
@@ -251,17 +291,19 @@ fn find_mouse_device(api: &HidApi) -> Option<HidDevice> {
             {
                 match device_info.open_device(api) {
                     Ok(dev) => {
-                        if dev.set_blocking_mode(false).is_err() {
-                            continue;
+                        if dev.set_blocking_mode(false).is_ok() {
+                            devices.push(FoundDevice {
+                                device: dev,
+                                vid: target_vid,
+                            });
                         }
-                        return Some(dev);
                     }
                     Err(_) => continue,
                 }
             }
         }
     }
-    None
+    devices
 }
 
 fn query_mouse_battery(device: &HidDevice) -> Result<(u32, bool), ()> {
