@@ -255,7 +255,7 @@ pub fn show_context_menu(hwnd: HWND) {
 
     // SAFETY: exit_item 已初始化，dwTypeData 指向有效的 exit_text。
     unsafe {
-        let _ = InsertMenuItemW(hmenu, 6, true, &exit_item);
+        let _ = InsertMenuItemW(hmenu, 5, true, &exit_item);
     }
 
     // SAFETY: hwnd、point、hmenu 均有效。

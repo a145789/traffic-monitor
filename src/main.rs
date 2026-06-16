@@ -666,12 +666,6 @@ fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     LRESULT(0)
 }
 
-fn handle_command(hwnd: HWND, wparam: WPARAM) -> LRESULT {
-    let menu_id = (wparam.0 & 0xFFFF) as u32;
-    tray::handle_menu_command(hwnd, menu_id);
-    LRESULT(0)
-}
-
 pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
     if msg == tcm && tcm != 0 {
@@ -768,7 +762,11 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        WM_COMMAND => handle_command(hwnd, wparam),
+        WM_COMMAND => {
+            let menu_id = (wparam.0 & 0xFFFF) as u32;
+            tray::handle_menu_command(hwnd, menu_id);
+            LRESULT(0)
+        }
 
         x if x == WM_APP_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
