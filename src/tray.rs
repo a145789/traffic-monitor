@@ -14,11 +14,9 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::config::{
     APP_NAME, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE, MENU_ID_AUTO_UPDATE_TOGGLE,
-    MENU_ID_CHECK_UPDATE_MANUAL, MENU_ID_RESTART_HID, MENU_ID_SHOW_MOUSE, SHOW_MOUSE_INFO,
-    UPDATE_IN_PROGRESS, WINDOW_CLASS, WINDOW_TITLE,
+    MENU_ID_CHECK_UPDATE_MANUAL, UPDATE_IN_PROGRESS, WINDOW_CLASS, WINDOW_TITLE,
 };
 use crate::ffi_guard::{MenuGuard, RegKey};
-use crate::util::{reg_read_dword, reg_write_dword};
 use std::cell::RefCell;
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
@@ -244,48 +242,7 @@ pub fn show_context_menu(hwnd: HWND) {
         let _ = InsertMenuItemW(hmenu, 4, true, &check_update_item);
     }
 
-    // 6. Show mouse info
-    let show_mouse = SHOW_MOUSE_INFO.load(std::sync::atomic::Ordering::Relaxed);
-    let mouse_text: Vec<u16> = "显示鼠标信息\0".encode_utf16().collect();
-    let mut mouse_item = MENUITEMINFOW {
-        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: if show_mouse {
-            MFS_CHECKED
-        } else {
-            MFS_UNCHECKED
-        },
-        wID: MENU_ID_SHOW_MOUSE,
-        ..Default::default()
-    };
-    mouse_item.dwTypeData = PWSTR(mouse_text.as_ptr() as *mut u16);
-
-    // SAFETY: mouse_item 已初始化，dwTypeData 指向有效的 mouse_text。
-    unsafe {
-        let _ = InsertMenuItemW(hmenu, 5, true, &mouse_item);
-    }
-
-    // 7. Restart HID (only visible when mouse info is shown)
-    let mut exit_pos = 6;
-    if show_mouse {
-        let restart_text: Vec<u16> = "重置鼠标\0".encode_utf16().collect();
-        let mut restart_item = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-            fState: MFS_UNCHECKED,
-            wID: MENU_ID_RESTART_HID,
-            ..Default::default()
-        };
-        restart_item.dwTypeData = PWSTR(restart_text.as_ptr() as *mut u16);
-
-        // SAFETY: restart_item 已初始化，dwTypeData 指向有效的 restart_text。
-        unsafe {
-            let _ = InsertMenuItemW(hmenu, 6, true, &restart_item);
-        }
-        exit_pos = 7;
-    }
-
-    // 8. Exit
+    // 6. Exit
     let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
     let mut exit_item = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -298,7 +255,7 @@ pub fn show_context_menu(hwnd: HWND) {
 
     // SAFETY: exit_item 已初始化，dwTypeData 指向有效的 exit_text。
     unsafe {
-        let _ = InsertMenuItemW(hmenu, exit_pos, true, &exit_item);
+        let _ = InsertMenuItemW(hmenu, 5, true, &exit_item);
     }
 
     // SAFETY: hwnd、point、hmenu 均有效。
@@ -445,27 +402,4 @@ fn toggle_auto_update() {
     let new_state = !current;
     ENABLE_AUTO_UPDATE.store(new_state, std::sync::atomic::Ordering::Release);
     crate::update::save_auto_update_enabled(new_state);
-}
-
-pub fn load_show_mouse_info() -> bool {
-    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
-
-    reg_read_dword(
-        HKEY_CURRENT_USER,
-        "Software\\Traffic Monitor",
-        "ShowMouseInfo",
-    )
-    .map(|v| v != 0)
-    .unwrap_or(false)
-}
-
-pub fn save_show_mouse_info(show: bool) {
-    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
-
-    reg_write_dword(
-        HKEY_CURRENT_USER,
-        "Software\\Traffic Monitor",
-        "ShowMouseInfo",
-        if show { 1 } else { 0 },
-    );
 }
