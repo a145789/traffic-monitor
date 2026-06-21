@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
@@ -32,7 +33,7 @@ static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 static MAIN_HWND_NETWORK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-type BlacklistCache = Option<(Vec<u64>, Instant)>;
+type BlacklistCache = Option<(Rc<HashSet<u64>>, Instant)>;
 const BLACKLIST_REFRESH_SECS: u64 = 30;
 
 /// 上次采样的 (入站字节, 出站字节, 采样时刻)。
@@ -346,7 +347,7 @@ unsafe fn read_wide_string(ptr: *mut u16) -> String {
     }
 }
 
-fn build_virtual_blacklist() -> Option<Vec<u64>> {
+fn build_virtual_blacklist() -> Option<HashSet<u64>> {
     let mut buf_size: u32 = 0;
     // SAFETY:
     // 1. GetAdaptersAddresses 是 Windows IP 助手模块的导出函数。
@@ -385,7 +386,7 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
         return None;
     }
 
-    let mut blacklist = Vec::new();
+    let mut blacklist = HashSet::new();
     let mut current = adapter_ptr;
     while !current.is_null() {
         // SAFETY:
@@ -405,7 +406,7 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
             // 2. GetAdaptersAddresses 成功返回的节点中，其 Luid 的内存数据已由系统完全初始化。
             // 3. 访问联合体的 Value 字段在 Rust 中需 unsafe 块，此处仅读取其拷贝，不违反内存安全。
             let luid_val = unsafe { adapter.Luid.Value };
-            blacklist.push(luid_val);
+            blacklist.insert(luid_val);
         }
 
         current = adapter.Next;
@@ -414,14 +415,14 @@ fn build_virtual_blacklist() -> Option<Vec<u64>> {
     Some(blacklist)
 }
 
-fn get_virtual_blacklist() -> Vec<u64> {
+fn get_virtual_blacklist() -> Rc<HashSet<u64>> {
     {
         let skip = VIRTUAL_BLACKLIST.with(|cell| {
             let cache = cell.borrow();
             if let Some((list, last_refresh)) = cache.as_ref()
                 && last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS
             {
-                return Some(list.clone());
+                return Some(Rc::clone(list));
             }
             None
         });
@@ -432,19 +433,23 @@ fn get_virtual_blacklist() -> Vec<u64> {
 
     let new_list = build_virtual_blacklist();
     match new_list {
-        Some(list) => {
+        Some(set) => {
+            let rc = Rc::new(set);
             VIRTUAL_BLACKLIST.with(|cell| {
-                *cell.borrow_mut() = Some((list.clone(), Instant::now()));
+                *cell.borrow_mut() = Some((Rc::clone(&rc), Instant::now()));
             });
-            list
+            rc
         }
         None => VIRTUAL_BLACKLIST.with(|cell| {
             let mut cache = cell.borrow_mut();
-            let old_list = cache.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+            let old = cache
+                .as_ref()
+                .map(|(l, _)| Rc::clone(l))
+                .unwrap_or_else(|| Rc::new(HashSet::new()));
             // Update timestamp on failure so we don't retry GetAdaptersAddresses
             // on every tick; reuse the old list (or empty) for 30s.
-            *cache = Some((old_list.clone(), Instant::now()));
-            old_list
+            *cache = Some((Rc::clone(&old), Instant::now()));
+            old
         }),
     }
 }

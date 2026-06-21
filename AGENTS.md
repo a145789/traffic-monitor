@@ -59,7 +59,7 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 
 ---
 
-## 架构与职责 (8 个源文件)
+## 架构与职责 (9 个源文件)
 
 所有的具体常量数值（如像素宽、高、定时器间隔、颜色等）均统定义在 [src/config.rs](src/config.rs) 中。AI 在修改或读取时应直接查阅该文件，避免在其他模块中硬编码。
 
@@ -71,5 +71,6 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 | [src/renderer.rs](src/renderer.rs)   | GDI 双缓冲绘制（位图缓存 `hdc_mem` -> 窗口 `hdc`）、字体、DPI 缩放、文字排版与对齐。       |
 | [src/tray.rs](src/tray.rs)           | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                        |
 | [src/update.rs](src/update.rs)       | 自动/手动检查更新、下载新版本安装包、SHA-256 安全哈希校验、UAC 提权覆盖安装。           |
+| [src/thermal.rs](src/thermal.rs)     | 设备过热风险推断引擎：电池放电功率直测（拔电）/CPU·内存·内核比多信号推断（插电）、双 EMA 热容模拟、滞回状态机。 |
 | [src/ffi_guard.rs](src/ffi_guard.rs) | RAII 资源守卫类型（`MutexGuard`、`RegKey`、`MenuGuard` 等），保证 FFI 资源安全释放。    |
 | [src/util.rs](src/util.rs)           | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                    |

@@ -4,6 +4,7 @@ mod collector;
 mod config;
 mod ffi_guard;
 mod renderer;
+mod thermal;
 mod tray;
 mod update;
 mod util;
@@ -43,11 +44,13 @@ use crate::collector::{
 };
 use crate::config::{
     COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
-    FULLSCREEN, GAP, LOWORD_MASK, NETWORK_BACKOFF, SUSPENDED, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_FULLSCREEN,
-    TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
+    FULLSCREEN, GAP, LOWORD_MASK, NETWORK_BACKOFF, SUSPENDED, THERMAL_STATE, TIMER_ID_CPU_MEM,
+    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_ID_THERMAL,
+    TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
+    TIMER_INTERVAL_THERMAL,
 };
 use crate::renderer::Renderer;
+use crate::thermal::collect_thermal;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
 };
@@ -114,6 +117,7 @@ fn suspend_system(hwnd: HWND) {
         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
+        KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
     }
     trim_working_set();
 }
@@ -138,6 +142,7 @@ fn resume_system(hwnd: HWND, reset_backoff: bool) {
             TIMER_INTERVAL_FULLSCREEN,
             None,
         );
+        let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
     }
     if !FULLSCREEN.load(Ordering::Acquire) {
         // SAFETY: hwnd 有效，定时器 ID 合法。
@@ -198,6 +203,7 @@ fn check_fullscreen(hwnd: HWND) {
             // SAFETY: hwnd 是当前进程所持有并处于活动状态的有效主窗口句柄，重新启动此线程关联的定时器不会引发未定义行为。
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+                let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
             }
         }
         return;
@@ -243,11 +249,13 @@ fn check_fullscreen(hwnd: HWND) {
         // SAFETY: hwnd 有效，销毁定时器。
         unsafe {
             KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
+            KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
         }
     } else if !should_suspend && was {
         // SAFETY: hwnd 有效，重建定时器。
         unsafe {
             let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+            let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
         }
     }
 }
@@ -381,6 +389,7 @@ fn main() {
         );
         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
         let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
     }
 
     // SAFETY: hwnd 有效，注册会话通知。
@@ -576,6 +585,7 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
             // SAFETY: hwnd 有效，重建 CPU/内存定时器。
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+                let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
             }
         }
     }
@@ -616,6 +626,19 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 // SAFETY: hwnd 有效，刷新 CPU/内存显示。
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+        TIMER_ID_THERMAL => {
+            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+                let prev = THERMAL_STATE.load(Ordering::Relaxed);
+                collect_thermal();
+                // 仅在热状态实际跳变时触发重绘，避免每秒空转 DWM 合成。
+                if THERMAL_STATE.load(Ordering::Relaxed) != prev {
+                    // SAFETY: hwnd 有效，刷新热风险变色显示。
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
             }
         }

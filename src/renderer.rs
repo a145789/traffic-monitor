@@ -9,8 +9,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::config::{
-    COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, CPU_USAGE, DISPLAY_HEIGHT, DISPLAY_WIDTH,
-    FONT_BASE_SIZE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP,
+    COLOR_CRIT_TEXT, COLOR_DARK_TEXT, COLOR_HOT_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, CPU_USAGE,
+    DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP,
+    THERMAL_STATE,
 };
 use crate::util::{reg_read_dword, to_wide};
 
@@ -26,6 +27,7 @@ pub struct Renderer {
     width: i32,
     height: i32,
     arrow_width: i32,
+    buf: Vec<u16>,
 }
 
 impl Renderer {
@@ -83,6 +85,7 @@ impl Renderer {
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
             arrow_width,
+            buf: Vec::with_capacity(32),
         }
     }
 
@@ -117,10 +120,17 @@ impl Renderer {
             write_u32(buf, bytes_per_sec);
             push_ascii(buf, " B/s");
         } else if bytes_per_sec < 1024 * 1024 {
-            write_fixed1(buf, bytes_per_sec as f64 / 1024.0);
+            // 整数定点：乘 10 后加半除数四舍五入，得到十分位精度值。
+            let x = ((bytes_per_sec as u64 * 10 + 512) / 1024) as u32;
+            write_u32(buf, x / 10);
+            buf.push(b'.' as u16);
+            buf.push((b'0' + (x % 10) as u8) as u16);
             push_ascii(buf, " KB/s");
         } else {
-            write_fixed1(buf, bytes_per_sec as f64 / (1024.0 * 1024.0));
+            let x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
+            write_u32(buf, x / 10);
+            buf.push(b'.' as u16);
+            buf.push((b'0' + (x % 10) as u8) as u16);
             push_ascii(buf, " MB/s");
         }
         buf.push(0);
@@ -139,11 +149,10 @@ impl Renderer {
         let speed_down = NET_SPEED_DOWN.load(Ordering::Relaxed);
         let cpu = CPU_USAGE.load(Ordering::Relaxed);
         let mem = MEM_USAGE.load(Ordering::Relaxed);
+        let thermal_state = THERMAL_STATE.load(Ordering::Relaxed);
 
         let half_height = self.height / 2;
         let scale = self.width as f64 / DISPLAY_WIDTH as f64;
-
-        let mut buf = Vec::with_capacity(32);
 
         // 1. 绘制第二列 (网速) - 最右列
         // 箭头左对齐，数值右对齐 — 表格效果
@@ -165,7 +174,7 @@ impl Renderer {
                 right: arrow_right,
                 bottom: half_height,
             };
-            let up_arrow = Self::wide(&mut buf, "\u{2191}");
+            let up_arrow = Self::wide(&mut self.buf, "\u{2191}");
             let _ = DrawTextW(
                 hdc_mem,
                 up_arrow,
@@ -180,7 +189,7 @@ impl Renderer {
                 right: speed_right,
                 bottom: half_height,
             };
-            let up_val = Self::format_speed_wide(&mut buf, speed_up);
+            let up_val = Self::format_speed_wide(&mut self.buf, speed_up);
             let _ = DrawTextW(
                 hdc_mem,
                 up_val,
@@ -195,7 +204,7 @@ impl Renderer {
                 right: arrow_right,
                 bottom: self.height,
             };
-            let down_arrow = Self::wide(&mut buf, "\u{2193}");
+            let down_arrow = Self::wide(&mut self.buf, "\u{2193}");
             let _ = DrawTextW(
                 hdc_mem,
                 down_arrow,
@@ -210,7 +219,7 @@ impl Renderer {
                 right: speed_right,
                 bottom: self.height,
             };
-            let down_val = Self::format_speed_wide(&mut buf, speed_down);
+            let down_val = Self::format_speed_wide(&mut self.buf, speed_down);
             let _ = DrawTextW(
                 hdc_mem,
                 down_val,
@@ -222,7 +231,15 @@ impl Renderer {
             let cpu_right = speed_left - col_gap;
             let cpu_left = cpu_right - (76.0 * scale).round() as i32;
 
-            let cpu_wide = Self::format_cpu_mem_wide(&mut buf, "CPU", cpu);
+            // 仅 CPU 行根据热风险状态变色，其余行保持默认色。
+            let thermal_color = match thermal_state {
+                2 => COLORREF(COLOR_HOT_TEXT),
+                3 => COLORREF(COLOR_CRIT_TEXT),
+                _ => self.text_color,
+            };
+            SetTextColor(hdc_mem, thermal_color);
+
+            let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", cpu);
             let mut rc_cpu = RECT {
                 left: cpu_left,
                 top: 0,
@@ -236,8 +253,10 @@ impl Renderer {
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
 
+            SetTextColor(hdc_mem, self.text_color);
+
             let h = self.height;
-            let mem_wide = Self::format_cpu_mem_wide(&mut buf, "MEM", mem);
+            let mem_wide = Self::format_cpu_mem_wide(&mut self.buf, "MEM", mem);
             let mut rc_mem = RECT {
                 left: cpu_left,
                 top: half_height,
@@ -250,8 +269,6 @@ impl Renderer {
                 &mut rc_mem,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
-
-            SetTextColor(hdc_mem, self.text_color);
 
             let _ = BitBlt(
                 hdc,
@@ -400,18 +417,6 @@ fn write_u32(buf: &mut Vec<u16>, mut n: u32) {
         n /= 10;
     }
     buf[start..].reverse();
-}
-
-fn write_fixed1(buf: &mut Vec<u16>, val: f64) {
-    let mut int_part = val as u32;
-    let mut frac = ((val - int_part as f64) * 10.0).round() as u32;
-    if frac >= 10 {
-        int_part += 1;
-        frac = 0;
-    }
-    write_u32(buf, int_part);
-    buf.push(b'.' as u16);
-    buf.push((b'0' + frac as u8) as u16);
 }
 
 #[cfg(test)]
