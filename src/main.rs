@@ -56,6 +56,7 @@ use crate::tray::{
 };
 use crate::update::{
     WM_USER_UPDATE_READY, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
+    subprocess_main,
 };
 use crate::util::show_error;
 
@@ -298,6 +299,11 @@ fn main() {
     if args.iter().any(|a| a == "--quit") {
         quit_existing_instance();
         return;
+    }
+
+    // 必须在单例 Mutex 锁之前拦截 --check-update，否则子进程会被当作重复实例直接退出。
+    if args.iter().any(|a| a == "--check-update") {
+        std::process::exit(subprocess_main());
     }
 
     let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -461,7 +462,7 @@ pub fn start_manual_check(hwnd: HWND) {
 }
 
 fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
-    let result = do_update_check();
+    let result = run_check_subprocess();
     let is_error = matches!(result, CheckResult::Error);
 
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
@@ -609,6 +610,82 @@ fn do_update_check() -> CheckResult {
     }
 
     CheckResult::InstalledReady(latest_version, temp_path_str)
+}
+
+/// 子进程入口：执行更新检查并将结果序列化到 stdout，供主进程解析。
+///
+/// 协议（单行，`|` 分隔）：
+/// - `NO_UPDATE`
+/// - `PORTABLE|<version>`
+/// - `INSTALLED|<version>|<path>`
+/// - `ERROR`
+///
+/// 退出码：0 = 成功（含 NoUpdate），1 = Error。
+pub fn subprocess_main() -> i32 {
+    let result = do_update_check();
+    let line = match &result {
+        CheckResult::NoUpdate => "NO_UPDATE".to_string(),
+        CheckResult::PortableFound(v) => format!("PORTABLE|{v}"),
+        CheckResult::InstalledReady(v, p) => format!("INSTALLED|{v}|{p}"),
+        CheckResult::Error => "ERROR".to_string(),
+    };
+    let _ = std::io::stdout().write_all(line.as_bytes());
+    let _ = std::io::stdout().flush();
+    if matches!(result, CheckResult::Error) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 主进程调用：re-exec 自身 `--check-update` 子进程，读取 stdout 解析结果。
+///
+/// winhttp/bcrypt 系列通过 /DELAYLOAD 延迟加载，主进程代码路径不触碰它们，
+/// 因此稳态下这些 DLL 永不进入主进程空间；子进程退出后它们随之释放。
+fn run_check_subprocess() -> CheckResult {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return CheckResult::Error,
+    };
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let output = match std::process::Command::new(exe)
+        .arg("--check-update")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return CheckResult::Error,
+    };
+    if !output.status.success() {
+        return CheckResult::Error;
+    }
+    parse_check_result(&output.stdout)
+}
+
+fn parse_check_result(stdout: &[u8]) -> CheckResult {
+    let text = match std::str::from_utf8(stdout) {
+        Ok(s) => s.trim(),
+        Err(_) => return CheckResult::Error,
+    };
+    if text.is_empty() {
+        return CheckResult::Error;
+    }
+    let mut parts = text.splitn(3, '|');
+    match parts.next() {
+        Some("NO_UPDATE") => CheckResult::NoUpdate,
+        Some("PORTABLE") => match parts.next() {
+            Some(v) if !v.is_empty() => CheckResult::PortableFound(v.to_string()),
+            _ => CheckResult::Error,
+        },
+        Some("INSTALLED") => match (parts.next(), parts.next()) {
+            (Some(v), Some(p)) if !v.is_empty() && !p.is_empty() => {
+                CheckResult::InstalledReady(v.to_string(), p.to_string())
+            }
+            _ => CheckResult::Error,
+        },
+        _ => CheckResult::Error,
+    }
 }
 
 fn post_update_status(hwnd: HWND, status: usize) {
