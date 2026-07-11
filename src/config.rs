@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+//! 编译期常量：窗口尺寸、颜色、定时器 ID/间隔、热模型参数等。
+//!
+//! 运行时可变状态见 `state.rs`。
 
 pub const APP_NAME: &str = "TrafficMonitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";
@@ -19,6 +21,7 @@ pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
 pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
 pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
 pub const TIMER_INTERVAL_THERMAL: u32 = 1000;
+pub const CPU_MEM_INTERVAL: u32 = 5000;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
 pub const COLOR_KEY: u32 = 0x00FF00FF;
@@ -29,33 +32,16 @@ pub const COLOR_CRIT_TEXT: u32 = 0x003030FF;
 
 pub const FONT_BASE_SIZE: i32 = 13;
 
-pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
-pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
-pub static ENABLE_AUTO_UPDATE: AtomicBool = AtomicBool::new(true);
-pub static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
 pub const MENU_ID_AUTO_UPDATE_TOGGLE: u32 = 1005;
 pub const MENU_ID_CHECK_UPDATE_MANUAL: u32 = 1006;
 
 /// 从 WPARAM/LPARAM 提取低 16 位（LOWORD）的掩码，用于菜单 ID 与托盘事件。
 pub const LOWORD_MASK: u32 = 0xFFFF;
 
-pub static NET_SPEED_UP: AtomicU32 = AtomicU32::new(0);
-pub static NET_SPEED_DOWN: AtomicU32 = AtomicU32::new(0);
-
-pub static NETWORK_BACKOFF: AtomicBool = AtomicBool::new(false);
-pub static CONSECUTIVE_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
-
-pub static CPU_USAGE: AtomicU32 = AtomicU32::new(0);
-pub static MEM_USAGE: AtomicU32 = AtomicU32::new(0);
-
 // ===== 热风险模型 (Thermal Risk) =====
 // 针对 Meteor Lake H (Core Ultra 7 155H) + 16" 轻薄本标定。
 // 其他机型需重新标定常量。拔电时用电池放电功率直测总发热,
 // 插电时用 CPU/MEM/内核比多信号推断(有 GPU/NPU 盲区)。
-
-pub static THERMAL_RISK: AtomicU32 = AtomicU32::new(0); // 0..=100, 预留给未来 UI/调试, 当前 renderer 只用 THERMAL_STATE
-pub static THERMAL_STATE: AtomicU8 = AtomicU8::new(0);
 
 pub const P_IDLE_PLUG_MW: i32 = 7000;
 pub const A_CPU_MW_PER_PCT: i32 = 350;

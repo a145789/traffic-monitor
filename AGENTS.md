@@ -43,6 +43,7 @@ Stop-Process -Name "traffic-monitor" -Force # 强退旧进程
 在任何代码修改后，提交前必须执行并确保无任何警告或错误：
 
 ```bash
+cargo test 2>&1   # 验证测试用例通过
 cargo build --release 2>&1      # 验证构建无警告
 cargo clippy -- -D warnings     # 验证 Clippy 无警告
 cargo fmt                       # 格式化代码
@@ -66,14 +67,14 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 
 所有的具体常量数值（如像素宽、高、定时器间隔、颜色等）均统定义在 [src/config.rs](src/config.rs) 中。AI 在修改或读取时应直接查阅该文件，避免在其他模块中硬编码。
 
-| 文件                                 | 职责说明                                                                                |
-| :----------------------------------- | :-------------------------------------------------------------------------------------- |
-| [src/main.rs](src/main.rs)           | 窗口创建、UI 消息循环、任务栏嵌入、窗口位置动态更新、系统挂起/恢复处理、单例 Mutex 锁。 |
-| [src/config.rs](src/config.rs)       | 全局常量定义、窗口与字体基准大小、定时器 ID、共享多线程无锁原子变量（Atomic）定义。     |
-| [src/collector.rs](src/collector.rs) | CPU 与内存采集、网卡接口过滤、单网卡锁定算法、网络断开与恢复消息发送。                  |
-| [src/renderer.rs](src/renderer.rs)   | GDI 双缓冲绘制（位图缓存 `hdc_mem` -> 窗口 `hdc`）、字体、DPI 缩放、文字排版与对齐。       |
-| [src/tray.rs](src/tray.rs)           | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                        |
-| [src/update.rs](src/update.rs)       | 自动/手动检查更新、下载新版本安装包、SHA-256 安全哈希校验、UAC 提权覆盖安装。           |
+| 文件                                 | 职责说明                                                                                                        |
+| :----------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| [src/main.rs](src/main.rs)           | 窗口创建、UI 消息循环、任务栏嵌入、窗口位置动态更新、系统挂起/恢复处理、单例 Mutex 锁。                         |
+| [src/config.rs](src/config.rs)       | 全局常量定义、窗口与字体基准大小、定时器 ID、共享多线程无锁原子变量（Atomic）定义。                             |
+| [src/collector.rs](src/collector.rs) | CPU 与内存采集、网卡接口过滤、单网卡锁定算法、网络断开与恢复消息发送。                                          |
+| [src/renderer.rs](src/renderer.rs)   | GDI 双缓冲绘制（位图缓存 `hdc_mem` -> 窗口 `hdc`）、字体、DPI 缩放、文字排版与对齐。                            |
+| [src/tray.rs](src/tray.rs)           | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                                                |
+| [src/update.rs](src/update.rs)       | 自动/手动检查更新、下载新版本安装包、SHA-256 安全哈希校验、UAC 提权覆盖安装。                                   |
 | [src/thermal.rs](src/thermal.rs)     | 设备过热风险推断引擎：电池放电功率直测（拔电）/CPU·内存·内核比多信号推断（插电）、双 EMA 热容模拟、滞回状态机。 |
-| [src/ffi_guard.rs](src/ffi_guard.rs) | RAII 资源守卫类型（`MutexGuard`、`RegKey`、`MenuGuard` 等），保证 FFI 资源安全释放。    |
-| [src/util.rs](src/util.rs)           | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                    |
+| [src/ffi_guard.rs](src/ffi_guard.rs) | RAII 资源守卫类型（`MutexGuard`、`RegKey`、`MenuGuard` 等），保证 FFI 资源安全释放。                            |
+| [src/util.rs](src/util.rs)           | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                                            |

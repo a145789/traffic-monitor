@@ -4,20 +4,20 @@ mod collector;
 mod config;
 mod ffi_guard;
 mod renderer;
+mod state;
+mod suspend;
 mod thermal;
 mod tray;
 mod update;
 mod util;
+mod window;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
-    COLORREF, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-    MONITORINFOEXW, MonitorFromWindow, PAINTSTRUCT,
-};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Power::{
     HPOWERNOTIFY, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
 };
@@ -27,14 +27,10 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetDesktopWindow,
-    GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP, IsWindow,
-    KillTimer, LWA_COLORKEY, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
-    RegisterWindowMessageW, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED,
-    WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WS_CHILD,
-    WS_EX_LAYERED, WS_VISIBLE,
+    DefWindowProcW, FindWindowW, KillTimer, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
+    PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SetTimer, ShowWindow, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_TIMER, WM_WTSSESSION_CHANGE,
 };
 use windows::core::w;
 
@@ -43,13 +39,15 @@ use crate::collector::{
     collect_network, init_network_listener, trim_working_set,
 };
 use crate::config::{
-    COLOR_KEY, CONSECUTIVE_ZERO_COUNT, DISPLAY_HEIGHT, DISPLAY_WIDTH, ENABLE_AUTO_UPDATE,
-    FULLSCREEN, GAP, LOWORD_MASK, NETWORK_BACKOFF, SUSPENDED, THERMAL_STATE, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_ID_THERMAL,
-    TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
-    TIMER_INTERVAL_THERMAL,
+    CPU_MEM_INTERVAL, LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
+    TIMER_ID_NETWORK, TIMER_ID_THERMAL, TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK,
+    TIMER_INTERVAL_NETWORK_BACKOFF, TIMER_INTERVAL_THERMAL,
 };
 use crate::renderer::Renderer;
+use crate::state::{
+    CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, FULLSCREEN, NETWORK_BACKOFF, SUSPENDED,
+    THERMAL_STATE,
+};
 use crate::thermal::collect_thermal;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
@@ -84,182 +82,6 @@ thread_local! {
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
-static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
-
-fn get_taskbar_hwnd() -> Option<HWND> {
-    let cached = TASKBAR_HWND.load(Ordering::Acquire);
-    if cached != 0 {
-        let hwnd = HWND(cached as *mut std::ffi::c_void);
-        // SAFETY: IsWindow 是纯查询 API，hwnd 来自缓存，仅做有效性判断。
-        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-            return Some(hwnd);
-        }
-        TASKBAR_HWND.store(0, Ordering::Release);
-    }
-    // SAFETY:
-    // "Shell_TrayWnd" 是 Windows 任务栏窗口的标准类名，常量宽字符串生命周期覆盖调用。
-    // FindWindowW 仅查询窗口句柄，不解引用任何裸指针，失败时安全返回 Err。
-    let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok() };
-    if let Some(h) = hwnd {
-        TASKBAR_HWND.store(h.0 as isize, Ordering::Release);
-    }
-    hwnd
-}
-
-// MutexGuard 定义已提取至 ffi_guard 模块中进行共用。
-
-fn suspend_system(hwnd: HWND) {
-    SUSPENDED.store(true, Ordering::Release);
-    FULLSCREEN.store(false, Ordering::Release);
-    // SAFETY:
-    // hwnd 是操作系统分配的有效主窗口句柄。
-    // 在系统休眠或锁屏时安全关闭所有监测定时器。
-    unsafe {
-        KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
-        KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
-        KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
-        KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
-    }
-    trim_working_set();
-}
-
-fn resume_system(hwnd: HWND, reset_backoff: bool) {
-    SUSPENDED.store(false, Ordering::Release);
-    if reset_backoff {
-        CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
-        NETWORK_BACKOFF.store(false, Ordering::Release);
-    }
-    let network_interval = if NETWORK_BACKOFF.load(Ordering::Acquire) {
-        TIMER_INTERVAL_NETWORK_BACKOFF
-    } else {
-        TIMER_INTERVAL_NETWORK
-    };
-    // SAFETY: hwnd 是系统分配的有效主窗口句柄。
-    unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
-        let _ = SetTimer(
-            Some(hwnd),
-            TIMER_ID_FULLSCREEN,
-            TIMER_INTERVAL_FULLSCREEN,
-            None,
-        );
-        let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-    }
-    if !FULLSCREEN.load(Ordering::Acquire) {
-        // SAFETY: hwnd 有效，定时器 ID 合法。
-        unsafe {
-            let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-        }
-    }
-}
-
-/// Converts an ASCII string to a fixed-size UTF-16 array. Only works for ASCII; non-ASCII bytes
-/// will produce incorrect results.
-const fn utf16<const N: usize>(s: &str) -> [u16; N] {
-    let mut buf = [0u16; N];
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        buf[i] = bytes[i] as u16;
-        i += 1;
-    }
-    buf
-}
-
-/// # Safety
-///
-/// 调用者必须保证 `lparam` 指向一个有效的、以 NUL 结尾的 UTF-16 宽字符序列。
-/// 由 `WM_SETTINGCHANGE` 消息传入时 OS 保证此条件成立。
-unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
-    let ptr = lparam.0 as *const u16;
-    if ptr.is_null() {
-        return false;
-    }
-    const EXPECTED: &[u16] = &utf16::<18>("ImmersiveColorSet\0");
-    for (i, &expected_char) in EXPECTED.iter().enumerate() {
-        // SAFETY: 调用者保证 ptr 指向有效的 NUL 结尾 UTF-16 序列，按偏移遍历安全。
-        let actual_char = unsafe { *ptr.add(i) };
-        if actual_char != expected_char {
-            return false;
-        }
-        if actual_char == 0 {
-            return true;
-        }
-    }
-    true
-}
-
-fn check_fullscreen(hwnd: HWND) {
-    // SAFETY: 纯查询 API，无副作用。
-    let foreground = unsafe { GetForegroundWindow() };
-    let is_invalid = foreground.is_invalid();
-    // SAFETY: GetDesktopWindow 和 GetShellWindow 是纯查询 Win32 API，无副作用。
-    let is_desktop_or_shell =
-        unsafe { GetDesktopWindow() == foreground || GetShellWindow() == foreground };
-
-    if is_invalid || is_desktop_or_shell || foreground == hwnd {
-        let was = FULLSCREEN.load(Ordering::Acquire);
-        if was {
-            FULLSCREEN.store(false, Ordering::Release);
-            // SAFETY: hwnd 是当前进程所持有并处于活动状态的有效主窗口句柄，重新启动此线程关联的定时器不会引发未定义行为。
-            unsafe {
-                let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-                let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-            }
-        }
-        return;
-    }
-
-    let mut rect = RECT::default();
-    // SAFETY: foreground 非空，rect 在栈上分配。
-    let _ = unsafe { GetWindowRect(foreground, &mut rect) };
-
-    // 使用 MonitorFromWindow 获取前台窗口所在显示器
-    // SAFETY: foreground 有效，MONITOR_DEFAULTTONEAREST 是合法标志。
-    let hmon_fg = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
-    let mut mi_fg = MONITORINFOEXW::default();
-    mi_fg.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-    // SAFETY: hmon_fg 有效，mi_fg 在栈上分配且 cbSize 已初始化。
-    let fg_ok = unsafe { GetMonitorInfoW(hmon_fg, &mut mi_fg as *mut MONITORINFOEXW as *mut _) };
-
-    let is_full = if fg_ok.as_bool() {
-        let mon_rect = mi_fg.monitorInfo.rcMonitor;
-        rect.left == mon_rect.left
-            && rect.top == mon_rect.top
-            && rect.right == mon_rect.right
-            && rect.bottom == mon_rect.bottom
-    } else {
-        false
-    };
-
-    // 检查前台窗口是否覆盖任务栏所在显示器
-    let same_monitor = match get_taskbar_hwnd() {
-        Some(h_taskbar) => {
-            // SAFETY: h_taskbar 有效。
-            let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
-            hmon_fg == hmon_tb
-        }
-        None => false,
-    };
-
-    let was = FULLSCREEN.load(Ordering::Acquire);
-    let should_suspend = is_full && same_monitor;
-    FULLSCREEN.store(should_suspend, Ordering::Release);
-
-    if should_suspend && !was {
-        // SAFETY: hwnd 有效，销毁定时器。
-        unsafe {
-            KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
-            KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
-        }
-    } else if !should_suspend && was {
-        // SAFETY: hwnd 有效，重建定时器。
-        unsafe {
-            let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
-            let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-        }
-    }
-}
 
 fn quit_existing_instance() {
     let class_name: Vec<u16> = crate::config::WINDOW_CLASS.encode_utf16().collect();
@@ -394,7 +216,7 @@ fn main() {
             None,
         );
         let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
-        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
         let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
     }
 
@@ -442,122 +264,14 @@ fn main() {
     });
 }
 
-fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
-    let h_taskbar = get_taskbar_hwnd()?;
-    // SAFETY: h_taskbar 已被验证为有效句柄，"TrayNotifyWnd" 为系统 Tray 窗口类名。
-    let h_tray = unsafe { FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")).ok()? };
-
-    let mut rc_tray = RECT::default();
-    let mut rc_taskbar = RECT::default();
-    // SAFETY: h_tray 和 h_taskbar 有效，rect 在栈上分配。
-    unsafe {
-        GetWindowRect(h_tray, &mut rc_tray).ok()?;
-        GetWindowRect(h_taskbar, &mut rc_taskbar).ok()?;
-    }
-
-    // SAFETY: hwnd 有效，GetDpiForWindow 是纯查询 API。
-    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-    let scale = dpi as f64 / 96.0;
-    let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
-    let display_height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
-    let gap = (GAP as f64 * scale).round() as i32;
-
-    let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
-    let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
-
-    Some((display_x, display_y, display_width, display_height))
-}
-
-fn embed_in_taskbar(hwnd: HWND) -> bool {
-    let (display_x, display_y, display_width, display_height) = match calc_widget_rect(hwnd) {
-        Some(rect) => rect,
-        None => {
-            show_error("Cannot find Shell_TrayWnd or TrayNotifyWnd");
-            return false;
-        }
-    };
-
-    let h_taskbar = match get_taskbar_hwnd() {
-        Some(h) => h,
-        None => {
-            show_error("Cannot find Shell_TrayWnd");
-            return false;
-        }
-    };
-
-    // SAFETY: hwnd 和 h_taskbar 均为已验证的有效句柄。
-    unsafe {
-        let _ = SetParent(hwnd, Some(h_taskbar));
-        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
-        let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            current_ex_style | (WS_EX_LAYERED.0 as isize),
-        );
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOP),
-            display_x,
-            display_y,
-            display_width,
-            display_height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-        );
-        if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(COLOR_KEY), 0, LWA_COLORKEY) {
-            show_error(&format!("Failed to set layered window attributes: {:?}", e));
-            return false;
-        }
-    }
-
-    true
-}
-
-fn update_taskbar_position(hwnd: HWND) {
-    thread_local! {
-        static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
-    }
-
-    let Some((display_x, display_y, display_width, display_height)) = calc_widget_rect(hwnd) else {
-        return;
-    };
-
-    let changed = LAST_RECT.with(|lp| match lp.get() {
-        Some((lx, ly, lw, lh))
-            if lx == display_x
-                && ly == display_y
-                && lw == display_width
-                && lh == display_height =>
-        {
-            false
-        }
-        _ => {
-            lp.set(Some((display_x, display_y, display_width, display_height)));
-            true
-        }
-    });
-
-    if changed {
-        // SAFETY: hwnd 有效，SWP_NOZORDER 不调整层级。
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                display_x,
-                display_y,
-                display_width,
-                display_height,
-                SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER,
-            );
-        }
-    }
-}
+use crate::suspend::{check_fullscreen, is_immersive_color_set, resume_system, suspend_system};
+use crate::window::{embed_in_taskbar, invalidate_taskbar_cache, update_taskbar_position};
 
 const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 
 fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
-    TASKBAR_HWND.store(0, Ordering::Release);
+    invalidate_taskbar_cache();
     remove_tray_icon();
     // SAFETY: hwnd 有效，隐藏窗口。
     unsafe {
@@ -590,7 +304,7 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
         if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
             // SAFETY: hwnd 有效，重建 CPU/内存定时器。
             unsafe {
-                let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, 5000, None);
+                let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
                 let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
             }
         }

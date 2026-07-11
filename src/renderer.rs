@@ -9,10 +9,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::config::{
-    COLOR_CRIT_TEXT, COLOR_DARK_TEXT, COLOR_HOT_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, CPU_USAGE,
-    DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP,
-    THERMAL_STATE,
+    COLOR_CRIT_TEXT, COLOR_DARK_TEXT, COLOR_HOT_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT,
+    DISPLAY_WIDTH, FONT_BASE_SIZE,
 };
+use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP, THERMAL_STATE};
 use crate::util::{reg_read_dword, to_wide};
 
 pub struct Renderer {
@@ -34,6 +34,24 @@ impl Renderer {
     pub fn new() -> Self {
         // SAFETY: null_mut 句柄获取整个屏幕的临时 HDC。
         let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
+        // 桌面 DC 理论上永不失效，但若极端情况（无桌面会话）下失败，
+        // 后续 GDI 操作将全为 no-op，渲染空白但不崩溃。
+        if hdc_screen.is_invalid() {
+            return Self {
+                hdc_mem: HDC::default(),
+                hbitmap: HBITMAP::default(),
+                hfont: HFONT::default(),
+                old_bitmap: HGDIOBJ::default(),
+                old_font: HGDIOBJ::default(),
+                hbrush: HBRUSH::default(),
+                text_color: COLORREF(COLOR_LIGHT_TEXT),
+                font_size: FONT_BASE_SIZE,
+                width: DISPLAY_WIDTH,
+                height: DISPLAY_HEIGHT,
+                arrow_width: 0,
+                buf: Vec::with_capacity(32),
+            };
+        }
 
         // SAFETY: hdc_screen 有效，创建兼容内存 DC。
         let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
@@ -57,16 +75,7 @@ impl Renderer {
             let _ = SetBkMode(hdc_mem, TRANSPARENT);
         }
 
-        let arrow_width = {
-            let arrow_text = to_wide("\u{2191} ");
-            let mut size = SIZE::default();
-            // SAFETY: hdc_mem 有效，arrow_text 以 NUL 结尾，size 在栈上。
-            unsafe {
-                let _ =
-                    GetTextExtentPoint32W(hdc_mem, &arrow_text[..arrow_text.len() - 1], &mut size);
-            }
-            size.cx
-        };
+        let arrow_width = measure_arrow_width(hdc_mem);
 
         // SAFETY: 释放临时屏幕 HDC。
         unsafe {
@@ -295,6 +304,9 @@ impl Renderer {
         // 1. 创建符合新大小的 Compatible Bitmap
         // SAFETY: null_mut 句柄获取临时屏幕 HDC。
         let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
+        if hdc_screen.is_invalid() {
+            return;
+        }
 
         // SAFETY: hdc_screen 有效，创建兼容位图。
         let new_bitmap = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
@@ -343,17 +355,7 @@ impl Renderer {
             let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
         }
 
-        let arrow_width = {
-            let hdc_mem = self.hdc_mem;
-            let arrow_text = to_wide("\u{2191} ");
-            let arrow_len = arrow_text.len() - 1;
-            let mut size = SIZE::default();
-            // SAFETY: hdc_mem 有效，arrow_text 以 NUL 结尾，size 在栈上。
-            unsafe {
-                let _ = GetTextExtentPoint32W(hdc_mem, &arrow_text[..arrow_len], &mut size);
-            }
-            size.cx
-        };
+        let arrow_width = measure_arrow_width(self.hdc_mem);
         self.arrow_width = arrow_width;
     }
 }
@@ -373,6 +375,16 @@ impl Drop for Renderer {
             let _ = DeleteDC(self.hdc_mem);
         }
     }
+}
+
+fn measure_arrow_width(hdc: HDC) -> i32 {
+    let arrow_text = to_wide("\u{2191} ");
+    let mut size = SIZE::default();
+    // SAFETY: hdc 有效，arrow_text 以 NUL 结尾，size 在栈上。
+    unsafe {
+        let _ = GetTextExtentPoint32W(hdc, &arrow_text[..arrow_text.len() - 1], &mut size);
+    }
+    size.cx
 }
 
 fn create_font(size: i32) -> HFONT {
@@ -466,5 +478,51 @@ mod tests {
             wide_to_string(Renderer::format_speed_wide(&mut buf, u32::MAX)),
             "4096.0 MB/s"
         );
+    }
+
+    // ===== write_u32 =====
+
+    #[test]
+    fn test_write_u32_zero() {
+        let mut buf = Vec::new();
+        write_u32(&mut buf, 0);
+        assert_eq!(wide_to_string(&buf), "0");
+    }
+
+    #[test]
+    fn test_write_u32_digit_boundaries() {
+        let mut buf = Vec::new();
+        // 1 位 → 2 位边界
+        write_u32(&mut buf, 9);
+        assert_eq!(wide_to_string(&buf), "9");
+        buf.clear();
+        write_u32(&mut buf, 10);
+        assert_eq!(wide_to_string(&buf), "10");
+
+        // 2 位 → 3 位边界
+        buf.clear();
+        write_u32(&mut buf, 99);
+        assert_eq!(wide_to_string(&buf), "99");
+        buf.clear();
+        write_u32(&mut buf, 100);
+        assert_eq!(wide_to_string(&buf), "100");
+    }
+
+    #[test]
+    fn test_write_u32_max() {
+        let mut buf = Vec::new();
+        write_u32(&mut buf, u32::MAX);
+        assert_eq!(wide_to_string(&buf), "4294967295");
+    }
+
+    // ===== push_ascii =====
+
+    #[test]
+    fn test_push_ascii_roundtrip() {
+        let mut buf = Vec::new();
+        push_ascii(&mut buf, "CPU: ");
+        push_ascii(&mut buf, "100");
+        push_ascii(&mut buf, "%");
+        assert_eq!(wide_to_string(&buf), "CPU: 100%");
     }
 }

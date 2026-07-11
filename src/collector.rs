@@ -13,9 +13,9 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
-use crate::config::{
-    BACKOFF_ZERO_THRESHOLD, CONSECUTIVE_ZERO_COUNT, CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN,
-    NET_SPEED_UP, NETWORK_BACKOFF,
+use crate::config::BACKOFF_ZERO_THRESHOLD;
+use crate::state::{
+    CONSECUTIVE_ZERO_COUNT, CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP, NETWORK_BACKOFF,
 };
 
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
@@ -530,5 +530,102 @@ mod tests {
         // 真正差异在逆转行为，此处至少锁定 API 选择不被误改回 duration_since）。
         let t = Instant::now();
         assert_eq!(t.saturating_duration_since(t).as_millis(), 0);
+    }
+
+    // ===== is_valid_interface =====
+
+    #[test]
+    fn test_is_valid_interface_ethernet() {
+        let row = MIB_IF_ROW2 {
+            Type: IF_TYPE_ETHERNET_CSMACD,
+            PhysicalAddressLength: 6,
+            ..Default::default()
+        };
+        assert!(is_valid_interface(&row));
+    }
+
+    #[test]
+    fn test_is_valid_interface_wifi() {
+        let row = MIB_IF_ROW2 {
+            Type: IF_TYPE_IEEE80211,
+            PhysicalAddressLength: 6,
+            ..Default::default()
+        };
+        assert!(is_valid_interface(&row));
+    }
+
+    #[test]
+    fn test_is_valid_interface_unknown_type_rejected() {
+        // 非以太网/非 WiFi 类型（如软件环回 IF_TYPE_SOFTWARE_LOOPBACK=24）应被过滤。
+        let row = MIB_IF_ROW2 {
+            Type: 24,
+            PhysicalAddressLength: 6,
+            ..Default::default()
+        };
+        assert!(!is_valid_interface(&row));
+    }
+
+    #[test]
+    fn test_is_valid_interface_zero_mac_rejected() {
+        // PhysicalAddressLength == 0 表示无 MAC 地址，不可用于流量统计。
+        let row = MIB_IF_ROW2 {
+            Type: IF_TYPE_ETHERNET_CSMACD,
+            PhysicalAddressLength: 0,
+            ..Default::default()
+        };
+        assert!(!is_valid_interface(&row));
+    }
+
+    // ===== is_virtual_friendly_name =====
+
+    #[test]
+    fn test_virtual_name_hyperv() {
+        assert!(is_virtual_friendly_name("Hyper-V Virtual Ethernet Adapter"));
+    }
+
+    #[test]
+    fn test_virtual_name_vmware() {
+        assert!(is_virtual_friendly_name("VMware Virtual Ethernet Adapter"));
+    }
+
+    #[test]
+    fn test_virtual_name_vbox() {
+        assert!(is_virtual_friendly_name(
+            "VirtualBox Host-Only Ethernet Adapter"
+        ));
+    }
+
+    #[test]
+    fn test_virtual_name_wsl() {
+        assert!(is_virtual_friendly_name("vEthernet (WSL)"));
+    }
+
+    #[test]
+    fn test_virtual_name_vpn() {
+        assert!(is_virtual_friendly_name("VPN Client Adapter"));
+    }
+
+    #[test]
+    fn test_virtual_name_loopback() {
+        assert!(is_virtual_friendly_name("Microsoft Loopback Adapter"));
+    }
+
+    #[test]
+    fn test_virtual_name_case_insensitive() {
+        // 大小写不敏感匹配。
+        assert!(is_virtual_friendly_name("VBOX Network Adapter"));
+        assert!(is_virtual_friendly_name("Virtual Ethernet Device"));
+    }
+
+    #[test]
+    fn test_virtual_name_physical_not_matched() {
+        // 真实物理网卡的常见名称不应被误判为虚拟。
+        assert!(!is_virtual_friendly_name(
+            "Intel(R) Ethernet Connection I219-LM"
+        ));
+        assert!(!is_virtual_friendly_name(
+            "Realtek PCIe GbE Family Controller"
+        ));
+        assert!(!is_virtual_friendly_name("Killer Wi-Fi 6 AX1650"));
     }
 }

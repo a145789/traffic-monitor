@@ -13,7 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::config::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
+use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{reg_read_dword, reg_write_dword, show_error, show_info, to_wide};
 
@@ -514,6 +514,7 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
     }
 }
 
+#[derive(Debug)]
 enum CheckResult {
     NoUpdate,
     PortableFound(String),
@@ -843,5 +844,86 @@ mod tests {
         assert_eq!(parse_version("0.4.3-nightly"), vec![0, 4, 3]);
         assert_eq!(parse_version("0.4"), vec![0, 4]);
         assert_eq!(parse_version("invalid"), Vec::<u32>::new());
+    }
+
+    // ===== parse_check_result =====
+
+    #[test]
+    fn test_parse_no_update() {
+        let result = parse_check_result(b"NO_UPDATE");
+        assert!(matches!(result, CheckResult::NoUpdate));
+    }
+
+    #[test]
+    fn test_parse_portable() {
+        let result = parse_check_result(b"PORTABLE|0.9.0");
+        match result {
+            CheckResult::PortableFound(v) => assert_eq!(v, "0.9.0"),
+            other => panic!("expected PortableFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_installed() {
+        let result =
+            parse_check_result(b"INSTALLED|1.0.0|C:\\Temp\\traffic-monitor-setup-temp.exe");
+        match result {
+            CheckResult::InstalledReady(v, p) => {
+                assert_eq!(v, "1.0.0");
+                assert_eq!(p, "C:\\Temp\\traffic-monitor-setup-temp.exe");
+            }
+            other => panic!("expected InstalledReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_error() {
+        let result = parse_check_result(b"ERROR");
+        assert!(matches!(result, CheckResult::Error));
+    }
+
+    #[test]
+    fn test_parse_empty_input() {
+        assert!(matches!(parse_check_result(b""), CheckResult::Error));
+    }
+
+    #[test]
+    fn test_parse_garbage() {
+        assert!(matches!(
+            parse_check_result(b"some random garbage"),
+            CheckResult::Error
+        ));
+    }
+
+    #[test]
+    fn test_parse_installed_missing_path() {
+        // INSTALLED 必须有版本号和路径两个字段。
+        assert!(matches!(
+            parse_check_result(b"INSTALLED|1.0.0"),
+            CheckResult::Error
+        ));
+    }
+
+    #[test]
+    fn test_parse_extra_pipes_in_path() {
+        // 路径中可能包含 `|`（虽然 Windows 路径不允许），splitn(3, '|') 不应拆分。
+        let result = parse_check_result(b"INSTALLED|2.0.0|C:\\A|B\\setup.exe");
+        match result {
+            CheckResult::InstalledReady(v, p) => {
+                assert_eq!(v, "2.0.0");
+                assert_eq!(p, "C:\\A|B\\setup.exe");
+            }
+            other => panic!("expected InstalledReady, got {other:?}"),
+        }
+    }
+
+    // ===== compute_sha256_hex known-answer =====
+
+    #[test]
+    fn test_sha256_known_answer() {
+        // "hello world" 的 SHA-256，由 shasum -a 256 确认。
+        let expected = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+        let hash = compute_sha256_hex(b"hello world").unwrap();
+        assert_eq!(hash, expected);
     }
 }
