@@ -29,6 +29,9 @@ static TIMES_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static P_FAST: AtomicI32 = AtomicI32::new(0);
 static P_SLOW: AtomicI32 = AtomicI32::new(0);
 static EMA_INITIALIZED: AtomicBool = AtomicBool::new(false);
+// EMA 初始化阶段：前 3 个样本取均值，避免启动时负载尖峰导致误报。
+static INIT_COUNT: AtomicU32 = AtomicU32::new(0);
+static INIT_SUM: AtomicI32 = AtomicI32::new(0);
 
 // 状态机驻留计数
 static DWELL: AtomicU32 = AtomicU32::new(0);
@@ -237,11 +240,23 @@ pub fn collect_thermal() {
     };
 
     // 5. 双 EMA（定点 Q8: alpha = N/256）
-    // 首次采样直接用 p_mw 初始化，避免从 0 爬升数分钟导致风险严重低估。
-    if !EMA_INITIALIZED.swap(true, Ordering::AcqRel) {
-        P_FAST.store(p_mw, Ordering::Relaxed);
-        P_SLOW.store(p_mw, Ordering::Relaxed);
-        THERMAL_RISK.store(f_p_to_risk(p_mw).clamp(0, 100) as u32, Ordering::Release);
+    // 前 3 个样本取均值再初始化，避免启动时的瞬时负载尖峰（如后台
+    // 编译 .NET 缓存、杀毒扫描）把慢 EMA（τ=90s）拉到极高值，
+    // 导致数分钟内持续误报过热。
+    if !EMA_INITIALIZED.load(Ordering::Relaxed) {
+        let count = INIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        INIT_SUM.fetch_add(p_mw, Ordering::Relaxed);
+        if count < 3 {
+            return;
+        }
+        let init_val = INIT_SUM.load(Ordering::Relaxed) / count as i32;
+        P_FAST.store(init_val, Ordering::Relaxed);
+        P_SLOW.store(init_val, Ordering::Relaxed);
+        EMA_INITIALIZED.store(true, Ordering::Release);
+        THERMAL_RISK.store(
+            f_p_to_risk(init_val).clamp(0, 100) as u32,
+            Ordering::Release,
+        );
         return;
     }
     let prev_fast = P_FAST.load(Ordering::Relaxed);
