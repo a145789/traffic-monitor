@@ -11,7 +11,7 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 > 修改代码时必须遵循以下既定设计决策，切勿违背：
 
 1. **窗口嵌入任务栏的顺序**
-   - **设计决策**：[src/main.rs](src/main.rs) 中的 `embed_in_taskbar` 必须严格按照以下 Win32 API 顺序调用：
+   - **设计决策**：[src/window.rs](src/window.rs) 中的 `embed_in_taskbar` 必须严格按照以下 Win32 API 顺序调用：
      1. `SetParent(hwnd, h_taskbar)`（此操作会剥离 `WS_EX_LAYERED` 样式）
      2. `SetWindowLongPtrW(GWL_STYLE, WS_CHILD | WS_VISIBLE)`（直接覆盖样式）
      3. `SetWindowLongPtrW(GWL_EXSTYLE, ... | WS_EX_LAYERED)`（重新应用分层样式）
@@ -25,6 +25,12 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 4. **更新检查 re-exec 子进程与 DLL 延迟加载**
    - **设计决策**：为避免 `winhttp.dll` / `bcrypt.dll` / `bcryptprimitives.dll`（及其连带依赖 `schannel` / `ncrypt` 等 TLS 栈）常驻主进程内存，[build.rs](build.rs) 通过 `/DELAYLOAD` 将这三个 DLL 移至延迟导入表；[src/update.rs](src/update.rs) 的更新检查逻辑改为 **re-exec 自身**（`traffic-monitor.exe --check-update`）在子进程中执行 HTTP 下载 + SHA-256 校验，结果通过 stdout 单行协议（`NO_UPDATE` / `PORTABLE|版本` / `INSTALLED|版本|路径` / `ERROR`）回传主进程。子进程退出后这些 DLL 随进程释放，主进程稳态零开销。
    - **隐式约束**：`--check-update` 参数拦截**必须在 [src/main.rs](src/main.rs) 的单例 Mutex 锁之前**执行，否则子进程会被当作重复实例直接退出。`/DELAYLOAD` 配置不可从 build.rs 中删除，否则 DLL 会回到标准导入表，re-exec 方案失去意义。
+5. **Explorer 重启与任务栏重建恢复机制**
+   - **设计决策**：当资源管理器（Explorer.exe）重启时，任务栏被销毁重建。小组件必须注册并拦截全局广播的 `TaskbarCreated` 消息，并在回调中调用 `invalidate_taskbar_cache()` 清理窗口句柄缓存，重新执行 `embed_in_taskbar` 重置嵌入关系，同时必须重新创建托盘图标（`create_tray_icon`）并重置监测定时器。遗漏此处理将导致 Explorer 重启后组件永久消失。
+6. **多显示器与 DPI 动态自适应 (WM_DPICHANGED)**
+   - **设计决策**：小组件窗口必须响应 `WM_DPICHANGED` 消息。在 DPI 变动时，除需要通知 `Renderer::update_dpi` 重新计算缩放字体外，**必须**重新执行 `embed_in_taskbar` 以根据最新 DPI 动态重置小组件窗口的物理宽高度和位置，否则会导致高分屏/跨屏移动时组件物理大小不合或排版截断。
+7. **挂起/全屏节能与定时器唤醒配对**
+   - **设计决策**：为确保后台低功耗常驻，小组件在休眠（`PBT_APMSUSPEND`）、锁屏（`WTS_SESSION_LOCK`）或当前显示器运行全屏应用时会执行 `suspend_system` 销毁监测定时器并冻结计算；在唤醒、解锁或退出全屏时通过 `resume_system` 恢复。任何针对监测周期的修改均必须保证“销毁”与“恢复”操作在逻辑上完全对称，否则会导致唤醒后组件数据永久冻结（卡死假活）。
 
 ---
 
@@ -63,14 +69,17 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 
 ---
 
-## 架构与职责 (9 个源文件)
+## 架构与职责 (12 个源文件)
 
 所有的具体常量数值（如像素宽、高、定时器间隔、颜色等）均统定义在 [src/config.rs](src/config.rs) 中。AI 在修改或读取时应直接查阅该文件，避免在其他模块中硬编码。
 
 | 文件                                 | 职责说明                                                                                                        |
 | :----------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
-| [src/main.rs](src/main.rs)           | 窗口创建、UI 消息循环、任务栏嵌入、窗口位置动态更新、系统挂起/恢复处理、单例 Mutex 锁。                         |
-| [src/config.rs](src/config.rs)       | 全局常量定义、窗口与字体基准大小、定时器 ID、共享多线程无锁原子变量（Atomic）定义。                             |
+| [src/main.rs](src/main.rs)           | 窗口创建、UI 消息循环、单例 Mutex 锁。                                                                          |
+| [src/config.rs](src/config.rs)       | 全局常量定义、窗口与字体基准大小、定时器 ID 等配置。                                                            |
+| [src/state.rs](src/state.rs)         | 共享多线程无锁原子变量（Atomic）定义与运行时全局状态。                                                          |
+| [src/window.rs](src/window.rs)       | 任务栏窗口查找、嵌入位置计算、任务栏嵌入以及窗口位置动态更新。                                                  |
+| [src/suspend.rs](src/suspend.rs)     | 系统挂起/恢复处理、全屏检测、Windows 主题（深浅色）变更检测。                                                   |
 | [src/collector.rs](src/collector.rs) | CPU 与内存采集、网卡接口过滤、单网卡锁定算法、网络断开与恢复消息发送。                                          |
 | [src/renderer.rs](src/renderer.rs)   | GDI 双缓冲绘制（位图缓存 `hdc_mem` -> 窗口 `hdc`）、字体、DPI 缩放、文字排版与对齐。                            |
 | [src/tray.rs](src/tray.rs)           | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                                                |

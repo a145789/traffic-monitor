@@ -87,6 +87,25 @@ struct SystemBatteryState {
 // 编译期布局断言：防止未来字段调整意外破坏与 Windows SDK 的对齐。
 const _: () = assert!(std::mem::size_of::<SystemBatteryState>() == 32);
 
+/// Windows PROCESSOR_INFORMATION 结构体的 Rust 镜像。
+///
+/// `CallNtPowerInformation(ProcessorInformation, level=11)` 返回此结构的数组，
+/// 每个元素对应一个逻辑处理器，包含其当前频率（CurrentMhz）和最大频率（MaxMhz）。
+///
+/// 字段按 Windows SDK 布局（6 × ULONG = 24 bytes），4 字节自然对齐。
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct ProcessorInformation {
+    number: u32,
+    max_mhz: u32,
+    current_mhz: u32,
+    mhz_limit: u32,
+    max_idle_state: u32,
+    current_idle_state: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<ProcessorInformation>() == 24);
+
 /// 读取电池状态。返回 (AC在线, 正在放电, 放电功率_mW)。
 ///
 /// 传感器不可用或插电时返回 (true, false, 0)，调用方走插电推断路径。
@@ -118,6 +137,68 @@ fn read_battery() -> (bool, bool, i32) {
     let discharging = s.discharging != 0 && s.rate < 0;
     let mw = if discharging { -s.rate } else { 0 };
     (ac, discharging, mw)
+}
+
+/// 读取所有逻辑处理器的当前频率与最大频率，返回 Q8 定点频率比。
+///
+/// `ratio_q8 = ΣCurrentMhz / ΣMaxMhz × 256`，范围 \[1, 256\]。
+///
+/// 用于动态缩放插电路径的 `A_CPU_MW_PER_PCT`，使热模型自动适应：
+/// - 电源方案切换（静谧模式频率被 cap → ratio 下降 → CPU 功耗系数降低）
+/// - 过热降频（thermal throttling → ratio 下降 → 模型跟踪功耗变化）
+/// - 不同 CPU 型号（i3/i7/i9 的 MaxMhz 不同 → ratio 归一化）
+///
+/// 传感器不可用或 sum_max 为 0 时返回 256（即 ratio=1.0，退化为原始静态系数）。
+fn read_cpu_freq_ratio_q8() -> u32 {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let elem_size = std::mem::size_of::<ProcessorInformation>();
+    let buf_size = num_cpus * elem_size;
+    let mut buf: Vec<u8> = vec![0u8; buf_size];
+
+    // SAFETY:
+    // 1. InformationLevel=11 (ProcessorInformation) 只读不写输入，传入 null/0 安全。
+    // 2. buf 已分配 num_cpus × sizeof(ProcessorInformation) 字节，大小正确。
+    // 3. ProcessorInformation 为 repr(C)，与 Windows SDK 逐字段对齐（24 bytes）。
+    let status = unsafe {
+        CallNtPowerInformation(
+            11, // ProcessorInformation
+            std::ptr::null(),
+            0,
+            buf.as_mut_ptr(),
+            buf_size as u32,
+        )
+    };
+
+    if status != 0 {
+        return 256;
+    }
+
+    // SAFETY: buf 是 u8 Vec，转为 ProcessorInformation 切片需满足对齐要求。
+    // Vec<u8> 分配对齐于平台默认对齐（16），ProcessorInformation 的对齐为 4，
+    // 此处对齐满足要求。内存由 buf 独占，函数结束前 buf 不会被 drop。
+    let processors = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr() as *const ProcessorInformation, num_cpus)
+    };
+
+    let mut sum_current: u64 = 0;
+    let mut sum_max: u64 = 0;
+    for p in processors {
+        // 跳过未填充的槽位（number 为 0 且频率为 0 表示此槽位无效）。
+        if p.number == 0 && p.current_mhz == 0 && p.max_mhz == 0 {
+            continue;
+        }
+        sum_current += p.current_mhz as u64;
+        sum_max += p.max_mhz as u64;
+    }
+
+    if sum_max == 0 {
+        return 256;
+    }
+
+    ((sum_current << 8) / sum_max).clamp(1, 256) as u32
 }
 
 /// 功率→风险分段线性映射 f(P)。
@@ -234,9 +315,13 @@ pub fn collect_thermal() {
         batt_mw
     } else {
         // 插电或传感器失败：多信号推断
+        // CPU 功耗系数按频率比动态缩放，自动适配电源方案切换、过热降频、
+        // 不同 CPU 型号等场景。ratio_q8 为 Q8 定点，(0, 256]。
+        let freq_ratio_q8 = read_cpu_freq_ratio_q8() as i32;
+        let a_dynamic = A_CPU_MW_PER_PCT * freq_ratio_q8 / 256;
         let ku_heavy = cpu > KERNEL_GATE_CPU_PCT && ku_q8 > KU_HEAVY_THRESHOLD_Q8;
         let k = if ku_heavy { C_KERNEL_HEAVY_MW } else { 0 };
-        P_IDLE_PLUG_MW + cpu * A_CPU_MW_PER_PCT + mem * B_MEM_MW_PER_PCT + k
+        P_IDLE_PLUG_MW + cpu * a_dynamic + mem * B_MEM_MW_PER_PCT + k
     };
 
     // 5. 双 EMA（定点 Q8: alpha = N/256）
