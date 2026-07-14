@@ -36,20 +36,9 @@ static INIT_SUM: AtomicI32 = AtomicI32::new(0);
 // 状态机驻留计数
 static DWELL: AtomicU32 = AtomicU32::new(0);
 
-const SYS_BATT_STATE_LEVEL: u32 = 5;
-
-// 使用 powrprof.dll 的 CallNtPowerInformation 而非 kernel32 的 GetSystemPowerStatus，
-// 因为后者不提供放电功率（mW），只有剩余电量百分比。
-#[link(name = "powrprof")]
-unsafe extern "system" {
-    fn CallNtPowerInformation(
-        level: u32,
-        in_buf: *const u8,
-        in_len: u32,
-        out_buf: *mut u8,
-        out_len: u32,
-    ) -> i32;
-}
+use windows::Win32::System::Power::{
+    CallNtPowerInformation, ProcessorInformation, SystemBatteryState,
+};
 
 /// Windows SYSTEM_BATTERY_STATE 结构体的 Rust 镜像。
 ///
@@ -115,21 +104,21 @@ fn read_battery() -> (bool, bool, i32) {
 
     // SAFETY:
     // 1. &mut s 是栈上合法的 SystemBatteryState 结构体，size 与其大小一致。
-    // 2. InformationLevel=5 (SystemBatteryState) 只读不写输入，传入 null/0 安全。
+    // 2. InformationLevel=SystemBatteryState 只读不写输入，传入 None 安全。
     // 3. CallNtPowerInformation 成功时填充 OutputBuffer，失败时不修改缓冲区（保持 Default）。
     // 4. 结构体为 repr(C)，与 Windows SYSTEM_BATTERY_STATE 逐字段对齐（32 bytes）。
     //    编译期断言 const _ below 保证布局变更时立即报错。
     let status = unsafe {
         CallNtPowerInformation(
-            SYS_BATT_STATE_LEVEL,
-            std::ptr::null(),
+            SystemBatteryState,
+            None,
             0,
-            &mut s as *mut _ as *mut u8,
+            Some(&mut s as *mut SystemBatteryState as *mut ::core::ffi::c_void),
             size,
         )
     };
 
-    if status != 0 || s.battery_present == 0 {
+    if status.0 != 0 || s.battery_present == 0 {
         return (true, false, 0);
     }
 
@@ -159,20 +148,20 @@ fn read_cpu_freq_ratio_q8() -> u32 {
     let mut buf: Vec<u8> = vec![0u8; buf_size];
 
     // SAFETY:
-    // 1. InformationLevel=11 (ProcessorInformation) 只读不写输入，传入 null/0 安全。
+    // 1. InformationLevel=ProcessorInformation 只读不写输入，传入 None 安全。
     // 2. buf 已分配 num_cpus × sizeof(ProcessorInformation) 字节，大小正确。
     // 3. ProcessorInformation 为 repr(C)，与 Windows SDK 逐字段对齐（24 bytes）。
     let status = unsafe {
         CallNtPowerInformation(
-            11, // ProcessorInformation
-            std::ptr::null(),
+            ProcessorInformation,
+            None,
             0,
-            buf.as_mut_ptr(),
+            Some(buf.as_mut_ptr() as *mut ::core::ffi::c_void),
             buf_size as u32,
         )
     };
 
-    if status != 0 {
+    if status.0 != 0 {
         return 256;
     }
 
@@ -481,5 +470,14 @@ mod tests {
         // COOL 态低风险保持不动
         assert_eq!(next_state(0, 10, 100), 0);
         assert_eq!(next_state(0, 24, 100), 0);
+    }
+
+    #[test]
+    fn test_real_battery_read() {
+        let (ac, discharging, mw) = read_battery();
+        println!("Real Battery Status:");
+        println!("  AC Online  : {}", ac);
+        println!("  Discharging: {}", discharging);
+        println!("  Power (mW) : {}", mw);
     }
 }

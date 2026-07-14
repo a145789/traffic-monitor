@@ -6,7 +6,6 @@ use windows::Win32::Graphics::Gdi::{
     FONT_QUALITY, FillRect, GetTextExtentPoint32W, GetWindowDC, HBITMAP, HBRUSH, HDC, HFONT,
     HGDIOBJ, LOGFONTW, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::config::{
     COLOR_CRIT_TEXT, COLOR_DARK_TEXT, COLOR_HOT_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT,
@@ -404,7 +403,6 @@ fn create_font(size: i32) -> HFONT {
 
 pub fn is_system_light_theme() -> bool {
     reg_read_dword(
-        HKEY_CURRENT_USER,
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
         "SystemUsesLightTheme",
     )

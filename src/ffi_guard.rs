@@ -11,23 +11,6 @@ impl Drop for MutexGuard {
     }
 }
 
-pub struct RegKey(windows::Win32::System::Registry::HKEY);
-
-impl RegKey {
-    pub fn new(handle: windows::Win32::System::Registry::HKEY) -> Self {
-        Self(handle)
-    }
-}
-
-impl Drop for RegKey {
-    fn drop(&mut self) {
-        // SAFETY: self.0 是由 RegOpenKeyExW 成功打开的有效注册表句柄，在析构时安全关闭。
-        unsafe {
-            let _ = windows::Win32::System::Registry::RegCloseKey(self.0);
-        }
-    }
-}
-
 pub struct MenuGuard(pub windows::Win32::UI::WindowsAndMessaging::HMENU);
 
 impl Drop for MenuGuard {

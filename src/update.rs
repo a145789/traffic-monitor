@@ -5,7 +5,6 @@ use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::Security::Cryptography::*;
-use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_YESNO, MessageBoxW, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
@@ -383,18 +382,13 @@ pub fn is_installed_version() -> bool {
 }
 
 pub fn load_auto_update_enabled() -> bool {
-    reg_read_dword(
-        HKEY_CURRENT_USER,
-        "Software\\Traffic Monitor",
-        "EnableAutoUpdate",
-    )
-    .map(|v| v != 0)
-    .unwrap_or(true)
+    reg_read_dword("Software\\Traffic Monitor", "EnableAutoUpdate")
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
 
 pub fn save_auto_update_enabled(enabled: bool) {
     reg_write_dword(
-        HKEY_CURRENT_USER,
         "Software\\Traffic Monitor",
         "EnableAutoUpdate",
         if enabled { 1 } else { 0 },

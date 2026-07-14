@@ -16,7 +16,7 @@ use crate::config::{
     APP_NAME, DISPLAY_HEIGHT, DISPLAY_WIDTH, MENU_ID_AUTO_UPDATE_TOGGLE,
     MENU_ID_CHECK_UPDATE_MANUAL, WINDOW_CLASS, WINDOW_TITLE,
 };
-use crate::ffi_guard::{MenuGuard, RegKey};
+use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use std::cell::RefCell;
 
@@ -297,103 +297,22 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
 }
 
 fn is_autostart_enabled() -> bool {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
-    };
-
-    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
-        .encode_utf16()
-        .collect();
-    let value_name: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut hkey = Default::default();
-
-    // SAFETY: key_path 以 NUL 结尾，hkey 在栈上分配，成功后由 RegKey 管理。
-    let open_ok = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
+    windows_registry::CURRENT_USER
+        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .and_then(|key| key.get_string(APP_NAME))
         .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = RegKey::new(hkey);
-        let mut buf = [0u8; 512];
-        let mut buf_size = buf.len() as u32;
-
-        // SAFETY: hkey 有效，buf 容量 512 足够。
-        let result = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(value_name.as_ptr()),
-                None,
-                None,
-                Some(buf.as_mut_ptr()),
-                Some(&mut buf_size),
-            )
-        };
-        result.is_ok()
-    } else {
-        false
-    }
 }
 
 fn toggle_autostart() {
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
-    };
-
-    let key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
-        .encode_utf16()
-        .collect();
-    let value_name: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut hkey = Default::default();
-
-    // SAFETY: key_path 以 NUL 结尾，hkey 在栈上分配，成功后由 RegKey 管理。
-    let open_ok = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_path.as_ptr()),
-            Some(0),
-            KEY_WRITE,
-            &mut hkey,
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = RegKey::new(hkey);
+    if let Ok(key) =
+        windows_registry::CURRENT_USER.create("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+    {
         if is_autostart_enabled() {
-            // SAFETY: hkey 有效，删除自启动项值。
-            unsafe {
-                let _ = RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr())).ok();
-            }
-        } else {
-            let exe_path = std::env::current_exe().unwrap();
+            let _ = key.remove_value(APP_NAME);
+        } else if let Ok(exe_path) = std::env::current_exe() {
             let path_str = exe_path.to_string_lossy().to_string();
             let path_quoted = format!("\"{}\"", path_str);
-            let path_wide: Vec<u16> = path_quoted
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-
-            // SAFETY: hkey 有效，path_wide 以 NUL 结尾，数据长度正确。
-            unsafe {
-                let _ = RegSetValueExW(
-                    hkey,
-                    PCWSTR(value_name.as_ptr()),
-                    Some(0),
-                    REG_SZ,
-                    Some(std::slice::from_raw_parts(
-                        path_wide.as_ptr() as *const u8,
-                        path_wide.len() * 2,
-                    )),
-                )
-                .ok();
-            }
+            let _ = key.set_string(APP_NAME, &path_quoted);
         }
     }
 }

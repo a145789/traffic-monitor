@@ -1,11 +1,8 @@
-use windows::Win32::System::Registry::{
-    HKEY, KEY_READ, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, RegCreateKeyExW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW,
 };
 use windows::core::PCWSTR;
+use windows_registry::CURRENT_USER;
 
 pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -37,91 +34,18 @@ pub fn show_info(msg: &str) {
     }
 }
 
-pub fn reg_read_dword(hkey_root: HKEY, subkey: &str, value_name: &str) -> Option<u32> {
-    let key_path = to_wide(subkey);
-    let val_name = to_wide(value_name);
-    let mut hkey = Default::default();
-
-    // SAFETY: key_path 以 NUL 结尾，hkey 为栈上变量，成功后由 RegKey RAII 守卫接管释放。
-    let open_ok = unsafe {
-        RegOpenKeyExW(
-            hkey_root,
-            PCWSTR(key_path.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = crate::ffi_guard::RegKey::new(hkey);
-        let mut dword: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-
-        // SAFETY: hkey 有效（生命周期由 _key_guard 保护），val_name 以 NUL 结尾，
-        // dword 和 size 为栈变量，size 与缓冲区大小匹配。
-        let result = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(val_name.as_ptr()),
-                None,
-                None,
-                Some(&mut dword as *mut u32 as *mut u8),
-                Some(&mut size),
-            )
-        };
-        if result.is_ok() {
-            return Some(dword);
-        }
-    }
-
-    None
+pub fn reg_read_dword(subkey: &str, value_name: &str) -> Option<u32> {
+    CURRENT_USER
+        .open(subkey)
+        .and_then(|key| key.get_u32(value_name))
+        .ok()
 }
 
-pub fn reg_write_dword(hkey_root: HKEY, subkey: &str, value_name: &str, value: u32) -> bool {
-    let key_path = to_wide(subkey);
-    let val_name = to_wide(value_name);
-    let mut hkey = Default::default();
-    let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
-
-    // SAFETY: key_path 以 NUL 结尾，hkey 和 disposition 为栈上变量，
-    // 成功后句柄由 RegKey RAII 守卫接管释放。
-    let open_ok = unsafe {
-        RegCreateKeyExW(
-            hkey_root,
-            PCWSTR(key_path.as_ptr()),
-            None,
-            None,
-            Default::default(),
-            KEY_WRITE,
-            None,
-            &mut hkey,
-            Some(&mut disposition),
-        )
+pub fn reg_write_dword(subkey: &str, value_name: &str, value: u32) -> bool {
+    CURRENT_USER
+        .create(subkey)
+        .and_then(|key| key.set_u32(value_name, value))
         .is_ok()
-    };
-
-    if open_ok {
-        let _key_guard = crate::ffi_guard::RegKey::new(hkey);
-        // SAFETY: hkey 有效（生命周期由 _key_guard 保护），val_name 以 NUL 结尾，
-        // from_raw_parts 将 &u32 转换为合法字节切片，长度正确。
-        unsafe {
-            RegSetValueExW(
-                hkey,
-                PCWSTR(val_name.as_ptr()),
-                Some(0),
-                REG_DWORD,
-                Some(std::slice::from_raw_parts(
-                    &value as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )),
-            )
-            .is_ok()
-        }
-    } else {
-        false
-    }
 }
 
 #[cfg(test)]
