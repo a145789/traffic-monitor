@@ -2,7 +2,9 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
-use windows::Win32::Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_CANCELLED, GetLastError, HWND, LPARAM, WPARAM,
+};
 use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::Security::Cryptography::*;
 use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
@@ -39,6 +41,7 @@ const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 static LAST_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 static LATEST_VERSION: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static TEMP_FILE_PATH: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+static UPDATE_ERROR_MESSAGE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 
 struct WinHttpHandles {
     h_request: *mut std::ffi::c_void,
@@ -90,6 +93,31 @@ fn check_status(status: i32, fn_name: &str) -> Result<(), String> {
     }
 }
 
+fn win32_code_from_hresult(code: u32) -> Option<u32> {
+    const FACILITY_WIN32_HRESULT_PREFIX: u32 = 0x8007_0000;
+    (code & 0xFFFF_0000 == FACILITY_WIN32_HRESULT_PREFIX).then_some(code & 0xFFFF)
+}
+
+fn friendly_error(op: &str, err: windows::core::Error) -> String {
+    let hresult = err.code().0 as u32;
+    let detail = match win32_code_from_hresult(hresult) {
+        Some(ERROR_WINHTTP_TIMEOUT) => "连接超时 (ERROR_WINHTTP_TIMEOUT)".to_string(),
+        Some(ERROR_WINHTTP_NAME_NOT_RESOLVED) => {
+            "域名解析失败 (ERROR_WINHTTP_NAME_NOT_RESOLVED)".to_string()
+        }
+        Some(ERROR_WINHTTP_CANNOT_CONNECT) => {
+            "无法连接到服务器 (ERROR_WINHTTP_CANNOT_CONNECT)".to_string()
+        }
+        Some(ERROR_WINHTTP_CONNECTION_ERROR) => {
+            "连接异常终止 (ERROR_WINHTTP_CONNECTION_ERROR)".to_string()
+        }
+        Some(ERROR_WINHTTP_SECURE_FAILURE) => "安全连接失败 (SSL/TLS 证书校验失败)".to_string(),
+        Some(code) if code == ERROR_ACCESS_DENIED.0 => "拒绝访问 (ACCESS_DENIED)".to_string(),
+        _ => format!("系统错误码: 0x{hresult:08X}"),
+    };
+    format!("{op}失败: {detail}")
+}
+
 fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
     let agent = to_wide("Traffic Monitor");
     let host_wide = to_wide(host);
@@ -109,21 +137,24 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
     handles.h_session = unsafe {
         WinHttpOpen(
             Some(&PCWSTR(agent.as_ptr())),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             None,
             None,
             0,
         )
     };
     if handles.h_session.is_null() {
-        return Err("WinHttpOpen returned null".to_string());
+        return Err(friendly_error(
+            "初始化网络库",
+            windows::core::Error::from_thread(),
+        ));
     }
 
     // SAFETY:
     // handles.h_session 是 WinHttpOpen 返回的有效 HINTERNET。
     // 所有超时值均为正 i32 毫秒数。
     unsafe {
-        let _ = WinHttpSetTimeouts(handles.h_session, 10000, 10000, 10000, 10000);
+        let _ = WinHttpSetTimeouts(handles.h_session, 15000, 15000, 15000, 15000);
     }
 
     let port = if secure {
@@ -138,7 +169,10 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
     handles.h_connect =
         unsafe { WinHttpConnect(handles.h_session, PCWSTR(host_wide.as_ptr()), port, 0) };
     if handles.h_connect.is_null() {
-        return Err("WinHttpConnect returned null".to_string());
+        return Err(friendly_error(
+            "建立网络连接",
+            windows::core::Error::from_thread(),
+        ));
     }
 
     // SAFETY:
@@ -162,7 +196,10 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
         )
     };
     if handles.h_request.is_null() {
-        return Err("WinHttpOpenRequest returned null".to_string());
+        return Err(friendly_error(
+            "创建网络请求",
+            windows::core::Error::from_thread(),
+        ));
     }
 
     // SAFETY:
@@ -170,14 +207,14 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
     // GET 请求无附加缓冲区（lpOptional 为 null，dwOptionalLength 为 0）。
     unsafe {
         WinHttpSendRequest(handles.h_request, None, Some(std::ptr::null()), 0, 0, 0)
-            .map_err(|e| format!("WinHttpSendRequest failed: {e:?}"))?;
+            .map_err(|e| friendly_error("发送网络请求", e))?;
     }
 
     // SAFETY:
     // handles.h_request 有效；lpBuffersReceived 为 null（由 API 内部分配）。
     unsafe {
         WinHttpReceiveResponse(handles.h_request, std::ptr::null_mut())
-            .map_err(|e| format!("WinHttpReceiveResponse failed: {e:?}"))?;
+            .map_err(|e| friendly_error("接收网络响应", e))?;
     }
 
     let mut status_code: u32 = 0;
@@ -197,11 +234,11 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
             &mut status_code_size,
             std::ptr::null_mut(),
         )
-        .map_err(|e| format!("WinHttpQueryHeaders failed: {e:?}"))?;
+        .map_err(|e| friendly_error("获取响应状态码", e))?;
     }
 
     if status_code != HTTP_OK {
-        return Err(format!("HTTP status: {status_code}"));
+        return Err(format!("HTTP 状态码错误: {status_code}"));
     }
 
     let mut response = Vec::new();
@@ -213,7 +250,7 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
         // &mut available 是有效的 u32 输出参数。
         unsafe {
             WinHttpQueryDataAvailable(handles.h_request, &mut available)
-                .map_err(|e| format!("WinHttpQueryDataAvailable failed: {e:?}"))?;
+                .map_err(|e| friendly_error("查询响应数据大小", e))?;
         }
 
         if available == 0 {
@@ -234,7 +271,7 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
                 available,
                 &mut read,
             )
-            .map_err(|e| format!("WinHttpReadData failed: {e:?}"))?;
+            .map_err(|e| friendly_error("读取响应数据", e))?;
         }
 
         if read == 0 {
@@ -458,7 +495,7 @@ pub fn start_manual_check(hwnd: HWND) {
 
 fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
     let result = run_check_subprocess();
-    let is_error = matches!(result, CheckResult::Error);
+    let is_error = matches!(result, CheckResult::Error(_));
 
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
@@ -481,7 +518,8 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
             post_update_status(hwnd, UPDATE_STATUS_INSTALLED_READY);
             posted = true;
         }
-        CheckResult::Error => {
+        CheckResult::Error(msg) => {
+            *UPDATE_ERROR_MESSAGE.lock().unwrap() = msg;
             if is_manual {
                 post_update_status(hwnd, UPDATE_STATUS_ERROR);
                 posted = true;
@@ -515,25 +553,30 @@ enum CheckResult {
     NoUpdate,
     PortableFound(String),
     InstalledReady(String, String),
-    Error,
+    Error(String),
 }
 
 fn do_update_check() -> CheckResult {
-    let response = fetch_url(VERSION_HOST, VERSION_PATH, true).ok();
+    let mut response = fetch_url(VERSION_HOST, VERSION_PATH, true);
+    if response.is_err() {
+        // 失败时增加 1 次重试，并等待 500ms 防止抖动
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        response = fetch_url(VERSION_HOST, VERSION_PATH, true);
+    }
 
     let response = match response {
-        Some(data) => data,
-        None => return CheckResult::Error,
+        Ok(data) => data,
+        Err(e) => return CheckResult::Error(format!("获取版本文件失败: {e}")),
     };
 
     let text = match String::from_utf8(response) {
         Ok(t) => t,
-        Err(_) => return CheckResult::Error,
+        Err(_) => return CheckResult::Error("版本文件编码不是 UTF-8".to_string()),
     };
 
     let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
     if lines.len() < 2 {
-        return CheckResult::Error;
+        return CheckResult::Error("版本文件格式不正确 (不足两行)".to_string());
     }
 
     let latest_version = lines[0].to_string();
@@ -567,31 +610,44 @@ fn do_update_check() -> CheckResult {
         }
     }
 
-    let mut installer_data = fetch_url(DOWNLOAD_HOST, &download_path, true).ok();
+    let mut installer_data = fetch_url(DOWNLOAD_HOST, &download_path, true);
+    let mut err_msg = None;
 
-    if installer_data.is_none() {
+    if let Err(e) = installer_data {
+        err_msg = Some(format!("从主源下载失败: {e}"));
         let proxy_path = format!(
             "/{GITHUB_BASE}/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
         );
-        if let Ok(data) = fetch_url(PROXY_HOST, &proxy_path, true) {
-            installer_data = Some(data);
+        match fetch_url(PROXY_HOST, &proxy_path, true) {
+            Ok(data) => {
+                installer_data = Ok(data);
+            }
+            Err(pe) => {
+                err_msg = Some(format!("主源失败({e}), 代理源失败({pe})"));
+                installer_data = Err(pe);
+            }
         }
     }
 
     let installer_data = match installer_data {
-        Some(data) => data,
-        None => return CheckResult::Error,
+        Ok(data) => data,
+        Err(_) => {
+            return CheckResult::Error(err_msg.unwrap_or_else(|| "下载安装包失败".to_string()));
+        }
     };
 
     let actual_hash_hex = match compute_sha256_hex(&installer_data) {
         Ok(h) => h,
-        Err(_) => {
-            return CheckResult::Error;
+        Err(e) => {
+            return CheckResult::Error(format!("计算安装包哈希失败: {e}"));
         }
     };
 
     if actual_hash_hex.to_uppercase() != expected_hash_hex {
-        return CheckResult::Error;
+        return CheckResult::Error(format!(
+            "安装包校验失败 (预期: {}, 实际: {})",
+            expected_hash_hex, actual_hash_hex
+        ));
     }
 
     if std::fs::write(&temp_path, &installer_data).is_err() {
@@ -599,10 +655,10 @@ fn do_update_check() -> CheckResult {
         if let Some(parent) = temp_path.parent() {
             let _ = std::fs::create_dir_all(parent);
             if std::fs::write(&temp_path, &installer_data).is_err() {
-                return CheckResult::Error;
+                return CheckResult::Error("保存安装包文件失败".to_string());
             }
         } else {
-            return CheckResult::Error;
+            return CheckResult::Error("保存安装包文件失败 (无法获取父目录)".to_string());
         }
     }
 
@@ -615,7 +671,7 @@ fn do_update_check() -> CheckResult {
 /// - `NO_UPDATE`
 /// - `PORTABLE|<version>`
 /// - `INSTALLED|<version>|<path>`
-/// - `ERROR`
+/// - `ERROR|<reason>`
 ///
 /// 退出码：0 = 成功（含 NoUpdate），1 = Error。
 pub fn subprocess_main() -> i32 {
@@ -624,11 +680,14 @@ pub fn subprocess_main() -> i32 {
         CheckResult::NoUpdate => "NO_UPDATE".to_string(),
         CheckResult::PortableFound(v) => format!("PORTABLE|{v}"),
         CheckResult::InstalledReady(v, p) => format!("INSTALLED|{v}|{p}"),
-        CheckResult::Error => "ERROR".to_string(),
+        CheckResult::Error(msg) => {
+            let single_line_msg = msg.replace(['\r', '\n'], " ");
+            format!("ERROR|{single_line_msg}")
+        }
     };
     let _ = std::io::stdout().write_all(line.as_bytes());
     let _ = std::io::stdout().flush();
-    if matches!(result, CheckResult::Error) {
+    if matches!(result, CheckResult::Error(_)) {
         1
     } else {
         0
@@ -642,7 +701,7 @@ pub fn subprocess_main() -> i32 {
 fn run_check_subprocess() -> CheckResult {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(_) => return CheckResult::Error,
+        Err(_) => return CheckResult::Error("无法获取当前程序路径".to_string()),
     };
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -652,37 +711,58 @@ fn run_check_subprocess() -> CheckResult {
         .output()
     {
         Ok(o) => o,
-        Err(_) => return CheckResult::Error,
+        Err(e) => return CheckResult::Error(format!("无法启动更新子进程: {e}")),
     };
-    if !output.status.success() {
-        return CheckResult::Error;
+    let parsed = parse_check_result(&output.stdout);
+    match parsed {
+        CheckResult::Error(msg) => {
+            if msg == "未知错误" && !output.status.success() {
+                CheckResult::Error("检查更新子进程异常退出".to_string())
+            } else {
+                CheckResult::Error(msg)
+            }
+        }
+        other => other,
     }
-    parse_check_result(&output.stdout)
 }
 
 fn parse_check_result(stdout: &[u8]) -> CheckResult {
     let text = match std::str::from_utf8(stdout) {
         Ok(s) => s.trim(),
-        Err(_) => return CheckResult::Error,
+        Err(_) => return CheckResult::Error("无法解析子进程输出编码".to_string()),
     };
     if text.is_empty() {
-        return CheckResult::Error;
+        return CheckResult::Error("子进程未返回任何数据".to_string());
     }
-    let mut parts = text.splitn(3, '|');
-    match parts.next() {
-        Some("NO_UPDATE") => CheckResult::NoUpdate,
-        Some("PORTABLE") => match parts.next() {
-            Some(v) if !v.is_empty() => CheckResult::PortableFound(v.to_string()),
-            _ => CheckResult::Error,
-        },
-        Some("INSTALLED") => match (parts.next(), parts.next()) {
-            (Some(v), Some(p)) if !v.is_empty() && !p.is_empty() => {
-                CheckResult::InstalledReady(v.to_string(), p.to_string())
+    if text == "NO_UPDATE" {
+        return CheckResult::NoUpdate;
+    }
+    if let Some(version) = text.strip_prefix("PORTABLE|") {
+        return if version.is_empty() {
+            CheckResult::Error("更新结果解析错误 (PORTABLE 无版本号)".to_string())
+        } else {
+            CheckResult::PortableFound(version.to_string())
+        };
+    }
+    if let Some(payload) = text.strip_prefix("INSTALLED|") {
+        return match payload.split_once('|') {
+            Some((version, path)) if !version.is_empty() && !path.is_empty() => {
+                CheckResult::InstalledReady(version.to_string(), path.to_string())
             }
-            _ => CheckResult::Error,
-        },
-        _ => CheckResult::Error,
+            _ => CheckResult::Error("更新结果解析错误 (INSTALLED 无版本或路径)".to_string()),
+        };
     }
+    if text == "ERROR" {
+        return CheckResult::Error("未知网络或内部错误".to_string());
+    }
+    if let Some(message) = text.strip_prefix("ERROR|") {
+        return if message.is_empty() {
+            CheckResult::Error("未知网络或内部错误".to_string())
+        } else {
+            CheckResult::Error(message.to_string())
+        };
+    }
+    CheckResult::Error("未知错误".to_string())
 }
 
 fn post_update_status(hwnd: HWND, status: usize) {
@@ -714,7 +794,13 @@ pub fn handle_update_ready(hwnd: HWND, status: usize) {
             }
         }
         UPDATE_STATUS_ERROR => {
-            show_error("检查更新失败，请检查网络连接。");
+            let error_msg = UPDATE_ERROR_MESSAGE.lock().unwrap().clone();
+            let show_msg = if error_msg.is_empty() {
+                "检查更新失败，请检查网络连接。".to_string()
+            } else {
+                format!("检查更新失败: {error_msg}")
+            };
+            show_error(&show_msg);
         }
         _ => {}
     }
@@ -874,20 +960,46 @@ mod tests {
 
     #[test]
     fn test_parse_error() {
-        let result = parse_check_result(b"ERROR");
-        assert!(matches!(result, CheckResult::Error));
+        let result = parse_check_result(b"ERROR|network error|proxy error");
+        match result {
+            CheckResult::Error(msg) => assert_eq!(msg, "network error|proxy error"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        for input in [b"ERROR".as_slice(), b"ERROR|".as_slice()] {
+            match parse_check_result(input) {
+                CheckResult::Error(msg) => assert_eq!(msg, "未知网络或内部错误"),
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_winhttp_error_code_mapping() {
+        let cannot_connect = 0x8007_0000 | ERROR_WINHTTP_CANNOT_CONNECT;
+        let connection_error = 0x8007_0000 | ERROR_WINHTTP_CONNECTION_ERROR;
+
+        assert_eq!(
+            win32_code_from_hresult(cannot_connect),
+            Some(ERROR_WINHTTP_CANNOT_CONNECT)
+        );
+        assert_eq!(
+            win32_code_from_hresult(connection_error),
+            Some(ERROR_WINHTTP_CONNECTION_ERROR)
+        );
+        assert_eq!(win32_code_from_hresult(0x8000_4005), None);
     }
 
     #[test]
     fn test_parse_empty_input() {
-        assert!(matches!(parse_check_result(b""), CheckResult::Error));
+        assert!(matches!(parse_check_result(b""), CheckResult::Error(_)));
     }
 
     #[test]
     fn test_parse_garbage() {
         assert!(matches!(
             parse_check_result(b"some random garbage"),
-            CheckResult::Error
+            CheckResult::Error(_)
         ));
     }
 
@@ -896,7 +1008,7 @@ mod tests {
         // INSTALLED 必须有版本号和路径两个字段。
         assert!(matches!(
             parse_check_result(b"INSTALLED|1.0.0"),
-            CheckResult::Error
+            CheckResult::Error(_)
         ));
     }
 
