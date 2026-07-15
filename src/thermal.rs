@@ -437,13 +437,12 @@ mod tests {
     #[test]
     fn test_state_machine_upgrade_with_dwell() {
         // dwell 不够时不升级
-        assert_eq!(next_state(0, 30, 5), 0);
-        assert_eq!(next_state(0, 30, 9), 0);
+        assert_eq!(next_state(0, 30, ST_DWELL_SECS - 1), 0);
         // dwell 达标后升级
-        assert_eq!(next_state(0, 25, 10), 1);
-        assert_eq!(next_state(0, 99, 10), 1);
-        assert_eq!(next_state(1, 55, 10), 2);
-        assert_eq!(next_state(2, 85, 10), 3);
+        assert_eq!(next_state(0, 25, ST_DWELL_SECS), 1);
+        assert_eq!(next_state(0, 99, ST_DWELL_SECS), 1);
+        assert_eq!(next_state(1, 55, ST_DWELL_SECS), 2);
+        assert_eq!(next_state(2, 85, ST_DWELL_SECS), 3);
     }
 
     #[test]
