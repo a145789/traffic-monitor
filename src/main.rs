@@ -36,7 +36,7 @@ use windows::core::w;
 
 use crate::collector::{
     WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, collect_cpu, collect_memory,
-    collect_network, init_network_listener, trim_working_set,
+    collect_network, compact_and_trim, init_network_listener, trim_working_set,
 };
 use crate::config::{
     CPU_MEM_INTERVAL, LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
@@ -467,6 +467,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_USER_UPDATE_READY => {
             let status = wparam.0;
             crate::update::handle_update_ready(hwnd, status);
+            compact_and_trim();
             LRESULT(0)
         }
 

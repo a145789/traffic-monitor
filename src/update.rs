@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use crate::collector::compact_and_trim;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{reg_read_dword, reg_write_dword, show_error, show_info, to_wide};
@@ -505,6 +506,7 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
 
     if !posted {
         UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+        compact_and_trim();
     }
 }
 

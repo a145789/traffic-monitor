@@ -9,6 +9,7 @@ use windows::Win32::NetworkManagement::IpHelper::{
     IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
@@ -457,8 +458,31 @@ fn get_virtual_blacklist() -> Rc<HashSet<u64>> {
 pub fn trim_working_set() {
     // SAFETY:
     // 1. GetCurrentProcess() 返回当前进程的伪句柄，它是安全的特殊常量句柄，不需要关闭且在当前进程内有效。
-    // 2. 将 (usize::MAX, usize::MAX) 传给 SetProcessWorkingSetSize 是系统约定的资源清理命令，旨在临时将进程工作集内存刷回磁盘，属于纯系统级配置，不存在内存越界写入危险。
+    // 2. 将 (usize::MAX, usize::MAX) 传给 SetProcessWorkingSetSize 是系统约定的
+    //    资源清理命令，将物理页面从工作集修剪至 Standby List。
     unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+/// 压缩进程堆并修剪工作集。
+///
+/// 与 `trim_working_set` 的区别：先调用 `HeapCompact` 将堆中的空闲页
+/// decommit 归还 OS，再修剪工作集物理页面。仅在更新检查等"大量临时堆分配
+/// 已全部释放"的场景中调用；**不可**用于常规周期性 trim，否则会因过度 decommit
+/// 导致后续正常分配反复 recommit 页面，造成工作集反弹到更高水位。
+pub fn compact_and_trim() {
+    // SAFETY:
+    // 1. GetProcessHeap() 返回当前进程默认堆的有效句柄，无需关闭。
+    // 2. HeapCompact(flags=0) 使用默认序列化，对多线程安全。
+    //    它合并空闲块并将整页空闲内存 decommit 归还 OS。
+    // 3. GetCurrentProcess() 返回当前进程的伪句柄，安全且不需关闭。
+    // 4. 将 (usize::MAX, usize::MAX) 传给 SetProcessWorkingSetSize 是系统约定的
+    //    资源清理命令，将物理页面从工作集修剪至 Standby List。
+    unsafe {
+        if let Ok(heap) = GetProcessHeap() {
+            let _ = HeapCompact(heap, HEAP_FLAGS(0));
+        }
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
