@@ -24,14 +24,14 @@ use windows::Win32::System::Power::{
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
+use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
-use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, FindWindowW, KillTimer, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
-    PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SetTimer, ShowWindow, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_TIMER, WM_WTSSESSION_CHANGE,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, FindWindowW, KillTimer, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
+    SW_HIDE, SetTimer, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED,
+    WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -63,17 +63,8 @@ use crate::update::{
 use crate::util::show_error;
 use crate::window::{embed_in_taskbar, invalidate_taskbar_cache, update_taskbar_position};
 
-const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
-const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 1;
 const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
-
-const GUID_MONITOR_POWER_ON: windows::core::GUID = windows::core::GUID::from_values(
-    0x02731015,
-    0x4510,
-    0x4526,
-    [0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA],
-);
 
 #[repr(C)]
 #[allow(non_snake_case)]
@@ -177,11 +168,13 @@ fn main() {
     }
     TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::Release);
 
+    // DEVICE_NOTIFY_WINDOW_HANDLE = 0；误用 SERVICE_HANDLE(1) 会把 HWND 当服务句柄，
+    // 返回 ERROR_SERVICE_NOT_IN_EXE (0x8007043B)。
     let power_notify = unsafe {
         RegisterPowerSettingNotification(
             HANDLE(hwnd.0),
             &GUID_MONITOR_POWER_ON,
-            REGISTER_NOTIFICATION_FLAGS(DEVICE_NOTIFY_WINDOW_HANDLE),
+            DEVICE_NOTIFY_WINDOW_HANDLE,
         )
     };
     match power_notify {
