@@ -146,7 +146,7 @@ fn main() {
             guard
         }
         Err(_) => {
-            show_error("Failed to create mutex");
+            show_error("创建单例互斥量失败");
             return;
         }
     };
@@ -162,14 +162,14 @@ fn main() {
     }
 
     if register_window_class().is_err() {
-        show_error("Failed to register window class");
+        show_error("注册窗口类失败");
         return;
     }
 
     let hwnd = match create_main_window() {
         Ok(h) => h,
         Err(e) => {
-            show_error(&format!("Failed to create window: {}", e));
+            show_error(&format!("创建窗口失败: {e}"));
             return;
         }
     };
@@ -184,10 +184,7 @@ fn main() {
         // SAFETY: 紧随 RegisterWindowMessageW 之后读取，中间未插入其他可改写
         // last-error 的 Win32 调用。
         let last = unsafe { GetLastError() };
-        show_error(&format!(
-            "Failed to register TaskbarCreated message: 0x{:08X}",
-            last.0
-        ));
+        show_error(&format!("注册 TaskbarCreated 消息失败: 0x{:08X}", last.0));
     }
     TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::Release);
 
@@ -205,15 +202,12 @@ fn main() {
         }
         Err(e) => {
             // 非致命：显示器开关检测失效，仅影响唤醒节能。记录便于排查。
-            show_error(&format!(
-                "Failed to register power setting notification: {:?}",
-                e
-            ));
+            show_error(&format!("注册电源设置通知失败: {e:?}"));
         }
     }
 
     if !embed_in_taskbar(hwnd) {
-        show_error("Failed to embed in taskbar. Make sure explorer.exe is running.");
+        show_error("嵌入任务栏失败。请确认 explorer.exe 正在运行。");
         return;
     }
 
@@ -225,7 +219,7 @@ fn main() {
     let renderer = match Renderer::new() {
         Ok(r) => r,
         Err(e) => {
-            show_error(&format!("Failed to initialize renderer: {e}"));
+            show_error(&format!("初始化渲染器失败: {e}"));
             remove_tray_icon();
             return;
         }
@@ -247,7 +241,7 @@ fn main() {
     }
 
     if !sync_monitoring_timers(hwnd) {
-        show_error("Failed to create monitoring timers");
+        show_error("创建监测定时器失败");
         return;
     }
 
@@ -255,7 +249,7 @@ fn main() {
     // 失败为非致命：锁屏暂停将失效，但显示器关闭暂停仍可由电源通知覆盖。
     unsafe {
         if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
-            show_error(&format!("Failed to register session notification: {:?}", e));
+            show_error(&format!("注册会话通知失败: {e:?}"));
         }
     }
 
@@ -281,10 +275,7 @@ fn main() {
                 0 => break,
                 -1 => {
                     let last = GetLastError();
-                    show_error(&format!(
-                        "GetMessageW fatal error in message loop: 0x{:08X}",
-                        last.0
-                    ));
+                    show_error(&format!("消息循环 GetMessageW 致命错误: 0x{:08X}", last.0));
                     break;
                 }
                 _ => {
@@ -339,7 +330,7 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
         });
 
         if !sync_monitoring_timers(hwnd) {
-            show_error("Failed to restore monitoring timers after Explorer restart");
+            show_error("Explorer 重启后恢复监测定时器失败");
         }
     }
     LRESULT(0)

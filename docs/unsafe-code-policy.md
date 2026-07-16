@@ -169,6 +169,34 @@ unsafe {
 
 ---
 
+## Rule 7.0: SAFETY 注释分级
+
+按 unsafe 块的 UB 风险等级分两档撰写 SAFETY 注释，避免噪音淹没高价值证明。
+
+### A 档（高风险，必须分条结构化证明）
+属于以下任一类别时，必须按 Rule 7.1 分条说明「输入与依赖校验 / 状态不变性约束」：
+- **写操作或状态变更**：任何会修改全局窗口/进程/线程状态、所有权关系的 API（`SetParent`、`SetWindowLongPtrW`、`SetLayeredWindowAttributes`、`SetProcessWorkingSetSize`、`PostQuitMessage` …）。
+- **句柄所有权转移或释放**：`CloseHandle`/`DeleteObject`/`DeleteDC`/`WinHttpCloseHandle`/`FreeMibTable`/`DestroyMenu` 等释放或托管类调用。
+- **填充调用方提供的缓冲区**：传入裸指针/可变引用由被调用方写入的实现，必须说明缓冲区大小、对齐、生命周期。
+
+### B 档（低风险，单行 SAFETY 即可）
+满足全部条件的**纯查询 API**，可用一行 SAFETY 注释说明，禁止长篇大论：
+- 不写入调用方提供的缓冲区（即无 `*mut T` 输出参数）；
+- 不接管或释放句柄；
+- 不修改任何全局/线程/窗口状态；
+- 仅返回标量、不可变句柄或句柄副本。
+
+示例：
+
+```rust
+// SAFETY: 纯查询 API，传入有效 hwnd，返回当前前台窗口，无副作用。
+let foreground = unsafe { GetForegroundWindow() };
+```
+
+判断不确定时一律升 A 档处理。
+
+---
+
 ## Rule 7.1: 大 unsafe 块必须进行结构化证明
 
 对于包含多行调用或原子事务的 `unsafe` 块，禁止使用一句话概括。必须进行**结构化拆解证明**：

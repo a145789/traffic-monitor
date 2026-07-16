@@ -31,6 +31,8 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
    - **设计决策**：小组件窗口必须响应 `WM_DPICHANGED` 消息。在 DPI 变动时，除需要通知 `Renderer::update_dpi` 重新计算缩放字体外，**必须**重新执行 `embed_in_taskbar` 以根据最新 DPI 动态重置小组件窗口的物理宽高度和位置，否则会导致高分屏/跨屏移动时组件物理大小不合或排版截断。
 7. **挂起/全屏节能与定时器唤醒配对**
    - **设计决策**：为确保后台低功耗常驻，小组件在休眠（`PBT_APMSUSPEND`）、锁屏（`WTS_SESSION_LOCK`）或当前显示器运行全屏应用时会执行 `suspend_system` 销毁监测定时器并冻结计算；在唤醒、解锁或退出全屏时通过 `resume_system` 恢复。任何针对监测周期的修改均必须保证“销毁”与“恢复”操作在逻辑上完全对称，否则会导致唤醒后组件数据永久冻结（卡死假活）。
+8. **RAII 句柄守卫归属规则**
+   - **设计决策**：[src/ffi_guard.rs](src/ffi_guard.rs) 仅收口「裸句柄 → 单一 `Close*`/`Destroy*`」配对、无业务构造语义的通用守卫（当前为 `MutexGuard`、`MenuGuard`）。业务专属守卫（`Renderer` 的事务式 `ScreenDcGuard`/`OwnedDc`/`OwnedBitmap`/`OwnedFont`/`OwnedBrush`、`update` 的 `WinHttpHandles`/`BcryptHandles`、`collector` 的 `MibTable`）**保留在各自业务文件**，因为它们的创建/选入/释放顺序与该模块的不变量强耦合。新增守卫时按此归属规则选择位置，禁止为追求「集中」而割裂业务上下文。
 
 ---
 
@@ -85,5 +87,5 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 | [src/tray.rs](src/tray.rs)           | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                                                |
 | [src/update.rs](src/update.rs)       | 自动/手动检查更新、下载新版本安装包、SHA-256 安全哈希校验、UAC 提权覆盖安装。                                   |
 | [src/thermal.rs](src/thermal.rs)     | 设备过热风险推断引擎：电池放电功率直测（拔电）/CPU·内存·内核比多信号推断（插电）、双 EMA 热容模拟、滞回状态机。 |
-| [src/ffi_guard.rs](src/ffi_guard.rs) | RAII 资源守卫类型（`MutexGuard`、`RegKey`、`MenuGuard` 等），保证 FFI 资源安全释放。                            |
+| [src/ffi_guard.rs](src/ffi_guard.rs) | 跨模块复用的通用 Win32 句柄 RAII 守卫（`MutexGuard`、`MenuGuard`）。业务专属守卫留在各自业务文件。              |
 | [src/util.rs](src/util.rs)           | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                                            |

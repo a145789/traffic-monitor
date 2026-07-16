@@ -1,3 +1,15 @@
+//! 跨模块复用的通用 Win32 句柄 RAII 守卫。
+//!
+//! 职责边界：本模块只收口那些在多个业务模块间共享、且无业务专属构造/释放逻辑的
+//! 「裸句柄 → CloseHandle/DestroyMenu」配对。业务专属守卫（如 `Renderer` 的事务式
+//! `ScreenDcGuard`/`OwnedDc`/`OwnedBitmap`、`update` 的 `WinHttpHandles`/`BcryptHandles`、
+//! `collector` 的 `MibTable`）保留在各自业务文件中，因为它们的创建/释放与具体业务
+//! 不变量强耦合（构造顺序、所有权移交、配对 API 等），强行集中反而割裂上下文。
+//!
+//! 新增守卫时遵循以下归属规则：
+//! - 仅做单一 `Close*`/`Destroy*` 释放、无业务构造逻辑的通用句柄 → 入此模块。
+//! - 创建/选入/配对/事务移交等含业务语义的 → 留在业务文件并就近注释生命周期。
+
 pub struct MutexGuard(pub windows::Win32::Foundation::HANDLE);
 
 impl Drop for MutexGuard {

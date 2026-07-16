@@ -70,7 +70,7 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
     let (display_x, display_y, display_width, display_height) = match calc_widget_rect(hwnd) {
         Some(rect) => rect,
         None => {
-            show_error("Cannot find Shell_TrayWnd or TrayNotifyWnd");
+            show_error("找不到 Shell_TrayWnd 或 TrayNotifyWnd");
             return false;
         }
     };
@@ -78,7 +78,7 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
     let h_taskbar = match get_taskbar_hwnd() {
         Some(h) => h,
         None => {
-            show_error("Cannot find Shell_TrayWnd");
+            show_error("找不到 Shell_TrayWnd");
             return false;
         }
     };
@@ -92,7 +92,7 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
     //    任一步失败立即返回 false，避免任务栏嵌入进入不可恢复的中间状态。
     unsafe {
         if SetParent(hwnd, Some(h_taskbar)).is_err() {
-            show_error("Failed to SetParent into taskbar");
+            show_error("SetParent 嵌入任务栏失败");
             return false;
         }
 
@@ -103,7 +103,7 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
         if prev_style == 0 {
             let last = GetLastError();
             if last.0 != 0 {
-                show_error(&format!("Failed to override GWL_STYLE: 0x{:08X}", last.0));
+                show_error(&format!("覆盖 GWL_STYLE 失败: 0x{:08X}", last.0));
                 return false;
             }
         }
@@ -118,10 +118,7 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
         if prev_ex == 0 {
             let last = GetLastError();
             if last.0 != 0 {
-                show_error(&format!(
-                    "Failed to reapply WS_EX_LAYERED: 0x{:08X}",
-                    last.0
-                ));
+                show_error(&format!("重新应用 WS_EX_LAYERED 失败: 0x{:08X}", last.0));
                 return false;
             }
         }
@@ -137,11 +134,11 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
         )
         .is_err()
         {
-            show_error("Failed to SetWindowPos in taskbar");
+            show_error("SetWindowPos 嵌入任务栏失败");
             return false;
         }
         if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(COLOR_KEY), 0, LWA_COLORKEY) {
-            show_error(&format!("Failed to set layered window attributes: {:?}", e));
+            show_error(&format!("设置分层窗口属性失败: {e:?}"));
             return false;
         }
     }
