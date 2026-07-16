@@ -39,6 +39,7 @@ static DWELL: AtomicU32 = AtomicU32::new(0);
 use windows::Win32::System::Power::{
     CallNtPowerInformation, ProcessorInformation, SystemBatteryState,
 };
+use windows::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount};
 
 /// Windows SYSTEM_BATTERY_STATE 结构体的 Rust 镜像。
 ///
@@ -139,38 +140,38 @@ fn read_battery() -> (bool, bool, i32) {
 ///
 /// 传感器不可用或 sum_max 为 0 时返回 256（即 ratio=1.0，退化为原始静态系数）。
 fn read_cpu_freq_ratio_q8() -> u32 {
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // SAFETY: ALL_PROCESSOR_GROUPS 是 Win32 约定的查询全部处理器组常量，调用无指针参数。
+    let num_cpus = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
+    if num_cpus == 0 {
+        return 256;
+    }
 
-    let elem_size = std::mem::size_of::<ProcessorInformation>();
-    let buf_size = num_cpus * elem_size;
-    let mut buf: Vec<u8> = vec![0u8; buf_size];
+    let Some(buf_size) = num_cpus
+        .checked_mul(std::mem::size_of::<ProcessorInformation>())
+        .and_then(|size| u32::try_from(size).ok())
+    else {
+        return 256;
+    };
+    let mut processors = vec![ProcessorInformation::default(); num_cpus];
 
     // SAFETY:
     // 1. InformationLevel=ProcessorInformation 只读不写输入，传入 None 安全。
-    // 2. buf 已分配 num_cpus × sizeof(ProcessorInformation) 字节，大小正确。
-    // 3. ProcessorInformation 为 repr(C)，与 Windows SDK 逐字段对齐（24 bytes）。
+    // 2. processors 是按 ProcessorInformation 对齐的连续可写数组，缓冲区字节数
+    //    由其元素数量和结构体大小经 checked_mul 计算，且已验证可表示为 u32。
+    // 3. ProcessorInformation 为 repr(C)，与 Windows SDK 布局一致（24 bytes）。
     let status = unsafe {
         CallNtPowerInformation(
             ProcessorInformation,
             None,
             0,
-            Some(buf.as_mut_ptr() as *mut ::core::ffi::c_void),
-            buf_size as u32,
+            Some(processors.as_mut_ptr().cast()),
+            buf_size,
         )
     };
 
     if status.0 != 0 {
         return 256;
     }
-
-    // SAFETY: buf 是 u8 Vec，转为 ProcessorInformation 切片需满足对齐要求。
-    // Vec<u8> 分配对齐于平台默认对齐（16），ProcessorInformation 的对齐为 4，
-    // 此处对齐满足要求。内存由 buf 独占，函数结束前 buf 不会被 drop。
-    let processors = unsafe {
-        std::slice::from_raw_parts(buf.as_ptr() as *const ProcessorInformation, num_cpus)
-    };
 
     let mut sum_current: u64 = 0;
     let mut sum_max: u64 = 0;

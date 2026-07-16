@@ -17,52 +17,81 @@ use crate::config::{
     TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
     TIMER_INTERVAL_THERMAL,
 };
-use crate::state::{CONSECUTIVE_ZERO_COUNT, FULLSCREEN, NETWORK_BACKOFF, SUSPENDED};
+use crate::state::{
+    CONSECUTIVE_ZERO_COUNT, FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS,
+};
 use crate::window::get_taskbar_hwnd;
 
-pub fn suspend_system(hwnd: HWND) {
-    SUSPENDED.store(true, Ordering::Release);
+pub fn is_suspended() -> bool {
+    SUSPEND_REASONS.load(Ordering::Acquire) != 0
+}
+
+pub fn suspend_system(hwnd: HWND, reason: u32) {
+    let previous = SUSPEND_REASONS.fetch_or(reason, Ordering::AcqRel);
     FULLSCREEN.store(false, Ordering::Release);
-    // SAFETY:
-    // hwnd 是操作系统分配的有效主窗口句柄。
-    // 在系统休眠或锁屏时安全关闭所有监测定时器。
+    let _ = sync_monitoring_timers(hwnd);
+    if previous == 0 {
+        trim_working_set();
+    }
+}
+
+pub fn resume_system(hwnd: HWND, reason: u32, reset_backoff: bool) {
+    SUSPEND_REASONS.fetch_and(!reason, Ordering::AcqRel);
+    if reset_backoff {
+        CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
+        NETWORK_BACKOFF.store(false, Ordering::Release);
+    }
+    let _ = sync_monitoring_timers(hwnd);
+}
+
+/// 依据暂停原因、全屏状态和网络退避状态，将所有监测定时器收敛到唯一正确集合。
+/// 返回 false 表示至少一个应创建的定时器创建失败。
+pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
+    // 先统一移除，再按当前状态重建，避免调用方各自维护不完整的定时器子集。
+    // SAFETY: hwnd 是主窗口句柄；移除不存在的定时器只会返回错误，不会破坏状态。
     unsafe {
         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
         KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
     }
-    trim_working_set();
-}
 
-pub fn resume_system(hwnd: HWND, reset_backoff: bool) {
-    SUSPENDED.store(false, Ordering::Release);
-    if reset_backoff {
-        CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
-        NETWORK_BACKOFF.store(false, Ordering::Release);
+    if is_suspended() {
+        return true;
     }
+
+    // SAFETY: hwnd 有效，ID 和间隔均为进程内固定常量；返回 0 表示创建失败。
+    let fullscreen_ok = unsafe {
+        SetTimer(
+            Some(hwnd),
+            TIMER_ID_FULLSCREEN,
+            TIMER_INTERVAL_FULLSCREEN,
+            None,
+        ) != 0
+    };
+
+    if FULLSCREEN.load(Ordering::Acquire) {
+        return fullscreen_ok;
+    }
+
     let network_interval = if NETWORK_BACKOFF.load(Ordering::Acquire) {
         TIMER_INTERVAL_NETWORK_BACKOFF
     } else {
         TIMER_INTERVAL_NETWORK
     };
-    // SAFETY: hwnd 是系统分配的有效主窗口句柄。
-    unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
-        let _ = SetTimer(
-            Some(hwnd),
-            TIMER_ID_FULLSCREEN,
-            TIMER_INTERVAL_FULLSCREEN,
-            None,
-        );
-        let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-    }
-    if !FULLSCREEN.load(Ordering::Acquire) {
-        // SAFETY: hwnd 有效，定时器 ID 合法。
-        unsafe {
-            let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
-        }
-    }
+    // SAFETY: hwnd 有效，ID 和间隔均为进程内固定常量；返回 0 表示创建失败。
+    let network_ok = unsafe {
+        SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None) != 0
+    };
+    // SAFETY: 同上，分别创建 CPU/内存与热风险定时器。
+    let cpu_mem_ok = unsafe {
+        SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None) != 0
+    };
+    let thermal_ok = unsafe {
+        SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None) != 0
+    };
+
+    fullscreen_ok && network_ok && cpu_mem_ok && thermal_ok
 }
 
 pub fn check_fullscreen(hwnd: HWND) {
@@ -77,11 +106,7 @@ pub fn check_fullscreen(hwnd: HWND) {
         let was = FULLSCREEN.load(Ordering::Acquire);
         if was {
             FULLSCREEN.store(false, Ordering::Release);
-            // SAFETY: hwnd 是当前进程所持有并处于活动状态的有效主窗口句柄，重新启动此线程关联的定时器不会引发未定义行为。
-            unsafe {
-                let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
-                let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-            }
+            let _ = sync_monitoring_timers(hwnd);
         }
         return;
     }
@@ -122,18 +147,8 @@ pub fn check_fullscreen(hwnd: HWND) {
     let should_suspend = is_full && same_monitor;
     FULLSCREEN.store(should_suspend, Ordering::Release);
 
-    if should_suspend && !was {
-        // SAFETY: hwnd 有效，销毁定时器。
-        unsafe {
-            KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
-            KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
-        }
-    } else if !should_suspend && was {
-        // SAFETY: hwnd 有效，重建定时器。
-        unsafe {
-            let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
-            let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-        }
+    if should_suspend != was {
+        let _ = sync_monitoring_timers(hwnd);
     }
 }
 

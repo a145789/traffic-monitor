@@ -5,8 +5,15 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
 
-/// 系统暂停标志（睡眠/锁屏/显示器关闭/全屏）。
-pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// 系统睡眠导致暂停。
+pub const SUSPEND_REASON_SYSTEM: u32 = 1 << 0;
+/// 会话锁定导致暂停。
+pub const SUSPEND_REASON_SESSION: u32 = 1 << 1;
+/// 显示器关闭导致暂停。
+pub const SUSPEND_REASON_MONITOR: u32 = 1 << 2;
+
+/// 当前生效的暂停原因位集合。仅当所有原因均清除后才恢复采集。
+pub static SUSPEND_REASONS: AtomicU32 = AtomicU32::new(0);
 
 /// 全屏应用在前台运行。
 pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);

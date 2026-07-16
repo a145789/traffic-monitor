@@ -24,6 +24,10 @@ pub const TIMER_INTERVAL_THERMAL: u32 = 1000;
 pub const CPU_MEM_INTERVAL: u32 = 5000;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
+pub const VERSION_METADATA_MAX_BYTES: usize = 4 * 1024;
+pub const INSTALLER_MAX_BYTES: usize = 256 * 1024 * 1024;
+pub const HTTP_READ_CHUNK_BYTES: usize = 64 * 1024;
+
 pub const COLOR_KEY: u32 = 0x00FF00FF;
 pub const COLOR_DARK_TEXT: u32 = 0x00282828;
 pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;

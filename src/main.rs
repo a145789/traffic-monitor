@@ -40,14 +40,13 @@ use crate::collector::{
     collect_network, init_network_listener, trim_working_set,
 };
 use crate::config::{
-    CPU_MEM_INTERVAL, LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
-    TIMER_ID_NETWORK, TIMER_ID_THERMAL, TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK,
-    TIMER_INTERVAL_NETWORK_BACKOFF, TIMER_INTERVAL_THERMAL,
+    LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK,
+    TIMER_ID_THERMAL,
 };
 use crate::renderer::Renderer;
 use crate::state::{
-    CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, FULLSCREEN, NETWORK_BACKOFF, SUSPENDED,
-    THERMAL_STATE,
+    CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, FULLSCREEN, NETWORK_BACKOFF,
+    SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM, THERMAL_STATE,
 };
 use crate::thermal::collect_thermal;
 use crate::tray::{
@@ -219,17 +218,9 @@ fn main() {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
-    // SAFETY: hwnd 有效，创建初始定时器。
-    unsafe {
-        let _ = SetTimer(
-            Some(hwnd),
-            TIMER_ID_FULLSCREEN,
-            TIMER_INTERVAL_FULLSCREEN,
-            None,
-        );
-        let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
-        let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
-        let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
+    if !sync_monitoring_timers(hwnd) {
+        show_error("Failed to create monitoring timers");
+        return;
     }
 
     // SAFETY: hwnd 有效，注册会话通知。
@@ -276,7 +267,10 @@ fn main() {
     });
 }
 
-use crate::suspend::{check_fullscreen, is_immersive_color_set, resume_system, suspend_system};
+use crate::suspend::{
+    check_fullscreen, is_immersive_color_set, is_suspended, resume_system, suspend_system,
+    sync_monitoring_timers,
+};
 use crate::window::{embed_in_taskbar, invalidate_taskbar_cache, update_taskbar_position};
 
 const WTS_SESSION_LOCK: usize = 0x7;
@@ -298,27 +292,8 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
             }
         });
 
-        let network_interval = if NETWORK_BACKOFF.load(Ordering::Acquire) {
-            TIMER_INTERVAL_NETWORK_BACKOFF
-        } else {
-            TIMER_INTERVAL_NETWORK
-        };
-        // SAFETY: hwnd 有效，重建网络定时器。
-        unsafe {
-            let _ = SetTimer(
-                Some(hwnd),
-                TIMER_ID_FULLSCREEN,
-                TIMER_INTERVAL_FULLSCREEN,
-                None,
-            );
-            let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None);
-        }
-        if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
-            // SAFETY: hwnd 有效，重建 CPU/内存定时器。
-            unsafe {
-                let _ = SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None);
-                let _ = SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None);
-            }
+        if !sync_monitoring_timers(hwnd) {
+            show_error("Failed to restore monitoring timers after Explorer restart");
         }
     }
     LRESULT(0)
@@ -337,12 +312,12 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_FULLSCREEN => {
-            if !SUSPENDED.load(Ordering::Acquire) {
+            if !is_suspended() {
                 check_fullscreen(hwnd);
             }
         }
         TIMER_ID_NETWORK => {
-            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+            if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
                 update_taskbar_position(hwnd);
                 collect_network();
                 // SAFETY: hwnd 有效，刷新网速显示。
@@ -352,7 +327,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_CPU_MEM => {
-            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+            if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
                 collect_cpu();
                 collect_memory();
                 // SAFETY: hwnd 有效，刷新 CPU/内存显示。
@@ -362,7 +337,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_THERMAL => {
-            if !SUSPENDED.load(Ordering::Acquire) && !FULLSCREEN.load(Ordering::Acquire) {
+            if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
                 let prev = THERMAL_STATE.load(Ordering::Relaxed);
                 collect_thermal();
                 // 仅在热状态实际跳变时触发重绘，避免每秒空转 DWM 合成。
@@ -382,10 +357,10 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
 fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match wparam.0 as u32 {
         PBT_APMSUSPEND => {
-            suspend_system(hwnd);
+            suspend_system(hwnd, SUSPEND_REASON_SYSTEM);
         }
         PBT_APMRESUMEAUTOMATIC => {
-            resume_system(hwnd, true);
+            resume_system(hwnd, SUSPEND_REASON_SYSTEM, true);
         }
         PBT_POWERSETTINGCHANGE => {
             let setting = lparam.0 as *const POWERBROADCAST_SETTING;
@@ -396,9 +371,9 @@ fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
                 {
                     let monitor_on = setting_ref.Data[0] != 0;
                     if monitor_on {
-                        resume_system(hwnd, true);
+                        resume_system(hwnd, SUSPEND_REASON_MONITOR, true);
                     } else {
-                        suspend_system(hwnd);
+                        suspend_system(hwnd, SUSPEND_REASON_MONITOR);
                     }
                 }
             }
@@ -411,10 +386,10 @@ fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
 fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     match wparam.0 {
         WTS_SESSION_LOCK => {
-            suspend_system(hwnd);
+            suspend_system(hwnd, SUSPEND_REASON_SESSION);
         }
         WTS_SESSION_UNLOCK => {
-            resume_system(hwnd, true);
+            resume_system(hwnd, SUSPEND_REASON_SESSION, true);
         }
         _ => {}
     }
@@ -449,29 +424,14 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_TIMER => handle_timer(hwnd, wparam),
 
         WM_USER_NETWORK_DISCONNECTED => {
-            if !SUSPENDED.load(Ordering::Acquire) {
-                // SAFETY: hwnd 有效，切换到退避间隔。
-                unsafe {
-                    let _ = SetTimer(
-                        Some(hwnd),
-                        TIMER_ID_NETWORK,
-                        TIMER_INTERVAL_NETWORK_BACKOFF,
-                        None,
-                    );
-                }
-            }
+            let _ = sync_monitoring_timers(hwnd);
             LRESULT(0)
         }
 
         WM_USER_NETWORK_RECONNECTED => {
             NETWORK_BACKOFF.store(false, Ordering::Release);
             CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
-            if !SUSPENDED.load(Ordering::Acquire) {
-                // SAFETY: hwnd 有效，恢复默认网速采集间隔。
-                unsafe {
-                    let _ = SetTimer(Some(hwnd), TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK, None);
-                }
-            }
+            let _ = sync_monitoring_timers(hwnd);
             start_auto_check(hwnd);
             LRESULT(0)
         }

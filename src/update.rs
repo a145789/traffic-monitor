@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::windows::fs::OpenOptionsExt;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -15,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::collector::compact_and_trim;
+use crate::config::{HTTP_READ_CHUNK_BYTES, INSTALLER_MAX_BYTES, VERSION_METADATA_MAX_BYTES};
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{reg_read_dword, reg_write_dword, show_error, show_info, to_wide};
@@ -112,7 +114,12 @@ fn friendly_error(op: &str, err: windows::core::Error) -> String {
     format!("{op}失败: {detail}")
 }
 
-fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
+fn fetch_url(
+    host: &str,
+    path: &str,
+    secure: bool,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let agent = to_wide("Traffic Monitor");
     let host_wide = to_wide(host);
     let path_wide = to_wide(path);
@@ -251,27 +258,37 @@ fn fetch_url(host: &str, path: &str, secure: bool) -> Result<Vec<u8>, String> {
             break;
         }
 
-        let mut buf = vec![0u8; available as usize];
+        let remaining = max_response_bytes.saturating_sub(response.len());
+        if remaining == 0 {
+            return Err(format!("响应数据超过大小上限 ({max_response_bytes} bytes)"));
+        }
+        let chunk_len = (available as usize)
+            .min(HTTP_READ_CHUNK_BYTES)
+            .min(remaining);
+        let mut buf = vec![0u8; chunk_len];
         let mut read: u32 = 0;
 
         // SAFETY:
-        // handles.h_request 有效。
-        // buf 已分配 `available` 字节；as_mut_ptr() 返回有效的可写指针。
-        // lpdwNumberOfBytesRead 是有效的 u32 输出参数。
+        // handles.h_request 有效；buf 是 chunk_len 字节的连续可写缓冲区。
+        // 请求长度由 buf.len() 转换且不超过 u32，read 是有效的输出参数。
         unsafe {
             WinHttpReadData(
                 handles.h_request,
                 buf.as_mut_ptr() as *mut _,
-                available,
+                chunk_len as u32,
                 &mut read,
             )
             .map_err(|e| friendly_error("读取响应数据", e))?;
         }
 
+        let read = read as usize;
         if read == 0 {
             break;
         }
-        response.extend_from_slice(&buf[..read as usize]);
+        if read > buf.len() {
+            return Err("WinHTTP 返回了超过目标缓冲区的读取长度".to_string());
+        }
+        response.extend_from_slice(&buf[..read]);
     }
 
     Ok(response)
@@ -392,15 +409,51 @@ fn compute_sha256_hex_file(path: &std::path::Path) -> Result<String, String> {
     Ok(format_hex(&hash_bytes))
 }
 
-fn compare_versions(current: &str, latest: &str) -> bool {
-    parse_version(latest) > parse_version(current)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
 }
 
-fn parse_version(v: &str) -> Vec<u32> {
-    let base = v.split('-').next().unwrap_or(v);
-    base.split('.')
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect()
+fn compare_versions(current: &str, latest: &str) -> bool {
+    match (parse_version(current), parse_version(latest)) {
+        (Some(current), Some(latest)) => latest > current,
+        _ => false,
+    }
+}
+
+fn parse_version(value: &str) -> Option<Version> {
+    let (base, suffix) = match value.split_once('-') {
+        Some((base, suffix)) => (base, Some(suffix)),
+        None => (value, None),
+    };
+    if suffix.is_some_and(|suffix| {
+        suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return None;
+    }
+
+    let mut parts = base.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some(Version {
+        major,
+        minor,
+        patch,
+    })
+}
+
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn is_installed_version() -> bool {
@@ -433,6 +486,24 @@ fn get_temp_installer_path() -> std::path::PathBuf {
     std::path::PathBuf::from(local_appdata)
         .join("Traffic Monitor")
         .join(TEMP_FILE_NAME)
+}
+
+fn open_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_ONLY)
+        .open(path)
+}
+
+fn create_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ_ONLY)
+        .open(path)
 }
 
 pub fn start_auto_check(hwnd: HWND) {
@@ -517,10 +588,18 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
 }
 
 #[derive(Debug)]
+struct VerifiedInstaller {
+    version: String,
+    path: std::path::PathBuf,
+    // 保持只读共享句柄直到 ShellExecuteExW 返回，阻止其他进程改写或替换已校验文件。
+    _file_lock: std::fs::File,
+}
+
+#[derive(Debug)]
 enum CheckResult {
     NoUpdate,
     PortableFound(String),
-    InstalledReady(String, String),
+    InstalledReady(VerifiedInstaller),
     Error(String),
 }
 
@@ -543,11 +622,21 @@ enum InstallerLaunch {
 }
 
 fn do_update_check() -> CheckResult {
-    let mut response = fetch_url(VERSION_HOST, VERSION_PATH, true);
+    let mut response = fetch_url(
+        VERSION_HOST,
+        VERSION_PATH,
+        true,
+        VERSION_METADATA_MAX_BYTES,
+    );
     if response.is_err() {
         // 失败时增加 1 次重试，并等待 500ms 防止抖动
         std::thread::sleep(std::time::Duration::from_millis(500));
-        response = fetch_url(VERSION_HOST, VERSION_PATH, true);
+        response = fetch_url(
+            VERSION_HOST,
+            VERSION_PATH,
+            true,
+            VERSION_METADATA_MAX_BYTES,
+        );
     }
 
     let response = match response {
@@ -560,21 +649,28 @@ fn do_update_check() -> CheckResult {
         Err(_) => return CheckResult::Error("版本文件编码不是 UTF-8".to_string()),
     };
 
-    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
-    if lines.len() < 2 {
-        return CheckResult::Error("版本文件格式不正确 (不足两行)".to_string());
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    if lines.len() != 2 {
+        return CheckResult::Error("版本文件必须恰好包含版本号和 SHA-256 两行".to_string());
     }
 
-    let latest_version = lines[0].to_string();
-    let expected_hash_hex = lines[1].to_uppercase();
+    let latest_version = lines[0];
+    if parse_version(latest_version).is_none() {
+        return CheckResult::Error("版本号格式不正确，必须为 major.minor.patch".to_string());
+    }
+    let expected_hash_hex = lines[1];
+    if !is_valid_sha256_hex(expected_hash_hex) {
+        return CheckResult::Error("SHA-256 必须是 64 位十六进制字符串".to_string());
+    }
+    let expected_hash_hex = expected_hash_hex.to_ascii_uppercase();
 
     let current_version = env!("CARGO_PKG_VERSION");
-    if !compare_versions(current_version, &latest_version) {
+    if !compare_versions(current_version, latest_version) {
         return CheckResult::NoUpdate;
     }
 
     if !is_installed_version() {
-        return CheckResult::PortableFound(latest_version);
+        return CheckResult::PortableFound(latest_version.to_string());
     }
 
     let download_path = format!(
@@ -582,21 +678,33 @@ fn do_update_check() -> CheckResult {
     );
 
     let temp_path = get_temp_installer_path();
-    let temp_path_str = temp_path.to_string_lossy().to_string();
 
-    // Skip download if temp file already exists with matching hash.
+    // 若临时文件已存在且哈希匹配，以只读共享锁打开后直接复用。
     if temp_path.exists() {
         if let Ok(existing_hash) = compute_sha256_hex_file(&temp_path) {
             if existing_hash.to_uppercase() == expected_hash_hex {
-                return CheckResult::InstalledReady(latest_version, temp_path_str);
+                match open_locked_installer(&temp_path) {
+                    Ok(file_lock) => {
+                        return CheckResult::InstalledReady(VerifiedInstaller {
+                            version: latest_version.to_string(),
+                            path: temp_path,
+                            _file_lock: file_lock,
+                        });
+                    }
+                    Err(_) => {
+                        // 无法锁定已有文件，删除后重新下载。
+                        let _ = std::fs::remove_file(&temp_path);
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(&temp_path);
             }
-            let _ = std::fs::remove_file(&temp_path);
         } else {
             let _ = std::fs::remove_file(&temp_path);
         }
     }
 
-    let mut installer_data = fetch_url(DOWNLOAD_HOST, &download_path, true);
+    let mut installer_data = fetch_url(DOWNLOAD_HOST, &download_path, true, INSTALLER_MAX_BYTES);
     let mut err_msg = None;
 
     if let Err(e) = installer_data {
@@ -604,7 +712,7 @@ fn do_update_check() -> CheckResult {
         let proxy_path = format!(
             "/{GITHUB_BASE}/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
         );
-        match fetch_url(PROXY_HOST, &proxy_path, true) {
+        match fetch_url(PROXY_HOST, &proxy_path, true, INSTALLER_MAX_BYTES) {
             Ok(data) => {
                 installer_data = Ok(data);
             }
@@ -636,19 +744,27 @@ fn do_update_check() -> CheckResult {
         ));
     }
 
-    if std::fs::write(&temp_path, &installer_data).is_err() {
-        // Try creating the parent directory and retry once.
-        if let Some(parent) = temp_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            if std::fs::write(&temp_path, &installer_data).is_err() {
-                return CheckResult::Error("保存安装包文件失败".to_string());
-            }
-        } else {
-            return CheckResult::Error("保存安装包文件失败 (无法获取父目录)".to_string());
+    // 确保父目录存在后，以 create_new(true) + FILE_SHARE_READ 创建独占写锁文件。
+    if let Some(parent) = temp_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 先尝试移除可能残留的无效文件（上次哈希不匹配或被中断的下载）。
+    let _ = std::fs::remove_file(&temp_path);
+    let mut file_lock = match create_locked_installer(&temp_path) {
+        Ok(f) => f,
+        Err(_) => {
+            return CheckResult::Error("创建安装包文件失败".to_string());
         }
+    };
+    if file_lock.write_all(&installer_data).is_err() {
+        return CheckResult::Error("写入安装包文件失败".to_string());
     }
 
-    CheckResult::InstalledReady(latest_version, temp_path_str)
+    CheckResult::InstalledReady(VerifiedInstaller {
+        version: latest_version.to_string(),
+        path: temp_path,
+        _file_lock: file_lock,
+    })
 }
 
 /// 子进程入口：完成更新检查、用户交互和外部动作，仅将最终动作回传主进程。
@@ -689,13 +805,17 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
             }
             UpdateAction::Done
         }
-        CheckResult::InstalledReady(version, temp_path) => {
-            let msg = format!("新版本 v{version} 已准备就绪。\n是否立即关闭程序并安装？");
+        CheckResult::InstalledReady(verified) => {
+            let msg = format!(
+                "新版本 v{} 已准备就绪。\n是否立即关闭程序并安装？",
+                verified.version
+            );
             if !show_yes_no(&msg) {
                 return UpdateAction::Done;
             }
 
-            match launch_installer(&temp_path) {
+            // 启动安装器，文件锁在 ShellExecuteExW 返回后才释放。
+            match launch_installer(verified) {
                 InstallerLaunch::Started => UpdateAction::ExitMain,
                 InstallerLaunch::Cancelled => UpdateAction::Done,
                 InstallerLaunch::Failed(code) => {
@@ -834,8 +954,9 @@ fn open_url(url: &str) {
     }
 }
 
-fn launch_installer(installer_path: &str) -> InstallerLaunch {
-    let path_wide = to_wide(installer_path);
+fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
+    let path_str = verified.path.to_string_lossy();
+    let path_wide = to_wide(&path_str);
     let verb_wide = to_wide("runas");
     let params_wide = to_wide("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
 
@@ -853,6 +974,11 @@ fn launch_installer(installer_path: &str) -> InstallerLaunch {
     // ShellExecuteExW 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体
     // 实际大小一致，未设置需要调用方提供额外指针或接管进程句柄的掩码。
     let launched = unsafe { ShellExecuteExW(&mut sei) };
+
+    // 安装器启动后（或启动失败后）释放文件锁——让 verified 的 _file_lock 在此函数
+    // 返回时 drop，确保 ShellExecuteExW 执行期间安装器文件不可被同权限进程替换。
+    drop(verified);
+
     if launched.is_ok() {
         return InstallerLaunch::Started;
     }
@@ -914,12 +1040,46 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_version() {
-        assert_eq!(parse_version("0.4.2"), vec![0, 4, 2]);
-        assert_eq!(parse_version("1.0.0"), vec![1, 0, 0]);
-        assert_eq!(parse_version("0.4.3-nightly"), vec![0, 4, 3]);
-        assert_eq!(parse_version("0.4"), vec![0, 4]);
-        assert_eq!(parse_version("invalid"), Vec::<u32>::new());
+    fn test_parse_version_valid() {
+        assert_eq!(
+            parse_version("0.4.2"),
+            Some(Version {
+                major: 0,
+                minor: 4,
+                patch: 2
+            })
+        );
+        assert_eq!(
+            parse_version("1.0.0"),
+            Some(Version {
+                major: 1,
+                minor: 0,
+                patch: 0
+            })
+        );
+        assert_eq!(
+            parse_version("0.4.3-nightly"),
+            Some(Version {
+                major: 0,
+                minor: 4,
+                patch: 3
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_version_rejects_invalid() {
+        // 不足三段
+        assert_eq!(parse_version("0.4"), None);
+        // 超过三段
+        assert_eq!(parse_version("1.2.3.4"), None);
+        // 非数字
+        assert_eq!(parse_version("invalid"), None);
+        assert_eq!(parse_version("1.x.3"), None);
+        // 空段
+        assert_eq!(parse_version("1..3"), None);
+        // 空后缀
+        assert_eq!(parse_version("1.2.3-"), None);
     }
 
     // ===== parse_update_action =====
