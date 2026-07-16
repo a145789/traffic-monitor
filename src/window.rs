@@ -19,15 +19,12 @@ pub fn get_taskbar_hwnd() -> Option<HWND> {
     let cached = TASKBAR_HWND.load(Ordering::Acquire);
     if cached != 0 {
         let hwnd = HWND(cached as *mut std::ffi::c_void);
-        // SAFETY: IsWindow 是纯查询 API，hwnd 来自缓存，仅做有效性判断。
         if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Some(hwnd);
         }
         TASKBAR_HWND.store(0, Ordering::Release);
     }
-    // SAFETY:
-    // "Shell_TrayWnd" 是 Windows 任务栏窗口的标准类名，常量宽字符串生命周期覆盖调用。
-    // FindWindowW 仅查询窗口句柄，不解引用任何裸指针，失败时安全返回 Err。
+    // SAFETY: 静态类名 "Shell_TrayWnd"；FindWindowW 仅查询句柄。
     let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok() };
     if let Some(h) = hwnd {
         TASKBAR_HWND.store(h.0 as isize, Ordering::Release);
@@ -42,18 +39,16 @@ pub fn invalidate_taskbar_cache() {
 
 pub fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     let h_taskbar = get_taskbar_hwnd()?;
-    // SAFETY: h_taskbar 已被验证为有效句柄，"TrayNotifyWnd" 为系统 Tray 窗口类名。
+    // SAFETY: "TrayNotifyWnd" 为系统托盘子窗口类名。
     let h_tray = unsafe { FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")).ok()? };
 
     let mut rc_tray = RECT::default();
     let mut rc_taskbar = RECT::default();
-    // SAFETY: h_tray 和 h_taskbar 有效，rect 在栈上分配。
     unsafe {
         GetWindowRect(h_tray, &mut rc_tray).ok()?;
         GetWindowRect(h_taskbar, &mut rc_taskbar).ok()?;
     }
 
-    // SAFETY: hwnd 有效，GetDpiForWindow 是纯查询 API。
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
     let scale = dpi as f64 / 96.0;
     let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
@@ -171,7 +166,6 @@ pub fn update_taskbar_position(hwnd: HWND) {
     });
 
     if changed {
-        // SAFETY: hwnd 有效，SWP_NOZORDER 不调整层级。
         unsafe {
             let _ = SetWindowPos(
                 hwnd,

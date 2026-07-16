@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
     WM_TIMER, WM_WTSSESSION_CHANGE,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use crate::collector::{
     WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, collect_cpu, collect_memory,
@@ -48,6 +48,10 @@ use crate::state::{
     CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, FULLSCREEN, NETWORK_BACKOFF,
     SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM, THERMAL_STATE,
 };
+use crate::suspend::{
+    check_fullscreen, is_immersive_color_set, is_suspended, resume_system, suspend_system,
+    sync_monitoring_timers,
+};
 use crate::thermal::collect_thermal;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
@@ -57,9 +61,12 @@ use crate::update::{
     subprocess_main,
 };
 use crate::util::show_error;
+use crate::window::{embed_in_taskbar, invalidate_taskbar_cache, update_taskbar_position};
 
 const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
 const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 1;
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
 
 const GUID_MONITOR_POWER_ON: windows::core::GUID = windows::core::GUID::from_values(
     0x02731015,
@@ -84,31 +91,21 @@ static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 fn quit_existing_instance() {
+    // WINDOW_CLASS 常量已含尾 NUL。
     let class_name: Vec<u16> = crate::config::WINDOW_CLASS.encode_utf16().collect();
-    // SAFETY: class_name 以 NUL 结尾，FindWindowW 查询不存在的窗口时安全返回 None。
-    let hwnd = unsafe {
-        FindWindowW(
-            windows::core::PCWSTR(class_name.as_ptr()),
-            windows::core::PCWSTR(std::ptr::null()),
-        )
-    };
+    let class_pcw = PCWSTR(class_name.as_ptr());
+    // SAFETY: class_name 以 NUL 结尾，查询不存在的窗口时安全返回错误。
+    let hwnd = unsafe { FindWindowW(class_pcw, PCWSTR(std::ptr::null())) };
 
     if let Ok(h) = hwnd
         && !h.is_invalid()
     {
-        // SAFETY: h 有效，PostMessageW 异步投递 WM_CLOSE 是线程安全的。
         unsafe {
             let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            // SAFETY: class_name 仍在作用域内。
-            let exist = unsafe {
-                FindWindowW(
-                    windows::core::PCWSTR(class_name.as_ptr()),
-                    windows::core::PCWSTR(std::ptr::null()),
-                )
-            };
+            let exist = unsafe { FindWindowW(class_pcw, PCWSTR(std::ptr::null())) };
             if exist.is_err() {
                 break;
             }
@@ -123,21 +120,20 @@ fn main() {
         return;
     }
 
-    // 必须在单例 Mutex 锁之前拦截 --check-update，否则子进程会被当作重复实例直接退出。
+    // 必须在单例 Mutex 之前拦截 --check-update，否则子进程会被当作重复实例退出。
     if args.iter().any(|a| a == "--check-update") {
         let is_manual = args.iter().any(|a| a == "--manual");
         std::process::exit(subprocess_main(is_manual));
     }
 
+    // MUTEX_NAME 常量已含尾 NUL。
     let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
-
-    // SAFETY: mutex_name 以 NUL 结尾，句柄由 MutexGuard 管理。
-    let mutex_handle =
-        unsafe { CreateMutexW(None, true, windows::core::PCWSTR(mutex_name.as_ptr())) };
+    // SAFETY: mutex_name 以 NUL 结尾；句柄由 MutexGuard 关闭。
+    let mutex_handle = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) };
 
     let _mutex_guard = match mutex_handle {
         Ok(handle) => {
-            // SAFETY: 立即在 CreateMutexW 之后读取 GetLastError，避免中间插入其他 Win32 调用导致错误码被覆盖。
+            // SAFETY: 紧接 CreateMutexW 读取 last-error，避免被中间调用覆盖。
             let last_error = unsafe { GetLastError() };
             let guard = crate::ffi_guard::MutexGuard(handle);
             if last_error == ERROR_ALREADY_EXISTS {
@@ -151,44 +147,36 @@ fn main() {
         }
     };
 
-    // 主进程没有任何文本输入需求。必须在首个顶层窗口收到 WM_CREATE 前禁用整个
-    // 进程的 IME，避免更新子进程弹窗关闭后的焦点回落触发第三方 TSF/IME 常驻。
-    // SAFETY:
-    // ImmDisableIME 只修改当前进程的输入法管理状态，不接收指针或外部句柄；
-    // u32::MAX 是 Win32 约定的“当前进程全部现有及后续线程”标识。此处尚未调用
-    // CreateWindowExW，满足 API 必须在首个顶层窗口创建前执行的时序要求。
+    // 首个顶层窗口创建前禁用进程 IME，避免更新弹窗焦点回落触发第三方 TSF 常驻。
+    // SAFETY: ImmDisableIME(u32::MAX) 仅改本进程输入法状态；须在 CreateWindowExW 前调用。
     unsafe {
         let _ = ImmDisableIME(u32::MAX);
     }
 
-    if register_window_class().is_err() {
-        show_error("注册窗口类失败");
+    if let Err(e) = register_window_class() {
+        show_error(&e);
         return;
     }
 
     let hwnd = match create_main_window() {
         Ok(h) => h,
         Err(e) => {
-            show_error(&format!("创建窗口失败: {e}"));
+            show_error(&e);
             return;
         }
     };
 
     init_network_listener(hwnd);
 
-    // SAFETY: "TaskbarCreated" 是 Windows 约定的常量字符串。
-    // RegisterWindowMessageW 失败时返回 0：仍静默降级（窗口过程已通过
-    // `msg == tcm && tcm != 0` 防御），但显式记录以便诊断 Explorer 重建失效。
+    // RegisterWindowMessageW 失败返回 0；窗口过程用 `msg == tcm && tcm != 0` 防御。
     let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     if taskbar_msg == 0 {
-        // SAFETY: 紧随 RegisterWindowMessageW 之后读取，中间未插入其他可改写
-        // last-error 的 Win32 调用。
+        // SAFETY: 紧随 RegisterWindowMessageW，未插入其他可改写 last-error 的调用。
         let last = unsafe { GetLastError() };
         show_error(&format!("注册 TaskbarCreated 消息失败: 0x{:08X}", last.0));
     }
     TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::Release);
 
-    // SAFETY: hwnd 有效，GUID_MONITOR_POWER_ON 是系统静态 GUID。
     let power_notify = unsafe {
         RegisterPowerSettingNotification(
             HANDLE(hwnd.0),
@@ -201,7 +189,7 @@ fn main() {
             POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Release);
         }
         Err(e) => {
-            // 非致命：显示器开关检测失效，仅影响唤醒节能。记录便于排查。
+            // 非致命：仅影响显示器开关节能。
             show_error(&format!("注册电源设置通知失败: {e:?}"));
         }
     }
@@ -212,7 +200,7 @@ fn main() {
     }
 
     let auto_update = load_auto_update_enabled();
-    ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Release);
+    ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Relaxed);
 
     create_tray_icon(hwnd);
 
@@ -235,7 +223,6 @@ fn main() {
         }
     });
 
-    // SAFETY: hwnd 有效，触发初始重绘。
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
@@ -245,8 +232,7 @@ fn main() {
         return;
     }
 
-    // SAFETY: hwnd 有效，注册会话通知以接收锁屏/解锁事件。
-    // 失败为非致命：锁屏暂停将失效，但显示器关闭暂停仍可由电源通知覆盖。
+    // 失败非致命：锁屏暂停失效，显示器关闭仍可由电源通知覆盖。
     unsafe {
         if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
             show_error(&format!("注册会话通知失败: {e:?}"));
@@ -256,19 +242,14 @@ fn main() {
     init_cleanup_temp();
     start_auto_check(hwnd);
 
-    // SAFETY:
-    // hwnd 由 CreateWindowExW 返回，经 is_invalid() 校验通过，为当前进程的有效主窗口句柄。
-    // TIMER_ID_INIT_TRIM (99) 为唯一常量，不与已有定时器 ID (1/2/3) 冲突。
-    // 一次性定时器在 10 秒后触发 trim_working_set()，释放初始化阶段遗留的冷代码页。
+    // 一次性定时器：10s 后 trim 初始化冷页；ID 99 不与监测定时器冲突。
     unsafe {
         let _ = SetTimer(Some(hwnd), TIMER_ID_INIT_TRIM, 10000, None);
     }
 
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
 
-    // SAFETY: msg 由操作系统填充，消息循环是标准 Win32 模式。
-    // GetMessageW 返回值三态：> 0 有消息；0 收到 WM_QUIT 正常退出；
-    // -1 致命错误（窗口/消息无效），必须停止循环以免继续处理未定义状态。
+    // GetMessageW：>0 有消息；0 收到 WM_QUIT；-1 致命错误须退出。
     unsafe {
         loop {
             match windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0).0 {
@@ -286,14 +267,12 @@ fn main() {
         }
     }
 
-    // SAFETY: hwnd 有效，注销会话通知。
     unsafe {
         let _ = WTSUnRegisterSessionNotification(hwnd);
     }
 
     let power_handle = POWER_NOTIFY_HANDLE.load(Ordering::Acquire);
     if power_handle != 0 {
-        // SAFETY: 注销先前注册的电源通知句柄。
         unsafe {
             let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(power_handle));
         }
@@ -304,19 +283,11 @@ fn main() {
     });
 }
 
-use crate::suspend::{
-    check_fullscreen, is_immersive_color_set, is_suspended, resume_system, suspend_system,
-    sync_monitoring_timers,
-};
-use crate::window::{embed_in_taskbar, invalidate_taskbar_cache, update_taskbar_position};
-
-const WTS_SESSION_LOCK: usize = 0x7;
-const WTS_SESSION_UNLOCK: usize = 0x8;
+// --- 窗口过程与消息处理 ---
 
 fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
     invalidate_taskbar_cache();
     remove_tray_icon();
-    // SAFETY: hwnd 有效，隐藏窗口。
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
@@ -340,10 +311,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     match wparam.0 {
         TIMER_ID_INIT_TRIM => {
             trim_working_set();
-            // SAFETY:
-            // hwnd 来自窗口过程，为操作系统分配的有效窗口句柄。
-            // TIMER_ID_INIT_TRIM 为本次启动时已创建的定时器 ID。
-            // KillTimer 对已销毁或不存在的定时器仅返回错误，不会触发 UB。
+            // KillTimer 对不存在的定时器仅返回错误，不触发 UB。
             unsafe {
                 KillTimer(Some(hwnd), TIMER_ID_INIT_TRIM).ok();
             }
@@ -357,7 +325,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
                 update_taskbar_position(hwnd);
                 collect_network();
-                // SAFETY: hwnd 有效，刷新网速显示。
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -367,7 +334,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
                 collect_cpu();
                 collect_memory();
-                // SAFETY: hwnd 有效，刷新 CPU/内存显示。
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -377,9 +343,8 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
                 let prev = THERMAL_STATE.load(Ordering::Relaxed);
                 collect_thermal();
-                // 仅在热状态实际跳变时触发重绘，避免每秒空转 DWM 合成。
+                // 仅状态跳变时重绘，避免每秒空转 DWM。
                 if THERMAL_STATE.load(Ordering::Relaxed) != prev {
-                    // SAFETY: hwnd 有效，刷新热风险变色显示。
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -402,7 +367,7 @@ fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
         PBT_POWERSETTINGCHANGE => {
             let setting = lparam.0 as *const POWERBROADCAST_SETTING;
             if !setting.is_null() {
-                // SAFETY: PBT_POWERSETTINGCHANGE 时 OS 保证 lparam 指向有效的 POWERBROADCAST_SETTING。
+                // SAFETY: PBT_POWERSETTINGCHANGE 时 OS 保证 lparam 指向有效结构。
                 let setting_ref = unsafe { &*setting };
                 if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1
                 {
@@ -444,14 +409,13 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            // SAFETY: hwnd 有效，BeginPaint/EndPaint 配对使用。
+            // SAFETY: BeginPaint/EndPaint 必须配对。
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             RENDERER.with(|r| {
                 if let Some(renderer) = r.borrow_mut().as_mut() {
                     renderer.render(hdc);
                 }
             });
-            // SAFETY: hwnd 与 ps 有效，结束绘图。
             unsafe {
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -479,7 +443,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         WM_SETTINGCHANGE => {
-            // SAFETY: WM_SETTINGCHANGE 的 lparam 由 OS 保证指向合法的 NUL 结尾宽字符串。
+            // SAFETY: OS 保证 lparam 指向 NUL 结尾宽字符串（或 null）。
             if unsafe { is_immersive_color_set(lparam) } {
                 RENDERER.with(|r| {
                     if let Some(renderer) = r.borrow_mut().as_mut() {
@@ -506,7 +470,6 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
         WM_CLOSE => {
             remove_tray_icon();
-            // SAFETY: PostQuitMessage 向当前线程投递 WM_QUIT。
             unsafe {
                 PostQuitMessage(0);
             }
@@ -527,7 +490,6 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        // SAFETY: hwnd、msg、wparam、lparam 由操作系统传入，调用默认窗口过程是安全的。
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }

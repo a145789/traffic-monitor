@@ -91,7 +91,7 @@ fn create_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::F
 }
 
 pub fn start_auto_check(hwnd: HWND) {
-    if !ENABLE_AUTO_UPDATE.load(Ordering::Acquire) {
+    if !ENABLE_AUTO_UPDATE.load(Ordering::Relaxed) {
         return;
     }
 
@@ -504,10 +504,8 @@ fn show_yes_no(msg: &str) -> bool {
 }
 
 fn open_url(url: &str) {
-    let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY:
-    // url_wide 是包含尾部 NUL 的 UTF-16 缓冲区，并在同步的 ShellExecuteW 调用期间
-    // 保持存活；其余字符串参数为 windows crate 提供的静态 NUL 终止字符串或 None。
+    let url_wide = to_wide(url);
+    // SAFETY: url_wide 含尾 NUL，ShellExecuteW 同步返回前存活。
     unsafe {
         let _ = ShellExecuteW(
             None,

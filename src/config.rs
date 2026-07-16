@@ -1,6 +1,9 @@
 //! 编译期常量：窗口尺寸、颜色、定时器 ID/间隔、热模型参数等。
 //!
 //! 运行时可变状态见 `state.rs`。
+//!
+//! 含尾 `\0` 的字符串常量可直接 `encode_utf16().collect()` 交给 Win32；
+//! 业务侧动态字符串请用 `util::to_wide`。
 
 pub const APP_NAME: &str = "TrafficMonitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";

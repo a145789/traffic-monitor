@@ -33,6 +33,12 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
    - **设计决策**：为确保后台低功耗常驻，小组件在休眠（`PBT_APMSUSPEND`）、锁屏（`WTS_SESSION_LOCK`）或当前显示器运行全屏应用时会执行 `suspend_system` 销毁监测定时器并冻结计算；在唤醒、解锁或退出全屏时通过 `resume_system` 恢复。任何针对监测周期的修改均必须保证“销毁”与“恢复”操作在逻辑上完全对称，否则会导致唤醒后组件数据永久冻结（卡死假活）。
 8. **RAII 句柄守卫归属规则**
    - **设计决策**：[src/ffi_guard.rs](src/ffi_guard.rs) 仅收口「裸句柄 → 单一 `Close*`/`Destroy*`」配对、无业务构造语义的通用守卫（当前为 `MutexGuard`、`MenuGuard`）。业务专属守卫（`Renderer` 的事务式 `ScreenDcGuard`/`OwnedDc`/`OwnedBitmap`/`OwnedFont`/`OwnedBrush`、`update` 的 `WinHttpHandles`/`BcryptHandles`、`collector` 的 `MibTable`）**保留在各自业务文件**，因为它们的创建/选入/释放顺序与该模块的不变量强耦合。新增守卫时按此归属规则选择位置，禁止为追求「集中」而割裂业务上下文。
+9. **代码风格（易被后续改动打散）**
+   - **用户可见字符串一律中文**（MessageBox、托盘菜单、初始化错误信息）。
+   - **业务宽字符串用 `util::to_wide`**；`config` 中已含尾 `\0` 的常量直接 `encode_utf16().collect()`。
+   - **生产路径禁止 `unwrap`/`expect`**（测试与 mutex poison 除外）；失败用 `Result`/`Option` 或早退。
+   - **`unsafe` 旁注只写不变量 / 失败歧义 / 内存布局**，禁止复述“句柄有效因为 OS 给了我们”。
+   - **原子序约定**见 [src/state.rs](src/state.rs) 模块头与各字段注释（Relaxed 展示/开关；Acq/Rel 跨线程握手）。
 
 ---
 

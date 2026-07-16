@@ -581,16 +581,14 @@ fn create_font(size: i32) -> HFONT {
     let mut lf = LOGFONTW {
         lfHeight: -size,
         lfWeight: 400,
-        lfQuality: FONT_QUALITY(3), // NONANTIALIASED_QUALITY, 彻底斩断 Layered 窗口上 GDI 渲染的半透明粉红毛边
+        // NONANTIALIASED_QUALITY：避免 Layered 窗口上 GDI 半透明粉红毛边。
+        lfQuality: FONT_QUALITY(3),
         ..Default::default()
     };
-    let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
-    lf.lfFaceName[..font_name.len()].copy_from_slice(&font_name);
-    // SAFETY:
-    // 1. lf 已经过完整的零初始化且 lfFaceName 被安全地写入了以 NUL 结尾的 "Segoe UI"
-    //    宽字符序列，避免了非法内存溢出。
-    // 2. 传入 LOGFONTW 结构体的指针给 CreateFontIndirectW 调用是内存安全的，返回的
-    //    HFONT 句柄所有权将被返回并交由外部进行清理。
+    let font_name = to_wide("Segoe UI");
+    let copy_len = font_name.len().min(lf.lfFaceName.len());
+    lf.lfFaceName[..copy_len].copy_from_slice(&font_name[..copy_len]);
+    // SAFETY: lfFaceName 含尾 NUL；返回的 HFONT 由调用方独占释放。
     unsafe { CreateFontIndirectW(&lf) }
 }
 

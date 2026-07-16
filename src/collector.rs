@@ -145,26 +145,27 @@ impl Drop for MibTable {
 
 pub fn collect_network() {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-    // SAFETY:
-    // table 指针传入 GetIfTable2 的可变引用中，成功调用后由 Windows 操作系统分配一块
-    // MIB_IF_TABLE2 结构的内存并填充数据，然后通过包装器 MibTable(table) 在其 Drop 中正确自动释放（RAII）。
+    // SAFETY: 成功时 OS 分配表，由 MibTable Drop → FreeMibTable 释放。
     let result = unsafe { GetIfTable2(&mut table) };
 
-    if result.0 == 0 && !table.is_null() {
-        let table_wrapper = MibTable(table);
-        let virtual_blacklist = get_virtual_blacklist();
-        let mut current_data = CURRENT_DATA.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    if result.0 != 0 || table.is_null() {
+        return;
+    }
+
+    let table_wrapper = MibTable(table);
+    let virtual_blacklist = get_virtual_blacklist();
+    let mut has_up_interface = false;
+
+    CURRENT_DATA.with(|cell| {
+        let mut current_data = cell.borrow_mut();
         current_data.clear();
-        let mut has_up_interface = false;
 
         for row in table_wrapper.rows() {
             if !is_valid_interface(row) {
                 continue;
             }
 
-            // SAFETY:
-            // InterfaceLuid 是 Win32 中的联合体（union）。
-            // 操作系统返回的 MibTable 中的每一行数据均由系统成功初始化，因此访问此联合体字段是内存安全的。
+            // SAFETY: 系统已初始化的 InterfaceLuid 联合体，只读 Value。
             let luid = unsafe { row.InterfaceLuid.Value };
             if virtual_blacklist.contains(&luid) {
                 continue;
@@ -177,23 +178,22 @@ pub fn collect_network() {
         }
 
         if !NET_INITIALIZED.load(Ordering::Acquire) {
-            // 首次采样：仅记录基线字节与时刻，不计算速率。
+            // 首次采样：只记基线，不算速率。
             let now = Instant::now();
-            INTERFACE_HISTORY.with(|cell| {
-                let mut history = cell.borrow_mut();
+            INTERFACE_HISTORY.with(|hist| {
+                let mut history = hist.borrow_mut();
                 history.clear();
-                for (luid, (in_octets, out_octets)) in &current_data {
+                for (luid, (in_octets, out_octets)) in current_data.iter() {
                     history.insert(*luid, (*in_octets, *out_octets, now));
                 }
             });
             NET_INITIALIZED.store(true, Ordering::Release);
-            CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
             return;
         }
 
         let now = Instant::now();
         let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
-            .with(|cell| select_winner_interface(&current_data, &mut cell.borrow_mut(), now));
+            .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
 
         NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
         NET_SPEED_UP.store(best_speed_up, Ordering::Release);
@@ -203,9 +203,7 @@ pub fn collect_network() {
             if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
                 NETWORK_BACKOFF.store(true, Ordering::Release);
                 let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
-                // SAFETY:
-                // HWND 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
-                // PostMessageW 是线程安全的 Windows API，能安全地跨线程投递自定义的网络断开消息。
+                // SAFETY: PostMessageW 只投递消息，线程安全。
                 unsafe {
                     let _ = PostMessageW(
                         Some(hwnd),
@@ -220,9 +218,6 @@ pub fn collect_network() {
             if NETWORK_BACKOFF.load(Ordering::Acquire) {
                 NETWORK_BACKOFF.store(false, Ordering::Release);
                 let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));
-                // SAFETY:
-                // HWND 句柄是由主线程初始化并存储在原子指针中的有效窗口句柄。
-                // PostMessageW 是线程安全的 Windows API，能安全地跨线程投递自定义的网络重连消息。
                 unsafe {
                     let _ = PostMessageW(
                         Some(hwnd),
@@ -233,16 +228,13 @@ pub fn collect_network() {
                 }
             }
         }
-
-        CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
-    }
+    });
 }
 
-/// 根据当前网卡字节数、历史记录和经过的毫秒数，选择总流量（上行+下行）最大的单一网卡，
-/// 并用本次数据更新历史，同时清理已经不再活跃的网卡历史。
+/// 选择总流量（上行+下行）最大的单一网卡，更新历史并清理已离线 LUID。
 fn select_winner_interface(
-    current_data: &std::collections::HashMap<u64, (u64, u64)>,
-    history: &mut std::collections::HashMap<u64, (u64, u64, Instant)>,
+    current_data: &HashMap<u64, (u64, u64)>,
+    history: &mut HashMap<u64, (u64, u64, Instant)>,
     now: Instant,
 ) -> (u32, u32) {
     let mut max_total: u64 = 0;
@@ -450,8 +442,7 @@ fn get_virtual_blacklist() -> Rc<HashSet<u64>> {
                 .as_ref()
                 .map(|(l, _)| Rc::clone(l))
                 .unwrap_or_else(|| Rc::new(HashSet::new()));
-            // Update timestamp on failure so we don't retry GetAdaptersAddresses
-            // on every tick; reuse the old list (or empty) for 30s.
+            // 失败也刷新时间戳，避免每 tick 重试 GetAdaptersAddresses；沿用旧表 30s。
             *cache = Some((Rc::clone(&old), Instant::now()));
             old
         }),

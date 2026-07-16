@@ -88,10 +88,8 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
 }
 
 pub fn check_fullscreen(hwnd: HWND) {
-    // SAFETY: 纯查询 API，无副作用。
     let foreground = unsafe { GetForegroundWindow() };
     let is_invalid = foreground.is_invalid();
-    // SAFETY: GetDesktopWindow 和 GetShellWindow 是纯查询 Win32 API，无副作用。
     let is_desktop_or_shell =
         unsafe { GetDesktopWindow() == foreground || GetShellWindow() == foreground };
 
@@ -105,15 +103,13 @@ pub fn check_fullscreen(hwnd: HWND) {
     }
 
     let mut rect = RECT::default();
-    // SAFETY: foreground 非空，rect 在栈上分配。
     let _ = unsafe { GetWindowRect(foreground, &mut rect) };
 
-    // 使用 MonitorFromWindow 获取前台窗口所在显示器
-    // SAFETY: foreground 有效，MONITOR_DEFAULTTONEAREST 是合法标志。
+    // 前台窗口所在显示器 vs 任务栏所在显示器，仅同屏全屏才暂停。
     let hmon_fg = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
     let mut mi_fg = MONITORINFOEXW::default();
     mi_fg.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-    // SAFETY: hmon_fg 有效，mi_fg 在栈上分配且 cbSize 已初始化。
+    // SAFETY: cbSize 已设；GetMonitorInfoW 写入 mi_fg。
     let fg_ok = unsafe { GetMonitorInfoW(hmon_fg, &mut mi_fg as *mut MONITORINFOEXW as *mut _) };
 
     let is_full = if fg_ok.as_bool() {
@@ -126,10 +122,8 @@ pub fn check_fullscreen(hwnd: HWND) {
         false
     };
 
-    // 检查前台窗口是否覆盖任务栏所在显示器
     let same_monitor = match get_taskbar_hwnd() {
         Some(h_taskbar) => {
-            // SAFETY: h_taskbar 有效。
             let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
             hmon_fg == hmon_tb
         }

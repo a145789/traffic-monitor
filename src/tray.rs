@@ -1,14 +1,17 @@
-use windows::Win32::Foundation::{HWND, POINT};
+use std::cell::RefCell;
+use std::sync::atomic::Ordering;
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, GetCursorPos, IDI_APPLICATION, InsertMenuItemW, LoadIconW,
-    MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFS_UNCHECKED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID,
-    MIIM_STATE, MIIM_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CLOSE, WM_USER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    CreatePopupMenu, CreateWindowExW, GetCursorPos, HMENU, IDI_APPLICATION, InsertMenuItemW,
+    LoadIconW, MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFS_UNCHECKED, MFT_SEPARATOR, MIIM_FTYPE,
+    MIIM_ID, MIIM_STATE, MIIM_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CLOSE, WM_USER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -18,7 +21,7 @@ use crate::config::{
 };
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
-use std::cell::RefCell;
+use crate::util::to_wide;
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 pub const MENU_ID_AUTOSTART: u32 = 1001;
@@ -30,45 +33,46 @@ thread_local! {
     static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) };
 }
 
-pub fn register_window_class() -> Result<(), String> {
-    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
-    let class_name_pcw = PCWSTR(class_name.as_ptr());
+fn module_instance() -> Result<windows::Win32::Foundation::HINSTANCE, String> {
+    // SAFETY: GetModuleHandleW(None) 查询当前进程模块，无指针参数。
+    unsafe { GetModuleHandleW(None) }
+        .map(Into::into)
+        .map_err(|e| format!("获取模块句柄失败: {e:?}"))
+}
 
-    // SAFETY: GetModuleHandleW(None) 在当前进程内总是成功。
-    let hinstance = unsafe { GetModuleHandleW(None).unwrap().into() };
+pub fn register_window_class() -> Result<(), String> {
+    // WINDOW_CLASS 常量已含尾 NUL。
+    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
+    let hinstance = module_instance()?;
 
     let wnd_class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(crate::wnd_proc),
         hInstance: hinstance,
-        lpszClassName: class_name_pcw,
+        lpszClassName: PCWSTR(class_name.as_ptr()),
         ..Default::default()
     };
 
-    // SAFETY: wnd_class 已完整初始化，class_name_pcw 生命周期覆盖调用。
+    // SAFETY: class_name 在调用期间保持存活；wnd_class 字段完整。
     let atom = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterClassExW(&wnd_class) };
     if atom == 0 {
-        return Err("Failed to register window class".to_string());
+        return Err("注册窗口类失败".to_string());
     }
-
     Ok(())
 }
 
 pub fn create_main_window() -> Result<HWND, String> {
+    // WINDOW_CLASS / WINDOW_TITLE 常量已含尾 NUL。
     let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
     let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
-    let class_name_pcw = PCWSTR(class_name.as_ptr());
-    let window_name_pcw = PCWSTR(window_name.as_ptr());
+    let hinstance = module_instance()?;
 
-    // SAFETY: GetModuleHandleW(None) 在当前进程内总是成功。
-    let hinstance = unsafe { GetModuleHandleW(None).unwrap().into() };
-
-    // SAFETY: PCWSTR 指针生命周期覆盖调用，CreateWindowExW 失败时返回 Err。
+    // SAFETY: 宽字符串缓冲区在调用期间存活。
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            class_name_pcw,
-            window_name_pcw,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(window_name.as_ptr()),
             WS_POPUP | WS_VISIBLE,
             0,
             0,
@@ -81,24 +85,21 @@ pub fn create_main_window() -> Result<HWND, String> {
         )
     };
 
-    match hwnd {
-        Ok(h) => Ok(h),
-        Err(e) => Err(format!("Failed to create window: {:?}", e)),
-    }
+    hwnd.map_err(|e| format!("创建窗口失败: {e:?}"))
 }
 
 pub fn create_tray_icon(hwnd: HWND) {
-    // SAFETY: LoadIconW 失败时回退到 IDI_APPLICATION。
+    let hinstance = match module_instance() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    // 1 as *const u16 对应 MAKEINTRESOURCEW(1)，资源 ID 1（assets/icon.ico）。
     #[allow(clippy::manual_dangling_ptr)]
-    // 1 as *const u16 对应 Win32 MAKEINTRESOURCEW(1)，表示嵌入的资源 ID 1（assets/icon.ico），
-    // clippy 的 manual_dangling_ptr 规则无法识别 Windows 资源 ID 惯用法，此处需抑制该 lint。
     let hicon = unsafe {
-        LoadIconW(
-            Some(GetModuleHandleW(None).unwrap().into()),
-            PCWSTR(1 as *const u16),
-        )
-        .or_else(|_| LoadIconW(None, IDI_APPLICATION))
-        .unwrap_or_default()
+        LoadIconW(Some(hinstance), PCWSTR(1 as *const u16))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default()
     };
 
     let mut nid = NOTIFYICONDATAW {
@@ -110,15 +111,16 @@ pub fn create_tray_icon(hwnd: HWND) {
         hIcon: hicon,
         ..Default::default()
     };
-    nid.Anonymous.uVersion = windows::Win32::UI::Shell::NOTIFYICON_VERSION_4;
+    nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
 
-    let tip: Vec<u16> = "Traffic Monitor\0".encode_utf16().collect();
-    nid.szTip[..tip.len()].copy_from_slice(&tip);
+    let tip = to_wide("Traffic Monitor");
+    let copy_len = tip.len().min(nid.szTip.len());
+    nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
 
-    // SAFETY: nid 已完整初始化，生命周期覆盖调用。
+    // SAFETY: nid 完整初始化，同步调用期间存活。
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-        let _ = Shell_NotifyIconW(windows::Win32::UI::Shell::NIM_SETVERSION, &nid);
+        let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
     }
     TRAY_DATA.with(|t| {
         *t.borrow_mut() = Some(nid);
@@ -128,7 +130,7 @@ pub fn create_tray_icon(hwnd: HWND) {
 pub fn remove_tray_icon() {
     TRAY_DATA.with(|t| {
         if let Some(nid) = t.borrow().as_ref() {
-            // SAFETY: nid 由 create_tray_icon 成功添加，生命周期由 TRAY_DATA 管理。
+            // SAFETY: nid 来自 create_tray_icon，生命周期由 TRAY_DATA 管理。
             unsafe {
                 let _ = Shell_NotifyIconW(NIM_DELETE, nid);
             }
@@ -136,137 +138,104 @@ pub fn remove_tray_icon() {
     });
 }
 
-pub fn show_context_menu(hwnd: HWND) {
-    let mut point = POINT::default();
-    // SAFETY: point 在栈上分配，GetCursorPos 填充有效坐标。
-    unsafe {
-        let _ = GetCursorPos(&mut point);
-    }
-
-    // SAFETY: CreatePopupMenu 失败时 unwrap panic，成功时句柄由 MenuGuard 管理。
-    let hmenu = unsafe { CreatePopupMenu().unwrap() };
-    let _menu_guard = MenuGuard(hmenu);
-
-    // 1. Version item (Disabled)
-    let version_str = format!("Traffic Monitor v{}\0", VERSION);
-    let version_text: Vec<u16> = version_str.encode_utf16().collect();
-    let mut version_item = MENUITEMINFOW {
+/// 插入字符串菜单项；`text` 须以 NUL 结尾（`to_wide` 产出即可）。
+fn insert_string_item(hmenu: HMENU, pos: u32, id: u32, text: &[u16], state: u32) {
+    let mut item = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: MFS_DISABLED,
-        wID: 0,
+        fState: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE(state),
+        wID: id,
         ..Default::default()
     };
-    version_item.dwTypeData = PWSTR(version_text.as_ptr() as *mut u16);
-
-    // SAFETY: version_item 已初始化，dwTypeData 指向有效的 version_text。
+    item.dwTypeData = PWSTR(text.as_ptr() as *mut u16);
+    // SAFETY: text 在 InsertMenuItemW 同步返回前保持存活。
     unsafe {
-        let _ = InsertMenuItemW(hmenu, 0, true, &version_item);
+        let _ = InsertMenuItemW(hmenu, pos, true, &item);
     }
+}
 
-    // 2. Separator
-    let sep_item = MENUITEMINFOW {
+fn insert_separator(hmenu: HMENU, pos: u32) {
+    let item = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_FTYPE,
         fType: MFT_SEPARATOR,
         ..Default::default()
     };
-
-    // SAFETY: sep_item 仅指定分隔线类型，无缓冲区依赖。
     unsafe {
-        let _ = InsertMenuItemW(hmenu, 1, true, &sep_item);
+        let _ = InsertMenuItemW(hmenu, pos, true, &item);
+    }
+}
+
+pub fn show_context_menu(hwnd: HWND) {
+    let mut point = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut point);
     }
 
-    // 3. Autostart
-    let autostart_text: Vec<u16> = "开机自启\0".encode_utf16().collect();
-    let mut autostart_item = MENUITEMINFOW {
-        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: if is_autostart_enabled() {
-            MFS_CHECKED
-        } else {
-            MFS_UNCHECKED
-        },
-        wID: MENU_ID_AUTOSTART,
-        ..Default::default()
+    let Ok(hmenu) = (unsafe { CreatePopupMenu() }) else {
+        return;
     };
-    autostart_item.dwTypeData = PWSTR(autostart_text.as_ptr() as *mut u16);
+    let menu_guard = MenuGuard(hmenu);
 
-    // SAFETY: autostart_item 已初始化，dwTypeData 指向有效的 autostart_text。
-    unsafe {
-        let _ = InsertMenuItemW(hmenu, 2, true, &autostart_item);
-    }
+    let version_text = to_wide(&format!("Traffic Monitor v{VERSION}"));
+    insert_string_item(hmenu, 0, 0, &version_text, MFS_DISABLED.0);
 
-    // 4. Auto-update toggle
-    let auto_update_enabled = ENABLE_AUTO_UPDATE.load(std::sync::atomic::Ordering::Relaxed);
-    let autoupdate_text: Vec<u16> = "自动检查更新\0".encode_utf16().collect();
-    let mut autoupdate_item = MENUITEMINFOW {
-        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: if auto_update_enabled {
-            MFS_CHECKED
-        } else {
-            MFS_UNCHECKED
-        },
-        wID: MENU_ID_AUTO_UPDATE_TOGGLE,
-        ..Default::default()
-    };
-    autoupdate_item.dwTypeData = PWSTR(autoupdate_text.as_ptr() as *mut u16);
+    insert_separator(hmenu, 1);
 
-    // SAFETY: autoupdate_item 已初始化，dwTypeData 指向有效的 autoupdate_text。
-    unsafe {
-        let _ = InsertMenuItemW(hmenu, 3, true, &autoupdate_item);
-    }
-
-    // 5. Manual check update
-    let update_in_progress = UPDATE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
-    let check_update_text: Vec<u16> = if update_in_progress {
-        "检查更新中...\0".encode_utf16().collect()
+    let autostart_text = to_wide("开机自启");
+    let autostart_state = if is_autostart_enabled() {
+        MFS_CHECKED.0
     } else {
-        "检查更新...\0".encode_utf16().collect()
+        MFS_UNCHECKED.0
     };
-    let mut check_update_item = MENUITEMINFOW {
-        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: if update_in_progress {
-            MFS_DISABLED
-        } else {
-            MFS_UNCHECKED
-        },
-        wID: MENU_ID_CHECK_UPDATE_MANUAL,
-        ..Default::default()
+    insert_string_item(
+        hmenu,
+        2,
+        MENU_ID_AUTOSTART,
+        &autostart_text,
+        autostart_state,
+    );
+
+    let auto_update_enabled = ENABLE_AUTO_UPDATE.load(Ordering::Relaxed);
+    let autoupdate_text = to_wide("自动检查更新");
+    let autoupdate_state = if auto_update_enabled {
+        MFS_CHECKED.0
+    } else {
+        MFS_UNCHECKED.0
     };
-    check_update_item.dwTypeData = PWSTR(check_update_text.as_ptr() as *mut u16);
+    insert_string_item(
+        hmenu,
+        3,
+        MENU_ID_AUTO_UPDATE_TOGGLE,
+        &autoupdate_text,
+        autoupdate_state,
+    );
 
-    // SAFETY: check_update_item 已初始化，dwTypeData 指向有效的 check_update_text。
-    unsafe {
-        let _ = InsertMenuItemW(hmenu, 4, true, &check_update_item);
-    }
-
-    // 6. Exit
-    let exit_text: Vec<u16> = "退出\0".encode_utf16().collect();
-    let mut exit_item = MENUITEMINFOW {
-        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-        fMask: MIIM_STRING | MIIM_STATE | MIIM_ID,
-        fState: MFS_UNCHECKED,
-        wID: MENU_ID_EXIT,
-        ..Default::default()
+    let update_in_progress = UPDATE_IN_PROGRESS.load(Ordering::Relaxed);
+    let check_update_text = if update_in_progress {
+        to_wide("检查更新中...")
+    } else {
+        to_wide("检查更新...")
     };
-    exit_item.dwTypeData = PWSTR(exit_text.as_ptr() as *mut u16);
+    let check_state = if update_in_progress {
+        MFS_DISABLED.0
+    } else {
+        MFS_UNCHECKED.0
+    };
+    insert_string_item(
+        hmenu,
+        4,
+        MENU_ID_CHECK_UPDATE_MANUAL,
+        &check_update_text,
+        check_state,
+    );
 
-    // SAFETY: exit_item 已初始化，dwTypeData 指向有效的 exit_text。
-    unsafe {
-        let _ = InsertMenuItemW(hmenu, 5, true, &exit_item);
-    }
+    let exit_text = to_wide("退出");
+    insert_string_item(hmenu, 5, MENU_ID_EXIT, &exit_text, MFS_UNCHECKED.0);
 
-    // 使用 TPM_RETURNCMD 阻止菜单循环重入投递 WM_COMMAND。取得选择后先把前台权
-    // 交还 Explorer，再执行命令，避免更新弹窗关闭时焦点恢复到常驻主进程。
-    // SAFETY:
-    // 1. hwnd 是主线程创建且仍存活的窗口；hmenu 由 CreatePopupMenu 创建并由
-    //    MenuGuard 保持到 TrackPopupMenu 返回；point 来自 GetCursorPos。
-    // 2. SetForegroundWindow 临时激活菜单所有者，满足托盘弹出菜单的 Win32 约定。
-    // 3. TPM_RETURNCMD 返回菜单 ID 而不发送 WM_COMMAND，因此命令不会在菜单循环中
-    //    重入执行，所有指针缓冲区均保持存活到同步调用返回。
+    // TPM_RETURNCMD：先取命令，再把前台权交还任务栏，最后执行，避免更新弹窗
+    // 关闭后焦点回落主进程并初始化第三方 IME（见 AGENTS.md）。
+    // SAFETY: hmenu 由 MenuGuard 持有至 TrackPopupMenu 返回；菜单项宽串仍在栈上。
     let selected_item = unsafe {
         let _ = SetForegroundWindow(hwnd);
         TrackPopupMenu(
@@ -282,15 +251,12 @@ pub fn show_context_menu(hwnd: HWND) {
     };
 
     if let Some(taskbar) = crate::window::get_taskbar_hwnd() {
-        // SAFETY:
-        // taskbar 由 get_taskbar_hwnd 通过 IsWindow 验证，且当前线程刚被允许设置前台
-        // 窗口；将前台权交还 Explorer 不传递指针，也不改变窗口所有权。
         unsafe {
             let _ = SetForegroundWindow(taskbar);
         }
     }
 
-    drop(_menu_guard);
+    drop(menu_guard);
 
     if selected_item != 0 {
         handle_menu_command(hwnd, selected_item);
@@ -302,17 +268,9 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
         MENU_ID_AUTOSTART => toggle_autostart(),
         MENU_ID_AUTO_UPDATE_TOGGLE => toggle_auto_update(),
         MENU_ID_CHECK_UPDATE_MANUAL => crate::update::start_manual_check(hwnd),
-        MENU_ID_EXIT => {
-            // SAFETY: hwnd 有效，PostMessageW 异步投递 WM_CLOSE 是线程安全的。
-            unsafe {
-                let _ = PostMessageW(
-                    Some(hwnd),
-                    WM_CLOSE,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                );
-            }
-        }
+        MENU_ID_EXIT => unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        },
         _ => {}
     }
 }
@@ -332,15 +290,15 @@ fn toggle_autostart() {
             let _ = key.remove_value(APP_NAME);
         } else if let Ok(exe_path) = std::env::current_exe() {
             let path_str = exe_path.to_string_lossy().to_string();
-            let path_quoted = format!("\"{}\"", path_str);
+            let path_quoted = format!("\"{path_str}\"");
             let _ = key.set_string(APP_NAME, &path_quoted);
         }
     }
 }
 
 fn toggle_auto_update() {
-    let current = ENABLE_AUTO_UPDATE.load(std::sync::atomic::Ordering::Acquire);
+    let current = ENABLE_AUTO_UPDATE.load(Ordering::Relaxed);
     let new_state = !current;
-    ENABLE_AUTO_UPDATE.store(new_state, std::sync::atomic::Ordering::Release);
+    ENABLE_AUTO_UPDATE.store(new_state, Ordering::Relaxed);
     crate::update::save_auto_update_enabled(new_state);
 }
