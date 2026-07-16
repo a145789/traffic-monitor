@@ -1,6 +1,6 @@
 [Setup]
 AppName=Traffic Monitor
-AppVersion=0.9.2
+AppVersion=1.0.0
 AppPublisher=Traffic Monitor
 AppMutex=TrafficMonitor_Mutex_Instance
 DefaultDirName={autopf}\Traffic Monitor
