@@ -19,12 +19,9 @@ use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{reg_read_dword, reg_write_dword, show_error, show_info, to_wide};
 
-pub const WM_USER_UPDATE_READY: u32 = WM_USER + 5;
+pub const WM_USER_UPDATE_ACTION: u32 = WM_USER + 5;
 
-pub const UPDATE_STATUS_NO_UPDATE: usize = 0;
-pub const UPDATE_STATUS_PORTABLE_FOUND: usize = 1;
-pub const UPDATE_STATUS_INSTALLED_READY: usize = 2;
-pub const UPDATE_STATUS_ERROR: usize = 3;
+const UPDATE_ACTION_EXIT_MAIN: usize = 1;
 
 const VERSION_HOST: &str = "github.com";
 const VERSION_PATH: &str = "/a145789/traffic-monitor/releases/latest/download/version.txt";
@@ -39,9 +36,6 @@ const AUTO_CHECK_COOLDOWN_SECS: u64 = 3600;
 const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 
 static LAST_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
-static LATEST_VERSION: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
-static TEMP_FILE_PATH: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
-static UPDATE_ERROR_MESSAGE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 
 struct WinHttpHandles {
     h_request: *mut std::ffi::c_void,
@@ -474,8 +468,9 @@ pub fn start_auto_check(hwnd: HWND) {
 }
 
 pub fn start_manual_check(hwnd: HWND) {
+    // 更新相关提示必须全部由短生命周期子进程显示，避免 MessageBox/IME DLL
+    // 因重复点击进入常驻主进程；已有检查运行时直接忽略本次点击。
     if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
-        show_info("检查更新正在进行中，请稍后再试。");
         return;
     }
 
@@ -489,47 +484,15 @@ pub fn start_manual_check(hwnd: HWND) {
         .is_err()
     {
         UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-        show_error("启动更新检查失败。");
     }
 }
 
 fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
-    let result = run_check_subprocess();
-    let is_error = matches!(result, CheckResult::Error(_));
-
-    let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-
-    let mut posted = false;
-    match result {
-        CheckResult::NoUpdate => {
-            if is_manual {
-                post_update_status(hwnd, UPDATE_STATUS_NO_UPDATE);
-                posted = true;
-            }
-        }
-        CheckResult::PortableFound(version) => {
-            *LATEST_VERSION.lock().unwrap() = version;
-            post_update_status(hwnd, UPDATE_STATUS_PORTABLE_FOUND);
-            posted = true;
-        }
-        CheckResult::InstalledReady(version, temp_path) => {
-            *LATEST_VERSION.lock().unwrap() = version;
-            *TEMP_FILE_PATH.lock().unwrap() = temp_path;
-            post_update_status(hwnd, UPDATE_STATUS_INSTALLED_READY);
-            posted = true;
-        }
-        CheckResult::Error(msg) => {
-            *UPDATE_ERROR_MESSAGE.lock().unwrap() = msg;
-            if is_manual {
-                post_update_status(hwnd, UPDATE_STATUS_ERROR);
-                posted = true;
-            }
-        }
-    }
+    let outcome = run_check_subprocess(is_manual);
 
     if !is_manual {
         let mut last = LAST_CHECK_TIME.lock().unwrap();
-        if is_error {
+        if outcome.is_error {
             // Offset the timestamp so only a short cooldown remains.
             *last = Some(
                 Instant::now()
@@ -542,10 +505,15 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
         }
     }
 
-    if !posted {
-        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-        compact_and_trim();
+    if outcome.action == UpdateAction::ExitMain && !outcome.is_error {
+        let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+        if post_update_action(hwnd, UPDATE_ACTION_EXIT_MAIN) {
+            return;
+        }
     }
+
+    UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    compact_and_trim();
 }
 
 #[derive(Debug)]
@@ -554,6 +522,24 @@ enum CheckResult {
     PortableFound(String),
     InstalledReady(String, String),
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateAction {
+    Done,
+    ExitMain,
+}
+
+struct SubprocessOutcome {
+    action: UpdateAction,
+    is_error: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallerLaunch {
+    Started,
+    Cancelled,
+    Failed(u32),
 }
 
 fn do_update_check() -> CheckResult {
@@ -665,151 +651,161 @@ fn do_update_check() -> CheckResult {
     CheckResult::InstalledReady(latest_version, temp_path_str)
 }
 
-/// 子进程入口：执行更新检查并将结果序列化到 stdout，供主进程解析。
+/// 子进程入口：完成更新检查、用户交互和外部动作，仅将最终动作回传主进程。
 ///
-/// 协议（单行，`|` 分隔）：
-/// - `NO_UPDATE`
-/// - `PORTABLE|<version>`
-/// - `INSTALLED|<version>|<path>`
-/// - `ERROR|<reason>`
+/// stdout 单行协议：
+/// - `DONE`：子进程已处理完毕，主进程继续运行。
+/// - `EXIT_MAIN`：安装器已成功启动，主进程应退出。
 ///
-/// 退出码：0 = 成功（含 NoUpdate），1 = Error。
-pub fn subprocess_main() -> i32 {
+/// 退出码：0 = 检查流程成功完成，1 = 更新检查失败。手动检查失败时，错误提示
+/// 已由子进程显示；退出码只供主进程决定自动检查的重试冷却时间。
+pub fn subprocess_main(is_manual: bool) -> i32 {
     let result = do_update_check();
-    let line = match &result {
-        CheckResult::NoUpdate => "NO_UPDATE".to_string(),
-        CheckResult::PortableFound(v) => format!("PORTABLE|{v}"),
-        CheckResult::InstalledReady(v, p) => format!("INSTALLED|{v}|{p}"),
-        CheckResult::Error(msg) => {
-            let single_line_msg = msg.replace(['\r', '\n'], " ");
-            format!("ERROR|{single_line_msg}")
-        }
+    let is_error = matches!(result, CheckResult::Error(_));
+    let action = complete_update_interaction(result, is_manual);
+    let line = match action {
+        UpdateAction::Done => "DONE",
+        UpdateAction::ExitMain => "EXIT_MAIN",
     };
+
     let _ = std::io::stdout().write_all(line.as_bytes());
     let _ = std::io::stdout().flush();
-    if matches!(result, CheckResult::Error(_)) {
-        1
-    } else {
-        0
-    }
+    i32::from(is_error)
 }
 
-/// 主进程调用：re-exec 自身 `--check-update` 子进程，读取 stdout 解析结果。
-///
-/// winhttp/bcrypt 系列通过 /DELAYLOAD 延迟加载，主进程代码路径不触碰它们，
-/// 因此稳态下这些 DLL 永不进入主进程空间；子进程退出后它们随之释放。
-fn run_check_subprocess() -> CheckResult {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return CheckResult::Error("无法获取当前程序路径".to_string()),
-    };
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let output = match std::process::Command::new(exe)
-        .arg("--check-update")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => return CheckResult::Error(format!("无法启动更新子进程: {e}")),
-    };
-    let parsed = parse_check_result(&output.stdout);
-    match parsed {
-        CheckResult::Error(msg) => {
-            if msg == "未知错误" && !output.status.success() {
-                CheckResult::Error("检查更新子进程异常退出".to_string())
-            } else {
-                CheckResult::Error(msg)
+fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAction {
+    match result {
+        CheckResult::NoUpdate => {
+            if is_manual {
+                let version = env!("CARGO_PKG_VERSION");
+                show_info(&format!("当前已是最新版本 (v{version})。"));
             }
+            UpdateAction::Done
         }
-        other => other,
-    }
-}
-
-fn parse_check_result(stdout: &[u8]) -> CheckResult {
-    let text = match std::str::from_utf8(stdout) {
-        Ok(s) => s.trim(),
-        Err(_) => return CheckResult::Error("无法解析子进程输出编码".to_string()),
-    };
-    if text.is_empty() {
-        return CheckResult::Error("子进程未返回任何数据".to_string());
-    }
-    if text == "NO_UPDATE" {
-        return CheckResult::NoUpdate;
-    }
-    if let Some(version) = text.strip_prefix("PORTABLE|") {
-        return if version.is_empty() {
-            CheckResult::Error("更新结果解析错误 (PORTABLE 无版本号)".to_string())
-        } else {
-            CheckResult::PortableFound(version.to_string())
-        };
-    }
-    if let Some(payload) = text.strip_prefix("INSTALLED|") {
-        return match payload.split_once('|') {
-            Some((version, path)) if !version.is_empty() && !path.is_empty() => {
-                CheckResult::InstalledReady(version.to_string(), path.to_string())
-            }
-            _ => CheckResult::Error("更新结果解析错误 (INSTALLED 无版本或路径)".to_string()),
-        };
-    }
-    if text == "ERROR" {
-        return CheckResult::Error("未知网络或内部错误".to_string());
-    }
-    if let Some(message) = text.strip_prefix("ERROR|") {
-        return if message.is_empty() {
-            CheckResult::Error("未知网络或内部错误".to_string())
-        } else {
-            CheckResult::Error(message.to_string())
-        };
-    }
-    CheckResult::Error("未知错误".to_string())
-}
-
-fn post_update_status(hwnd: HWND, status: usize) {
-    // SAFETY: hwnd 是有效的主窗口句柄，PostMessageW 线程安全。
-    unsafe {
-        let _ = PostMessageW(Some(hwnd), WM_USER_UPDATE_READY, WPARAM(status), LPARAM(0));
-    }
-}
-
-pub fn handle_update_ready(hwnd: HWND, status: usize) {
-    match status {
-        UPDATE_STATUS_NO_UPDATE => {
-            let version = env!("CARGO_PKG_VERSION");
-            show_info(&format!("当前已是最新版本 (v{version})。"));
-        }
-        UPDATE_STATUS_PORTABLE_FOUND => {
-            let version = LATEST_VERSION.lock().unwrap().clone();
+        CheckResult::PortableFound(version) => {
             let msg = format!("发现新版本 v{version}。\n是否打开网页下载免安装版？");
             if show_yes_no(&msg) {
                 open_url(RELEASE_PAGE_URL);
             }
+            UpdateAction::Done
         }
-        UPDATE_STATUS_INSTALLED_READY => {
-            let version = LATEST_VERSION.lock().unwrap().clone();
-            let temp_path = TEMP_FILE_PATH.lock().unwrap().clone();
+        CheckResult::InstalledReady(version, temp_path) => {
             let msg = format!("新版本 v{version} 已准备就绪。\n是否立即关闭程序并安装？");
-            if show_yes_no(&msg) {
-                launch_installer_and_exit(hwnd, &temp_path);
+            if !show_yes_no(&msg) {
+                return UpdateAction::Done;
+            }
+
+            match launch_installer(&temp_path) {
+                InstallerLaunch::Started => UpdateAction::ExitMain,
+                InstallerLaunch::Cancelled => UpdateAction::Done,
+                InstallerLaunch::Failed(code) => {
+                    show_error(&format!("启动安装程序失败 (错误码: {code})"));
+                    UpdateAction::Done
+                }
             }
         }
-        UPDATE_STATUS_ERROR => {
-            let error_msg = UPDATE_ERROR_MESSAGE.lock().unwrap().clone();
-            let show_msg = if error_msg.is_empty() {
-                "检查更新失败，请检查网络连接。".to_string()
-            } else {
-                format!("检查更新失败: {error_msg}")
-            };
-            show_error(&show_msg);
+        CheckResult::Error(message) => {
+            if is_manual {
+                show_error(&format!("检查更新失败: {message}"));
+            }
+            UpdateAction::Done
         }
-        _ => {}
     }
+}
+
+/// 主进程调用：re-exec 自身 `--check-update` 子进程，等待其完成全部更新交互。
+///
+/// winhttp/bcrypt、MessageBox/IME 和 ShellExecute 相关 DLL 只会进入子进程；
+/// 子进程退出后由操作系统整体回收，主进程只解析 `DONE/EXIT_MAIN` 最终动作。
+///
+/// 此处使用 `spawn()` + 手动读取 stdout，而非 `output()`，避免后者为并发读取
+/// stderr 创建一个使用默认 2MB 栈预留的隐藏线程。
+fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
+    let failed = || SubprocessOutcome {
+        action: UpdateAction::Done,
+        is_error: true,
+    };
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return failed(),
+    };
+
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut command = std::process::Command::new(exe);
+    command.arg("--check-update");
+    if is_manual {
+        command.arg("--manual");
+    }
+
+    let mut child = match command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return failed(),
+    };
+
+    let mut stdout_data = Vec::new();
+    let read_failed = match child.stdout.take() {
+        Some(mut stdout) => stdout.read_to_end(&mut stdout_data).is_err(),
+        None => true,
+    };
+
+    let exit_status = match child.wait() {
+        Ok(status) => status,
+        Err(_) => return failed(),
+    };
+
+    let parsed = parse_update_action(&stdout_data);
+    SubprocessOutcome {
+        action: parsed.unwrap_or(UpdateAction::Done),
+        is_error: read_failed || parsed.is_none() || !exit_status.success(),
+    }
+}
+
+fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
+    match std::str::from_utf8(stdout).ok()?.trim() {
+        "DONE" => Some(UpdateAction::Done),
+        "EXIT_MAIN" => Some(UpdateAction::ExitMain),
+        _ => None,
+    }
+}
+
+fn post_update_action(hwnd: HWND, action: usize) -> bool {
+    // SAFETY:
+    // hwnd 来自主线程创建的窗口句柄，并且仅在主进程仍持有该窗口期间由工作线程使用。
+    // PostMessageW 只向目标线程队列复制整数消息参数，不会跨线程解引用 Rust 内存；
+    // 若窗口已销毁，API 会返回错误，调用本身不会访问无效内存。
+    unsafe { PostMessageW(Some(hwnd), WM_USER_UPDATE_ACTION, WPARAM(action), LPARAM(0)).is_ok() }
+}
+
+pub fn handle_update_action(action: usize) {
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    if action != UPDATE_ACTION_EXIT_MAIN {
+        return;
+    }
+
+    remove_tray_icon();
+    // SAFETY:
+    // 此函数仅由主窗口过程处理 WM_USER_UPDATE_ACTION 时调用，因此当前线程就是
+    // UI 消息循环所属线程；PostQuitMessage 会向当前线程队列投递 WM_QUIT。
+    unsafe {
+        PostQuitMessage(0);
+    }
 }
 
 fn show_yes_no(msg: &str) -> bool {
     let title = to_wide("Traffic Monitor");
     let msg_wide = to_wide(msg);
+    // SAFETY:
+    // title 和 msg_wide 均由 to_wide 创建，包含尾部 NUL，且缓冲区在同步调用
+    // MessageBoxW 返回前始终存活；None 表示对话框不依附其他窗口。
     let result = unsafe {
         MessageBoxW(
             None,
@@ -823,7 +819,9 @@ fn show_yes_no(msg: &str) -> bool {
 
 fn open_url(url: &str) {
     let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: url_wide 是有效的 NUL 终止宽字符串。
+    // SAFETY:
+    // url_wide 是包含尾部 NUL 的 UTF-16 缓冲区，并在同步的 ShellExecuteW 调用期间
+    // 保持存活；其余字符串参数为 windows crate 提供的静态 NUL 终止字符串或 None。
     unsafe {
         let _ = ShellExecuteW(
             None,
@@ -836,13 +834,9 @@ fn open_url(url: &str) {
     }
 }
 
-fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
-    let path_wide: Vec<u16> = installer_path
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let verb_wide: Vec<u16> = "runas\0".encode_utf16().collect();
+fn launch_installer(installer_path: &str) -> InstallerLaunch {
+    let path_wide = to_wide(installer_path);
+    let verb_wide = to_wide("runas");
     let params_wide = to_wide("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
 
     let mut sei = SHELLEXECUTEINFOW {
@@ -854,23 +848,23 @@ fn launch_installer_and_exit(_hwnd: HWND, installer_path: &str) {
         ..Default::default()
     };
 
-    // SAFETY: sei 已正确初始化，path_wide 和 verb_wide 均有效。
-    let ok = unsafe { ShellExecuteExW(&mut sei) };
+    // SAFETY:
+    // path_wide、verb_wide 和 params_wide 都是 NUL 终止的 UTF-16 缓冲区，并在
+    // ShellExecuteExW 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体
+    // 实际大小一致，未设置需要调用方提供额外指针或接管进程句柄的掩码。
+    let launched = unsafe { ShellExecuteExW(&mut sei) };
+    if launched.is_ok() {
+        return InstallerLaunch::Started;
+    }
 
-    if ok.is_ok() && sei.hInstApp.0 as usize > 32 {
-        remove_tray_icon();
-        // SAFETY: PostQuitMessage 从主线程调用是安全的。
-        unsafe {
-            PostQuitMessage(0);
-        }
+    // SAFETY:
+    // 紧接失败的 ShellExecuteExW 调用读取当前线程 last-error，中间未调用其他
+    // 可能覆盖错误码的 Win32 API。
+    let error = unsafe { GetLastError() };
+    if error == ERROR_CANCELLED {
+        InstallerLaunch::Cancelled
     } else {
-        // SAFETY: GetLastError 在 ShellExecuteExW 失败后立即调用，结果有效。
-        let err = unsafe { GetLastError() };
-        if err == ERROR_CANCELLED {
-            // User denied UAC, keep running
-        } else {
-            show_error(&format!("启动安装程序失败 (错误码: {err:?})"));
-        }
+        InstallerLaunch::Failed(error.0)
     }
 }
 
@@ -928,49 +922,32 @@ mod tests {
         assert_eq!(parse_version("invalid"), Vec::<u32>::new());
     }
 
-    // ===== parse_check_result =====
+    // ===== parse_update_action =====
 
     #[test]
-    fn test_parse_no_update() {
-        let result = parse_check_result(b"NO_UPDATE");
-        assert!(matches!(result, CheckResult::NoUpdate));
+    fn test_parse_done_action() {
+        assert_eq!(parse_update_action(b"DONE"), Some(UpdateAction::Done));
+        assert_eq!(parse_update_action(b"  DONE\r\n"), Some(UpdateAction::Done));
     }
 
     #[test]
-    fn test_parse_portable() {
-        let result = parse_check_result(b"PORTABLE|0.9.0");
-        match result {
-            CheckResult::PortableFound(v) => assert_eq!(v, "0.9.0"),
-            other => panic!("expected PortableFound, got {other:?}"),
-        }
+    fn test_parse_exit_main_action() {
+        assert_eq!(
+            parse_update_action(b"EXIT_MAIN"),
+            Some(UpdateAction::ExitMain)
+        );
     }
 
     #[test]
-    fn test_parse_installed() {
-        let result =
-            parse_check_result(b"INSTALLED|1.0.0|C:\\Temp\\traffic-monitor-setup-temp.exe");
-        match result {
-            CheckResult::InstalledReady(v, p) => {
-                assert_eq!(v, "1.0.0");
-                assert_eq!(p, "C:\\Temp\\traffic-monitor-setup-temp.exe");
-            }
-            other => panic!("expected InstalledReady, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_error() {
-        let result = parse_check_result(b"ERROR|network error|proxy error");
-        match result {
-            CheckResult::Error(msg) => assert_eq!(msg, "network error|proxy error"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-
-        for input in [b"ERROR".as_slice(), b"ERROR|".as_slice()] {
-            match parse_check_result(input) {
-                CheckResult::Error(msg) => assert_eq!(msg, "未知网络或内部错误"),
-                other => panic!("expected Error, got {other:?}"),
-            }
+    fn test_reject_invalid_update_actions() {
+        for input in [
+            b"".as_slice(),
+            b"NO_UPDATE".as_slice(),
+            b"EXIT_MAIN|extra".as_slice(),
+            b"some random garbage".as_slice(),
+            &[0xFF, 0xFE],
+        ] {
+            assert_eq!(parse_update_action(input), None);
         }
     }
 
@@ -988,41 +965,6 @@ mod tests {
             Some(ERROR_WINHTTP_CONNECTION_ERROR)
         );
         assert_eq!(win32_code_from_hresult(0x8000_4005), None);
-    }
-
-    #[test]
-    fn test_parse_empty_input() {
-        assert!(matches!(parse_check_result(b""), CheckResult::Error(_)));
-    }
-
-    #[test]
-    fn test_parse_garbage() {
-        assert!(matches!(
-            parse_check_result(b"some random garbage"),
-            CheckResult::Error(_)
-        ));
-    }
-
-    #[test]
-    fn test_parse_installed_missing_path() {
-        // INSTALLED 必须有版本号和路径两个字段。
-        assert!(matches!(
-            parse_check_result(b"INSTALLED|1.0.0"),
-            CheckResult::Error(_)
-        ));
-    }
-
-    #[test]
-    fn test_parse_extra_pipes_in_path() {
-        // 路径中可能包含 `|`（虽然 Windows 路径不允许），splitn(3, '|') 不应拆分。
-        let result = parse_check_result(b"INSTALLED|2.0.0|C:\\A|B\\setup.exe");
-        match result {
-            CheckResult::InstalledReady(v, p) => {
-                assert_eq!(v, "2.0.0");
-                assert_eq!(p, "C:\\A|B\\setup.exe");
-            }
-            other => panic!("expected InstalledReady, got {other:?}"),
-        }
     }
 
     // ===== compute_sha256_hex known-answer =====

@@ -25,6 +25,7 @@ use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowW, KillTimer, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
@@ -36,7 +37,7 @@ use windows::core::w;
 
 use crate::collector::{
     WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, collect_cpu, collect_memory,
-    collect_network, compact_and_trim, init_network_listener, trim_working_set,
+    collect_network, init_network_listener, trim_working_set,
 };
 use crate::config::{
     CPU_MEM_INTERVAL, LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
@@ -53,7 +54,7 @@ use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
 };
 use crate::update::{
-    WM_USER_UPDATE_READY, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
+    WM_USER_UPDATE_ACTION, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
     subprocess_main,
 };
 use crate::util::show_error;
@@ -125,7 +126,8 @@ fn main() {
 
     // 必须在单例 Mutex 锁之前拦截 --check-update，否则子进程会被当作重复实例直接退出。
     if args.iter().any(|a| a == "--check-update") {
-        std::process::exit(subprocess_main());
+        let is_manual = args.iter().any(|a| a == "--manual");
+        std::process::exit(subprocess_main(is_manual));
     }
 
     let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
@@ -149,6 +151,16 @@ fn main() {
             return;
         }
     };
+
+    // 主进程没有任何文本输入需求。必须在首个顶层窗口收到 WM_CREATE 前禁用整个
+    // 进程的 IME，避免更新子进程弹窗关闭后的焦点回落触发第三方 TSF/IME 常驻。
+    // SAFETY:
+    // ImmDisableIME 只修改当前进程的输入法管理状态，不接收指针或外部句柄；
+    // u32::MAX 是 Win32 约定的“当前进程全部现有及后续线程”标识。此处尚未调用
+    // CreateWindowExW，满足 API 必须在首个顶层窗口创建前执行的时序要求。
+    unsafe {
+        let _ = ImmDisableIME(u32::MAX);
+    }
 
     if register_window_class().is_err() {
         show_error("Failed to register window class");
@@ -464,10 +476,8 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        WM_USER_UPDATE_READY => {
-            let status = wparam.0;
-            crate::update::handle_update_ready(hwnd, status);
-            compact_and_trim();
+        WM_USER_UPDATE_ACTION => {
+            crate::update::handle_update_action(wparam.0);
             LRESULT(0)
         }
 

@@ -6,9 +6,9 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, GetCursorPos, IDI_APPLICATION, InsertMenuItemW, LoadIconW,
     MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFS_UNCHECKED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID,
-    MIIM_STATE, MIIM_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_CLOSE, WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    MIIM_STATE, MIIM_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CLOSE, WM_USER, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -259,21 +259,42 @@ pub fn show_context_menu(hwnd: HWND) {
         let _ = InsertMenuItemW(hmenu, 5, true, &exit_item);
     }
 
-    // SAFETY: hwnd、point、hmenu 均有效。
-    unsafe {
+    // 使用 TPM_RETURNCMD 阻止菜单循环重入投递 WM_COMMAND。取得选择后先把前台权
+    // 交还 Explorer，再执行命令，避免更新弹窗关闭时焦点恢复到常驻主进程。
+    // SAFETY:
+    // 1. hwnd 是主线程创建且仍存活的窗口；hmenu 由 CreatePopupMenu 创建并由
+    //    MenuGuard 保持到 TrackPopupMenu 返回；point 来自 GetCursorPos。
+    // 2. SetForegroundWindow 临时激活菜单所有者，满足托盘弹出菜单的 Win32 约定。
+    // 3. TPM_RETURNCMD 返回菜单 ID 而不发送 WM_COMMAND，因此命令不会在菜单循环中
+    //    重入执行，所有指针缓冲区均保持存活到同步调用返回。
+    let selected_item = unsafe {
         let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(
+        TrackPopupMenu(
             hmenu,
-            TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+            TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
             point.x,
             point.y,
             Some(0),
             hwnd,
             None,
-        );
+        )
+        .0 as u32
+    };
+
+    if let Some(taskbar) = crate::window::get_taskbar_hwnd() {
+        // SAFETY:
+        // taskbar 由 get_taskbar_hwnd 通过 IsWindow 验证，且当前线程刚被允许设置前台
+        // 窗口；将前台权交还 Explorer 不传递指针，也不改变窗口所有权。
+        unsafe {
+            let _ = SetForegroundWindow(taskbar);
+        }
     }
 
     drop(_menu_guard);
+
+    if selected_item != 0 {
+        handle_menu_command(hwnd, selected_item);
+    }
 }
 
 pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
