@@ -17,7 +17,7 @@ use crate::config::{
     TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
     TIMER_INTERVAL_THERMAL,
 };
-use crate::state::{CONSECUTIVE_ZERO_COUNT, FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS};
+use crate::state::{CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS};
 use crate::window::get_taskbar_hwnd;
 
 pub fn is_suspended() -> bool {
@@ -26,7 +26,7 @@ pub fn is_suspended() -> bool {
 
 pub fn suspend_system(hwnd: HWND, reason: u32) {
     let previous = SUSPEND_REASONS.fetch_or(reason, Ordering::AcqRel);
-    FULLSCREEN.store(false, Ordering::Release);
+    MONITOR_FULLSCREEN.store(false, Ordering::Release);
     let _ = sync_monitoring_timers(hwnd);
     if previous == 0 {
         trim_working_set();
@@ -68,7 +68,7 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         ) != 0
     };
 
-    if FULLSCREEN.load(Ordering::Acquire) {
+    if MONITOR_FULLSCREEN.load(Ordering::Acquire) {
         return fullscreen_ok;
     }
 
@@ -94,9 +94,9 @@ pub fn check_fullscreen(hwnd: HWND) {
         unsafe { GetDesktopWindow() == foreground || GetShellWindow() == foreground };
 
     if is_invalid || is_desktop_or_shell || foreground == hwnd {
-        let was = FULLSCREEN.load(Ordering::Acquire);
+        let was = MONITOR_FULLSCREEN.load(Ordering::Acquire);
         if was {
-            FULLSCREEN.store(false, Ordering::Release);
+            MONITOR_FULLSCREEN.store(false, Ordering::Release);
             let _ = sync_monitoring_timers(hwnd);
         }
         return;
@@ -130,9 +130,9 @@ pub fn check_fullscreen(hwnd: HWND) {
         None => false,
     };
 
-    let was = FULLSCREEN.load(Ordering::Acquire);
+    let was = MONITOR_FULLSCREEN.load(Ordering::Acquire);
     let should_suspend = is_full && same_monitor;
-    FULLSCREEN.store(should_suspend, Ordering::Release);
+    MONITOR_FULLSCREEN.store(should_suspend, Ordering::Release);
 
     if should_suspend != was {
         let _ = sync_monitoring_timers(hwnd);

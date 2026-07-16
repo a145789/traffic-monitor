@@ -23,11 +23,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::collector::compact_and_trim;
 use crate::config::{INSTALLER_MAX_BYTES, VERSION_METADATA_MAX_BYTES};
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
-use crate::util::{reg_read_dword, reg_write_dword, show_error, show_info, to_wide};
+use crate::util::{
+    compact_and_trim, reg_read_dword, reg_write_dword, show_error, show_info, to_wide,
+};
 
 use crypto::{compute_sha256_hex, compute_sha256_hex_file};
 use http::fetch_url;

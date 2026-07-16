@@ -11,7 +11,7 @@
 //! 降频地板：高占用 + 低频比时抬高风险下限，避免 throttle 后功耗下降造成假凉快。
 //! 状态机带滞回 + 升级/降级不对称驻留。
 
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU32, Ordering};
 
 use crate::config::{
     A_CPU_MW_PER_PCT, B_MEM_MW_PER_PCT, C_KERNEL_HEAVY_MW, FP_BREAKS_MW, FP_BREAKS_RISK,
@@ -20,13 +20,7 @@ use crate::config::{
     ST_WARM_TO_HOT, TAU_DIE_ALPHA_Q8, TAU_SKIN_ALPHA_Q8, THROTTLE_CPU_PCT, THROTTLE_FREQ_Q8,
     THROTTLE_RISK_FLOOR, TREND_BONUS_DN, TREND_BONUS_UP, TREND_FALL_MW, TREND_RISE_MW,
 };
-use crate::state::{MEM_USAGE, THERMAL_RISK, THERMAL_STATE};
-
-// 独立的 GetSystemTimes 前值，与 collector 解耦，避免 1s/5s 采样周期混叠。
-static PREV_IDLE: AtomicU64 = AtomicU64::new(0);
-static PREV_KERNEL: AtomicU64 = AtomicU64::new(0);
-static PREV_USER: AtomicU64 = AtomicU64::new(0);
-static TIMES_INITIALIZED: AtomicBool = AtomicBool::new(false);
+use crate::state::{CPU_KU_Q8, CPU_USAGE, MEM_USAGE, THERMAL_RISK, THERMAL_STATE};
 
 // 双节点热当量（mW 单位：稳态时节点值趋近输入功率）
 static T_DIE: AtomicI32 = AtomicI32::new(0);
@@ -305,76 +299,17 @@ fn step_state_machine(cur: u8, r: u32, dwell: u32, prev_intent: i8) -> (u8, u32,
     }
 }
 
-/// 独立采样 GetSystemTimes，计算 CPU 利用率与内核/用户比。
+/// 热风险采集入口。每秒由 `TIMER_ID_THERMAL` 调用（调用前须先 `collect_cpu`）。
 ///
-/// 返回 (cpu_pct, ku_q8)。ku_q8 = (kernel_diff << 8) / user_diff，定点 Q8。
-/// 与 `collector::collect_cpu` 完全解耦，避免 1s/5s 采样周期混叠。
-fn sample_cpu_times() -> Option<(i32, u32)> {
-    let mut idle = 0u64;
-    let mut kernel = 0u64;
-    let mut user = 0u64;
-
-    // SAFETY: 传入的指针均指向当前栈帧分配的有效且可变的 u64 变量。
-    // Windows API 仅在此调用期间写入数据，符合内存安全和对齐要求。
-    let ok = unsafe {
-        windows::Win32::System::Threading::GetSystemTimes(
-            Some(&mut idle as *mut u64 as *mut _),
-            Some(&mut kernel as *mut u64 as *mut _),
-            Some(&mut user as *mut u64 as *mut _),
-        )
-        .is_ok()
-    };
-
-    if !ok {
-        return None;
-    }
-
-    if !TIMES_INITIALIZED.load(Ordering::Acquire) {
-        PREV_IDLE.store(idle, Ordering::Release);
-        PREV_KERNEL.store(kernel, Ordering::Release);
-        PREV_USER.store(user, Ordering::Release);
-        TIMES_INITIALIZED.store(true, Ordering::Release);
-        return None;
-    }
-
-    let di = idle.saturating_sub(PREV_IDLE.load(Ordering::Acquire));
-    let dk = kernel.saturating_sub(PREV_KERNEL.load(Ordering::Acquire));
-    let du = user.saturating_sub(PREV_USER.load(Ordering::Acquire));
-
-    PREV_IDLE.store(idle, Ordering::Release);
-    PREV_KERNEL.store(kernel, Ordering::Release);
-    PREV_USER.store(user, Ordering::Release);
-
-    let total = dk + du;
-    if total == 0 {
-        return None;
-    }
-
-    let cpu_pct = (((total - di) * 100 / total).min(100)) as i32;
-    // Windows GetSystemTimes 的 kernel 时间包含 idle，需扣除得到纯内核时间。
-    // 否则 idle 时 ku_q8 被空闲时间严重高估（idle 时 dk≈di+du，比纯内核大 10 倍+）。
-    let dk_actual = dk.saturating_sub(di);
-    let ku_q8 = if du > 0 {
-        ((dk_actual << 8) / du) as u32
-    } else {
-        255
-    };
-    Some((cpu_pct, ku_q8))
-}
-
-/// 热风险采集入口。每秒由 `TIMER_ID_THERMAL` 调用。
-///
-/// 开销：最多 2 次 `CallNtPowerInformation` + 1 次 `GetSystemTimes` + 纯整数运算。
-/// 总开销仍远低于 1Hz 可感知阈值。
+/// CPU% / ku_q8 由 `collector::collect_cpu` 写入 atomics，本函数只读，避免双路径采样。
+/// 开销：最多 2 次 `CallNtPowerInformation` + 纯整数运算。
 pub fn collect_thermal() {
     // 1. 采集电池状态
     let (ac, discharging, batt_mw) = read_battery();
 
-    // 2. 独立采样 CPU 时间
-    let (cpu, ku_q8) = match sample_cpu_times() {
-        Some(v) => v,
-        None => return,
-    };
+    // 2. 读取同源 CPU 指标（1Hz，由 collect_cpu 写入）
+    let cpu = CPU_USAGE.load(Ordering::Relaxed) as i32;
+    let ku_q8 = CPU_KU_Q8.load(Ordering::Relaxed);
 
     // 3. 读取内存负载（由 collector 每 5s 更新，热模型容忍 5s 滞后）
     let mem = MEM_USAGE.load(Ordering::Relaxed) as i32;

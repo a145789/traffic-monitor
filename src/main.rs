@@ -45,7 +45,7 @@ use crate::config::{
 };
 use crate::renderer::Renderer;
 use crate::state::{
-    CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, FULLSCREEN, NETWORK_BACKOFF,
+    CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, NETWORK_BACKOFF,
     SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM, THERMAL_STATE,
 };
 use crate::suspend::{
@@ -322,7 +322,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_NETWORK => {
-            if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
+            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
                 update_taskbar_position(hwnd);
                 collect_network();
                 unsafe {
@@ -331,8 +331,8 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_CPU_MEM => {
-            if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
-                collect_cpu();
+            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
+                // CPU 已由 1Hz 热定时器同源采样；此处仅采内存（5s）。
                 collect_memory();
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -340,10 +340,15 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_THERMAL => {
-            if !is_suspended() && !FULLSCREEN.load(Ordering::Acquire) {
+            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
+                // 先写 CPU atomics，再跑热模型（同 1Hz 窗口，单一 GetSystemTimes 源）。
+                if !collect_cpu() {
+                    return LRESULT(0);
+                }
                 let prev = THERMAL_STATE.load(Ordering::Relaxed);
                 collect_thermal();
                 // 仅状态跳变时重绘，避免每秒空转 DWM。
+                // 网速定时器约 1s 也会 Invalidate，UI 的 CPU% 随之刷新。
                 if THERMAL_STATE.load(Ordering::Relaxed) != prev {
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);

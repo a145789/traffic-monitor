@@ -18,8 +18,9 @@ pub const SUSPEND_REASON_MONITOR: u32 = 1 << 2;
 /// 暂停原因位集；仅当全部清除后才恢复采集。读写：AcqRel / Acquire。
 pub static SUSPEND_REASONS: AtomicU32 = AtomicU32::new(0);
 
-/// 全屏应用在前台。读写：Acquire / Release（定时器与全屏检测）。
-pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+/// 本组件所在显示器上，前台窗口是否全屏（非系统全局全屏）。
+/// 读写：Acquire / Release（定时器与全屏检测）。
+pub static MONITOR_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
 /// 允许自动检查更新。读写：Relaxed（非关键段开关，同进程）。
 pub static ENABLE_AUTO_UPDATE: AtomicBool = AtomicBool::new(true);
@@ -39,8 +40,13 @@ pub static NETWORK_BACKOFF: AtomicBool = AtomicBool::new(false);
 /// 连续零速计数。读写：Relaxed（单写路径为主）。
 pub static CONSECUTIVE_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// CPU 使用率（0-100）。读写：Relaxed。
+/// CPU 使用率（0-100）。读写：Relaxed（采集写、渲染/热模型读）。
 pub static CPU_USAGE: AtomicU32 = AtomicU32::new(0);
+
+/// 内核/用户时间比（Q8 定点：`(kernel_actual << 8) / user`）。
+/// 由 `collector::collect_cpu` 与 `CPU_USAGE` 同源写出；热模型读。
+/// 读写：Relaxed。
+pub static CPU_KU_Q8: AtomicU32 = AtomicU32::new(0);
 
 /// 内存使用率（0-100）。读写：Relaxed。
 pub static MEM_USAGE: AtomicU32 = AtomicU32::new(0);
