@@ -177,7 +177,18 @@ fn main() {
     init_network_listener(hwnd);
 
     // SAFETY: "TaskbarCreated" 是 Windows 约定的常量字符串。
+    // RegisterWindowMessageW 失败时返回 0：仍静默降级（窗口过程已通过
+    // `msg == tcm && tcm != 0` 防御），但显式记录以便诊断 Explorer 重建失效。
     let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    if taskbar_msg == 0 {
+        // SAFETY: 紧随 RegisterWindowMessageW 之后读取，中间未插入其他可改写
+        // last-error 的 Win32 调用。
+        let last = unsafe { GetLastError() };
+        show_error(&format!(
+            "Failed to register TaskbarCreated message: 0x{:08X}",
+            last.0
+        ));
+    }
     TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::Release);
 
     // SAFETY: hwnd 有效，GUID_MONITOR_POWER_ON 是系统静态 GUID。
@@ -188,8 +199,17 @@ fn main() {
             REGISTER_NOTIFICATION_FLAGS(DEVICE_NOTIFY_WINDOW_HANDLE),
         )
     };
-    if let Ok(handle) = power_notify {
-        POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Release);
+    match power_notify {
+        Ok(handle) => {
+            POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Release);
+        }
+        Err(e) => {
+            // 非致命：显示器开关检测失效，仅影响唤醒节能。记录便于排查。
+            show_error(&format!(
+                "Failed to register power setting notification: {:?}",
+                e
+            ));
+        }
     }
 
     if !embed_in_taskbar(hwnd) {
@@ -202,8 +222,16 @@ fn main() {
 
     create_tray_icon(hwnd);
 
+    let renderer = match Renderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            show_error(&format!("Failed to initialize renderer: {e}"));
+            remove_tray_icon();
+            return;
+        }
+    };
     RENDERER.with(|r| {
-        *r.borrow_mut() = Some(Renderer::new());
+        *r.borrow_mut() = Some(renderer);
     });
 
     RENDERER.with(|r| {
@@ -223,9 +251,12 @@ fn main() {
         return;
     }
 
-    // SAFETY: hwnd 有效，注册会话通知。
+    // SAFETY: hwnd 有效，注册会话通知以接收锁屏/解锁事件。
+    // 失败为非致命：锁屏暂停将失效，但显示器关闭暂停仍可由电源通知覆盖。
     unsafe {
-        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+            show_error(&format!("Failed to register session notification: {:?}", e));
+        }
     }
 
     init_cleanup_temp();
@@ -242,10 +273,25 @@ fn main() {
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
 
     // SAFETY: msg 由操作系统填充，消息循环是标准 Win32 模式。
+    // GetMessageW 返回值三态：> 0 有消息；0 收到 WM_QUIT 正常退出；
+    // -1 致命错误（窗口/消息无效），必须停止循环以免继续处理未定义状态。
     unsafe {
-        while windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0).into() {
-            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
-            windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+        loop {
+            match windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0).0 {
+                0 => break,
+                -1 => {
+                    let last = GetLastError();
+                    show_error(&format!(
+                        "GetMessageW fatal error in message loop: 0x{:08X}",
+                        last.0
+                    ));
+                    break;
+                }
+                _ => {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                }
+            }
         }
     }
 

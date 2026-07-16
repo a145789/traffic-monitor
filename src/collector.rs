@@ -191,43 +191,9 @@ pub fn collect_network() {
             return;
         }
 
-        let mut max_total: u64 = 0;
-        let mut best_speed_down: u32 = 0;
-        let mut best_speed_up: u32 = 0;
         let now = Instant::now();
-
-        INTERFACE_HISTORY.with(|cell| {
-            let mut history = cell.borrow_mut();
-            for (luid, (in_octets, out_octets)) in &current_data {
-                if let Some(&(prev_in, prev_out, prev_time)) = history.get(luid) {
-                    // 用 saturating_duration_since 而非 duration_since：后者在
-                    // now < prev_time 时会 panic，配合本 crate 的 panic="abort"
-                    // 会直接杀进程。Instant 虽是单调时钟，但 VM 挂起/恢复、系统
-                    // 休眠唤醒等场景下确有时间回退报告；时间逆转时这里安全返回
-                    // 0，后续经 normalize_bytes_per_sec 的 max(1) 兜底按极高网速
-                    // 处理，远好于静默崩溃。
-                    let elapsed_ms = now.saturating_duration_since(prev_time).as_millis() as u64;
-                    let speed_down =
-                        normalize_bytes_per_sec(in_octets.saturating_sub(prev_in), elapsed_ms);
-                    let speed_up =
-                        normalize_bytes_per_sec(out_octets.saturating_sub(prev_out), elapsed_ms);
-                    let total = speed_down as u64 + speed_up as u64;
-
-                    if total > max_total {
-                        max_total = total;
-                        best_speed_down = speed_down;
-                        best_speed_up = speed_up;
-                    }
-                }
-            }
-
-            // 用本次采样数据覆盖历史，附带采样时刻用于下次归一化。
-            for (luid, (in_octets, out_octets)) in &current_data {
-                history.insert(*luid, (*in_octets, *out_octets, now));
-            }
-            // 清除已离线网卡的历史，防止陈旧 LUID 残留。
-            history.retain(|luid, _| current_data.contains_key(luid));
-        });
+        let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
+            .with(|cell| select_winner_interface(&current_data, &mut cell.borrow_mut(), now));
 
         NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
         NET_SPEED_UP.store(best_speed_up, Ordering::Release);
@@ -270,6 +236,43 @@ pub fn collect_network() {
 
         CURRENT_DATA.with(|cell| *cell.borrow_mut() = current_data);
     }
+}
+
+/// 根据当前网卡字节数、历史记录和经过的毫秒数，选择总流量（上行+下行）最大的单一网卡，
+/// 并用本次数据更新历史，同时清理已经不再活跃的网卡历史。
+fn select_winner_interface(
+    current_data: &std::collections::HashMap<u64, (u64, u64)>,
+    history: &mut std::collections::HashMap<u64, (u64, u64, Instant)>,
+    now: Instant,
+) -> (u32, u32) {
+    let mut max_total: u64 = 0;
+    let mut best_speed_down: u32 = 0;
+    let mut best_speed_up: u32 = 0;
+
+    for (luid, (in_octets, out_octets)) in current_data {
+        if let Some(&(prev_in, prev_out, prev_time)) = history.get(luid) {
+            // 用 saturating_duration_since 而非 duration_since 以防止时间回退导致崩溃。
+            let elapsed_ms = now.saturating_duration_since(prev_time).as_millis() as u64;
+            let speed_down = normalize_bytes_per_sec(in_octets.saturating_sub(prev_in), elapsed_ms);
+            let speed_up = normalize_bytes_per_sec(out_octets.saturating_sub(prev_out), elapsed_ms);
+            let total = speed_down as u64 + speed_up as u64;
+
+            if total > max_total {
+                max_total = total;
+                best_speed_down = speed_down;
+                best_speed_up = speed_up;
+            }
+        }
+    }
+
+    // 用本次采样数据覆盖历史，附带采样时刻用于下次归一化。
+    for (luid, (in_octets, out_octets)) in current_data {
+        history.insert(*luid, (*in_octets, *out_octets, now));
+    }
+    // 清除已离线网卡的历史，防止陈旧 LUID 残留。
+    history.retain(|luid, _| current_data.contains_key(luid));
+
+    (best_speed_down, best_speed_up)
 }
 
 /// 将"累计字节差值"按实际经过的毫秒数归一化为"每秒字节"。
@@ -663,5 +666,102 @@ mod tests {
             "Realtek PCIe GbE Family Controller"
         ));
         assert!(!is_virtual_friendly_name("Killer Wi-Fi 6 AX1650"));
+    }
+
+    // ===== select_winner_interface =====
+
+    #[test]
+    fn test_select_winner_interface_multiple_active() {
+        // 两张网卡同时有流量，应选出总流量最大的那一张。
+        let mut history = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(1);
+
+        // 网卡 1 (LUID = 100): 1s 内增量 1000 字节，下行 800，上行 200 => 1000 B/s
+        // 网卡 2 (LUID = 200): 1s 内增量 2000 字节，下行 1500，上行 500 => 2000 B/s
+        history.insert(100, (10000, 5000, t0));
+        history.insert(200, (20000, 10000, t0));
+
+        let mut current = std::collections::HashMap::new();
+        current.insert(100, (10800, 5200));
+        current.insert(200, (21500, 10500));
+
+        let (down, up) = select_winner_interface(&current, &mut history, t1);
+        assert_eq!(down, 1500);
+        assert_eq!(up, 500);
+    }
+
+    #[test]
+    fn test_select_winner_interface_first_appearance() {
+        // 某张网卡首次出现，没有历史，不应该计算出任何速度（返回 0）。
+        let mut history = std::collections::HashMap::new();
+        let t0 = Instant::now();
+
+        // 网卡 1 首次出现
+        let mut current = std::collections::HashMap::new();
+        current.insert(100, (5000, 2000));
+
+        let (down, up) = select_winner_interface(&current, &mut history, t0);
+        assert_eq!(down, 0);
+        assert_eq!(up, 0);
+
+        // 但此时它的数据应该已经被正确记入历史中
+        assert!(history.contains_key(&100));
+        assert_eq!(history.get(&100).unwrap().0, 5000);
+    }
+
+    #[test]
+    fn test_select_winner_interface_counter_rollback() {
+        // 网卡计数器回退（例如网卡重置或溢出），不应溢出崩溃，通过 saturating_sub 速度返回 0
+        let mut history = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(1);
+
+        // 网卡 1 (LUID = 100): 历史值为 10000/5000
+        history.insert(100, (10000, 5000, t0));
+
+        // 当前值回退到 8000/4000
+        let mut current = std::collections::HashMap::new();
+        current.insert(100, (8000, 4000));
+
+        let (down, up) = select_winner_interface(&current, &mut history, t1);
+        assert_eq!(down, 0);
+        assert_eq!(up, 0);
+    }
+
+    #[test]
+    fn test_select_winner_interface_offline_removed() {
+        // 网卡下线/消失后，历史记录中应该不再保留其 LUID
+        let mut history = std::collections::HashMap::new();
+        let t0 = Instant::now();
+
+        history.insert(100, (10000, 5000, t0));
+        history.insert(200, (20000, 10000, t0));
+
+        // 当前只剩 200，100 已下线
+        let mut current = std::collections::HashMap::new();
+        current.insert(200, (21000, 10500));
+
+        let _ = select_winner_interface(&current, &mut history, t0);
+        assert!(!history.contains_key(&100), "已下线的网卡历史记录应被清除");
+        assert!(history.contains_key(&200), "在线的网卡历史记录应保留");
+    }
+
+    #[test]
+    fn test_select_winner_interface_backoff_scale() {
+        // 15 秒退避恢复：经过 15s 后，即使累计流量很大，也应正确进行时间除法，求得每秒平均速度。
+        let mut history = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(15);
+
+        // 网卡 1 (LUID = 100): 15秒内下行增量 150,000 字节，上行 30,000 字节 => 平均每秒 10,000/2,000
+        history.insert(100, (10000, 5000, t0));
+
+        let mut current = std::collections::HashMap::new();
+        current.insert(100, (160000, 35000));
+
+        let (down, up) = select_winner_interface(&current, &mut history, t1);
+        assert_eq!(down, 10000);
+        assert_eq!(up, 2000);
     }
 }

@@ -14,6 +14,32 @@ use crate::config::{
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP, THERMAL_STATE};
 use crate::util::{reg_read_dword, to_wide};
 
+/// `Renderer::new()` 失败的具体原因。所有失败均发生在 GDI 资源创建阶段，
+/// 一旦创建全部成功，后续选入、设置背景模式与测量都无法失败。
+#[derive(Debug)]
+pub enum RendererError {
+    ScreenDcUnavailable,
+    MemoryDcCreationFailed,
+    BitmapCreationFailed,
+    FontCreationFailed,
+    BrushCreationFailed,
+}
+
+impl std::fmt::Display for RendererError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            Self::ScreenDcUnavailable => "无法获取屏幕设备上下文",
+            Self::MemoryDcCreationFailed => "无法创建兼容内存 DC",
+            Self::BitmapCreationFailed => "无法创建兼容位图",
+            Self::FontCreationFailed => "无法创建字体",
+            Self::BrushCreationFailed => "无法创建背景刷子",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for RendererError {}
+
 pub struct Renderer {
     hdc_mem: HDC,
     hbitmap: HBITMAP,
@@ -29,72 +55,209 @@ pub struct Renderer {
     buf: Vec<u16>,
 }
 
+// ===== 模块私有 RAII 资源守卫 =====
+//
+// 设计目标：构造 `Renderer` 时所有 GDI 对象按依赖顺序创建，任何一步失败时
+// 由局部守卫的 Drop 自动清理已申请的资源，无需手写多分支释放。
+// 成功路径在最后一刻通过 `mem::forget` 把所有权移交给 `Renderer`，由
+// `Renderer::drop` 负责“还原默认对象 → 销毁独占对象 → 释放 DC”的标准释放序。
+
+/// 临时屏幕 DC 守卫：构造时通过 `GetWindowDC(null)` 获取，`Drop` 时 `ReleaseDC`。
+struct ScreenDcGuard {
+    hdc: HDC,
+}
+
+impl ScreenDcGuard {
+    fn acquire() -> Option<Self> {
+        // SAFETY: 传入 nullptr 句柄获取整个桌面屏幕的 HDC，是 Win32 获取
+        // 兼容 GDI 资源所需源 DC 的标准方式。失败时返回无效句柄。
+        let hdc = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
+        if hdc.is_invalid() {
+            None
+        } else {
+            Some(Self { hdc })
+        }
+    }
+}
+
+impl Drop for ScreenDcGuard {
+    fn drop(&mut self) {
+        // SAFETY: self.hdc 来自 `GetWindowDC(HWND=null)`，配对释放 API 是
+        // `ReleaseDC` 且必须传入相同的 HWND（桌面 nullptr）。
+        unsafe {
+            let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), self.hdc);
+        }
+    }
+}
+
+/// 内存兼容 DC 守卫：由 `CreateCompatibleDC` 创建，`Drop` 时 `DeleteDC`。
+struct OwnedDc {
+    hdc: HDC,
+}
+
+impl OwnedDc {
+    fn new(hdc_screen: HDC) -> Option<Self> {
+        // SAFETY: hdc_screen 由调用方传入且已验证为有效屏幕 HDC。
+        let hdc = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
+        if hdc.is_invalid() {
+            None
+        } else {
+            Some(Self { hdc })
+        }
+    }
+}
+
+impl Drop for OwnedDc {
+    fn drop(&mut self) {
+        // SAFETY: self.hdc 由 `CreateCompatibleDC` 创建。构造期间若选入了对象，
+        // 其所有权已由上层管理；本守卫仅出现在构造失败的早期阶段——此时 DC 中尚未
+        // 选入任何独占对象——`DeleteDC` 是其正确释放 API。
+        unsafe {
+            let _ = DeleteDC(self.hdc);
+        }
+    }
+}
+
+/// 位图守卫：由 `CreateCompatibleBitmap` 创建，`Drop` 时 `DeleteObject`。
+struct OwnedBitmap {
+    hb: HBITMAP,
+}
+
+impl OwnedBitmap {
+    fn new(hdc_screen: HDC, width: i32, height: i32) -> Option<Self> {
+        // SAFETY: 必须使用屏幕 DC 以匹配屏幕颜色格式；width/height 为正像素尺寸。
+        let hb = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
+        if hb.is_invalid() {
+            None
+        } else {
+            Some(Self { hb })
+        }
+    }
+}
+
+impl Drop for OwnedBitmap {
+    fn drop(&mut self) {
+        // SAFETY: self.hb 由 `CreateCompatibleBitmap` 创建并被当前进程独占。
+        unsafe {
+            let _ = DeleteObject(self.hb.into());
+        }
+    }
+}
+
+/// 字体守卫：由 `CreateFontIndirectW` 创建，`Drop` 时 `DeleteObject`。
+struct OwnedFont {
+    hf: HFONT,
+}
+
+impl OwnedFont {
+    fn new(size: i32) -> Option<Self> {
+        let hf = create_font(size);
+        if hf.is_invalid() {
+            None
+        } else {
+            Some(Self { hf })
+        }
+    }
+}
+
+impl Drop for OwnedFont {
+    fn drop(&mut self) {
+        // SAFETY: self.hf 由 `CreateFontIndirectW` 创建并被独占。
+        unsafe {
+            let _ = DeleteObject(self.hf.into());
+        }
+    }
+}
+
+/// 刷子守卫：由 `CreateSolidBrush` 创建，`Drop` 时 `DeleteObject`。
+struct OwnedBrush {
+    hbr: HBRUSH,
+}
+
+impl OwnedBrush {
+    fn new() -> Option<Self> {
+        // SAFETY: COLOR_KEY 是合法的 COLORREF 常量。
+        let hbr = unsafe { CreateSolidBrush(COLORREF(COLOR_KEY)) };
+        if hbr.is_invalid() {
+            None
+        } else {
+            Some(Self { hbr })
+        }
+    }
+}
+
+impl Drop for OwnedBrush {
+    fn drop(&mut self) {
+        // SAFETY: self.hbr 由 `CreateSolidBrush` 创建并被独占。
+        unsafe {
+            let _ = DeleteObject(self.hbr.into());
+        }
+    }
+}
+
 impl Renderer {
-    pub fn new() -> Self {
-        // SAFETY: null_mut 句柄获取整个屏幕的临时 HDC。
-        let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
-        // 桌面 DC 理论上永不失效，但若极端情况（无桌面会话）下失败，
-        // 后续 GDI 操作将全为 no-op，渲染空白但不崩溃。
-        if hdc_screen.is_invalid() {
-            return Self {
-                hdc_mem: HDC::default(),
-                hbitmap: HBITMAP::default(),
-                hfont: HFONT::default(),
-                old_bitmap: HGDIOBJ::default(),
-                old_font: HGDIOBJ::default(),
-                hbrush: HBRUSH::default(),
-                text_color: COLORREF(COLOR_LIGHT_TEXT),
-                font_size: FONT_BASE_SIZE,
-                width: DISPLAY_WIDTH,
-                height: DISPLAY_HEIGHT,
-                arrow_width: 0,
-                buf: Vec::with_capacity(32),
-            };
-        }
+    /// 事务式构造：所有 GDI 资源按依赖顺序创建，任何一步失败由局部 RAII 守卫
+    /// 自动清理；全部成功后选入对象并移交所有权给 `Renderer`。
+    pub fn new() -> Result<Self, RendererError> {
+        // 1. 临时屏幕 DC（Drop 时 ReleaseDC）。
+        let screen_dc = ScreenDcGuard::acquire().ok_or(RendererError::ScreenDcUnavailable)?;
 
-        // SAFETY: hdc_screen 有效，创建兼容内存 DC。
-        let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
+        // 2. 兼容内存 DC（Drop 时 DeleteDC）。
+        let dc = OwnedDc::new(screen_dc.hdc).ok_or(RendererError::MemoryDcCreationFailed)?;
 
-        // SAFETY: hdc_screen 有效，创建兼容位图。
-        let hbitmap = unsafe { CreateCompatibleBitmap(hdc_screen, DISPLAY_WIDTH, DISPLAY_HEIGHT) };
+        // 3. 兼容位图（Drop 时 DeleteObject）。必须使用屏幕 DC 而非内存 DC。
+        let bitmap = OwnedBitmap::new(screen_dc.hdc, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            .ok_or(RendererError::BitmapCreationFailed)?;
 
-        // SAFETY: hdc_mem 和 hbitmap 有效，选入并备份旧位图。
-        let old_bitmap = unsafe { SelectObject(hdc_mem, hbitmap.into()) };
+        // 4. 字体（Drop 时 DeleteObject）。
+        let font = OwnedFont::new(FONT_BASE_SIZE).ok_or(RendererError::FontCreationFailed)?;
 
-        let hfont = create_font(FONT_BASE_SIZE);
+        // 5. 背景刷子（Drop 时 DeleteObject）。
+        let brush = OwnedBrush::new().ok_or(RendererError::BrushCreationFailed)?;
 
-        // SAFETY: hfont 有效，选入并备份旧字体。
-        let old_font = unsafe { SelectObject(hdc_mem, hfont.into()) };
+        // ── 至此所有可失败步骤均已成功。后续选入/测量/配置均不会失败。──
 
-        // SAFETY: 创建透明背景纯色刷子。
-        let hbrush = unsafe { CreateSolidBrush(COLORREF(COLOR_KEY)) };
+        // 6. 选入位图并备份原默认位图（stock 1x1 位图）。
+        // SAFETY: dc 与 bitmap 均为刚创建的有效独占句柄。
+        let old_bitmap = unsafe { SelectObject(dc.hdc, bitmap.hb.into()) };
 
-        // SAFETY: 设置背景模式为透明。
+        // 7. 选入字体并备份原默认字体（stock 系统字体）。
+        // SAFETY: dc 与 font 均为有效独占句柄。
+        let old_font = unsafe { SelectObject(dc.hdc, font.hf.into()) };
+
+        // 8. 设置背景模式为透明，便于 DrawTextW 与位图 blit 保留透明色键。
+        // SAFETY: dc.hdc 有效。
         unsafe {
-            let _ = SetBkMode(hdc_mem, TRANSPARENT);
+            let _ = SetBkMode(dc.hdc, TRANSPARENT);
         }
 
-        let arrow_width = measure_arrow_width(hdc_mem);
+        // 9. 测量箭头宽度（依赖已选入的字体）。
+        let arrow_width = measure_arrow_width(dc.hdc);
 
-        // SAFETY: 释放临时屏幕 HDC。
-        unsafe {
-            let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
-        }
+        // 10. 释放临时屏幕 DC（其使命仅限于提供创建上下文）。
+        drop(screen_dc);
 
-        Self {
-            hdc_mem,
-            hbitmap,
-            hfont,
+        // 11. 把独占资源所有权移交给 Renderer，杜绝守卫 Drop 误释放仍在使用的对象。
+        let renderer = Self {
+            hdc_mem: dc.hdc,
+            hbitmap: bitmap.hb,
+            hfont: font.hf,
             old_bitmap,
             old_font,
-            hbrush,
+            hbrush: brush.hbr,
             text_color: COLORREF(COLOR_LIGHT_TEXT),
             font_size: FONT_BASE_SIZE,
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
             arrow_width,
             buf: Vec::with_capacity(32),
-        }
+        };
+        std::mem::forget(dc);
+        std::mem::forget(bitmap);
+        std::mem::forget(font);
+        std::mem::forget(brush);
+
+        Ok(renderer)
     }
 
     pub fn update_text_color(&mut self) {
@@ -169,122 +332,154 @@ impl Renderer {
         let speed_left = speed_right - (76.0 * scale).round() as i32;
         let arrow_right = speed_left + self.arrow_width;
 
-        // SAFETY: hdc_mem、hbrush 均有效，DrawTextW 的 RECT 和字符串在栈上分配。
+        // 填充画布背景为透明色键，并设置文字颜色。
+        // SAFETY: self.hdc_mem、self.hbrush 均为已选入且有效的 GDI 句柄；rect 在栈上。
         unsafe {
             let _ = FillRect(self.hdc_mem, &rect, self.hbrush);
+        }
+        // SAFETY: self.hdc_mem 有效。
+        unsafe {
             SetTextColor(self.hdc_mem, self.text_color);
-            let hdc_mem = self.hdc_mem;
+        }
 
-            // 上行箭头
-            let mut rc_up_arrow = RECT {
-                left: speed_left,
-                top: 0,
-                right: arrow_right,
-                bottom: half_height,
-            };
-            let up_arrow = Self::wide(&mut self.buf, "\u{2191}");
+        // 上行箭头
+        let mut rc_up_arrow = RECT {
+            left: speed_left,
+            top: 0,
+            right: arrow_right,
+            bottom: half_height,
+        };
+        let up_arrow = Self::wide(&mut self.buf, "\u{2191}");
+        // SAFETY: hdc_mem 有效；rc_up_arrow 在栈上；up_arrow 是 NUL 结尾的字段缓冲区切片。
+        unsafe {
             let _ = DrawTextW(
-                hdc_mem,
+                self.hdc_mem,
                 up_arrow,
                 &mut rc_up_arrow,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
             );
+        }
 
-            // 上行数值
-            let mut rc_up_val = RECT {
-                left: arrow_right,
-                top: 0,
-                right: speed_right,
-                bottom: half_height,
-            };
-            let up_val = Self::format_speed_wide(&mut self.buf, speed_up);
+        // 上行数值
+        let mut rc_up_val = RECT {
+            left: arrow_right,
+            top: 0,
+            right: speed_right,
+            bottom: half_height,
+        };
+        let up_val = Self::format_speed_wide(&mut self.buf, speed_up);
+        // SAFETY: hdc_mem 有效；rc_up_val 在栈上；up_val 是 NUL 结尾的字段缓冲区切片。
+        unsafe {
             let _ = DrawTextW(
-                hdc_mem,
+                self.hdc_mem,
                 up_val,
                 &mut rc_up_val,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
+        }
 
-            // 下行箭头
-            let mut rc_down_arrow = RECT {
-                left: speed_left,
-                top: half_height,
-                right: arrow_right,
-                bottom: self.height,
-            };
-            let down_arrow = Self::wide(&mut self.buf, "\u{2193}");
+        // 下行箭头
+        let mut rc_down_arrow = RECT {
+            left: speed_left,
+            top: half_height,
+            right: arrow_right,
+            bottom: self.height,
+        };
+        let down_arrow = Self::wide(&mut self.buf, "\u{2193}");
+        // SAFETY: 同上。
+        unsafe {
             let _ = DrawTextW(
-                hdc_mem,
+                self.hdc_mem,
                 down_arrow,
                 &mut rc_down_arrow,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_LEFT,
             );
+        }
 
-            // 下行数值
-            let mut rc_down_val = RECT {
-                left: arrow_right,
-                top: half_height,
-                right: speed_right,
-                bottom: self.height,
-            };
-            let down_val = Self::format_speed_wide(&mut self.buf, speed_down);
+        // 下行数值
+        let mut rc_down_val = RECT {
+            left: arrow_right,
+            top: half_height,
+            right: speed_right,
+            bottom: self.height,
+        };
+        let down_val = Self::format_speed_wide(&mut self.buf, speed_down);
+        // SAFETY: 同上。
+        unsafe {
             let _ = DrawTextW(
-                hdc_mem,
+                self.hdc_mem,
                 down_val,
                 &mut rc_down_val,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
+        }
 
-            // 2. 绘制第一列 (CPU & MEM) - 最左列
-            let cpu_right = speed_left - col_gap;
-            let cpu_left = cpu_right - (76.0 * scale).round() as i32;
+        // 2. 绘制第一列 (CPU & MEM) - 最左列
+        let cpu_right = speed_left - col_gap;
+        let cpu_left = cpu_right - (76.0 * scale).round() as i32;
 
-            // 仅 CPU 行根据热风险状态变色，其余行保持默认色。
-            let thermal_color = match thermal_state {
-                2 => COLORREF(COLOR_HOT_TEXT),
-                3 => COLORREF(COLOR_CRIT_TEXT),
-                _ => self.text_color,
-            };
-            SetTextColor(hdc_mem, thermal_color);
+        // 仅 CPU 行根据热风险状态变色，其余行保持默认色。
+        let thermal_color = match thermal_state {
+            2 => COLORREF(COLOR_HOT_TEXT),
+            3 => COLORREF(COLOR_CRIT_TEXT),
+            _ => self.text_color,
+        };
+        // SAFETY: hdc_mem 有效。
+        unsafe {
+            SetTextColor(self.hdc_mem, thermal_color);
+        }
 
-            let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", cpu);
-            let mut rc_cpu = RECT {
-                left: cpu_left,
-                top: 0,
-                right: cpu_right,
-                bottom: half_height,
-            };
+        let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", cpu);
+        let mut rc_cpu = RECT {
+            left: cpu_left,
+            top: 0,
+            right: cpu_right,
+            bottom: half_height,
+        };
+        // SAFETY: 同上；cpu_wide 是 NUL 结尾的字段缓冲区切片。
+        unsafe {
             let _ = DrawTextW(
-                hdc_mem,
+                self.hdc_mem,
                 cpu_wide,
                 &mut rc_cpu,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
+        }
 
-            SetTextColor(hdc_mem, self.text_color);
+        // SAFETY: hdc_mem 有效。
+        unsafe {
+            SetTextColor(self.hdc_mem, self.text_color);
+        }
 
-            let h = self.height;
-            let mem_wide = Self::format_cpu_mem_wide(&mut self.buf, "MEM", mem);
-            let mut rc_mem = RECT {
-                left: cpu_left,
-                top: half_height,
-                right: cpu_right,
-                bottom: h,
-            };
+        let h = self.height;
+        let mem_wide = Self::format_cpu_mem_wide(&mut self.buf, "MEM", mem);
+        let mut rc_mem = RECT {
+            left: cpu_left,
+            top: half_height,
+            right: cpu_right,
+            bottom: h,
+        };
+        // SAFETY: 同上。
+        unsafe {
             let _ = DrawTextW(
-                hdc_mem,
+                self.hdc_mem,
                 mem_wide,
                 &mut rc_mem,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
+        }
 
+        // 3. 把内存 DC 内容一次性 blit 到目标窗口 DC。
+        // SAFETY: hdc 与 self.hdc_mem 均为有效 DC；坐标与尺寸基于 self.width / self.height，
+        // 与位图选择时的尺寸一致。
+        unsafe {
             let _ = BitBlt(
                 hdc,
                 0,
                 0,
                 self.width,
                 self.height,
-                Some(hdc_mem),
+                Some(self.hdc_mem),
                 0,
                 0,
                 SRCCOPY,
@@ -293,77 +488,73 @@ impl Renderer {
     }
 
     pub fn update_dpi(&mut self, hwnd: HWND) {
-        // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用 GetDpiForWindow 是安全的，无跨进程非法访问问题。
+        // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用
+        // GetDpiForWindow 是纯查询 API，无跨进程非法访问问题。
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
         let scale = dpi as f64 / 96.0;
         let width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
         let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
         let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
 
-        // 1. 创建符合新大小的 Compatible Bitmap
-        // SAFETY: null_mut 句柄获取临时屏幕 HDC。
-        let hdc_screen = unsafe { GetWindowDC(Some(HWND(std::ptr::null_mut()))) };
-        if hdc_screen.is_invalid() {
+        // 1. 取得临时屏幕 DC。
+        let Some(screen_dc) = ScreenDcGuard::acquire() else {
             return;
-        }
+        };
 
-        // SAFETY: hdc_screen 有效，创建兼容位图。
-        let new_bitmap = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
-
-        // SAFETY: 释放临时屏幕 HDC。
-        unsafe {
-            let _ = ReleaseDC(Some(HWND(std::ptr::null_mut())), hdc_screen);
-        }
-
-        if new_bitmap.is_invalid() {
-            // 位图创建失败时保持旧尺寸与旧位图，避免 BitBlt 源/目标大小不匹配。
+        // 2. 创建新尺寸的兼容位图（必须用屏幕 DC）。失败时保持旧尺寸与旧位图。
+        let Some(new_bitmap) = OwnedBitmap::new(screen_dc.hdc, width, height) else {
             return;
-        }
+        };
 
-        // 2. 重新创建并选择字体（不设上限）
-        let new_font = create_font(font_size);
-        if new_font.is_invalid() {
-            // 字体创建失败时释放已创建的新位图，保持旧状态不变。
-            unsafe {
-                let _ = DeleteObject(new_bitmap.into());
-            }
+        // 位图创建后不再需要屏幕 DC，提前释放。
+        drop(screen_dc);
+
+        // 3. 创建新尺寸的字体。失败时由 OwnedBitmap 守卫自动释放位图。
+        let Some(new_font) = OwnedFont::new(font_size) else {
             return;
-        }
+        };
 
-        // 3. 新 GDI 资源都已就绪，一次性更新内存 DC 与属性，确保状态一致。
-        // SAFETY: hdc_mem 和 new_bitmap 有效，选入新位图并销毁旧位图。
-        let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.into()) };
+        // 4. 新资源均已就绪：原子替换并向后清理旧对象，确保 BitBlt 源/目标尺寸一致。
+        // SAFETY: self.hdc_mem 有效；new_bitmap 为刚创建的独占位图；SelectObject 返回的
+        // old_bitmap 是此前选入并被替换的 self.hbitmap，已脱离 DC 可安全 DeleteObject。
+        let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.hb.into()) };
         unsafe {
             let _ = DeleteObject(old_bitmap);
         }
-        self.hbitmap = new_bitmap;
+        self.hbitmap = new_bitmap.hb;
 
-        // SAFETY: hdc_mem 和 new_font 有效，选入新字体并销毁旧字体。
-        let old_font = unsafe { SelectObject(self.hdc_mem, new_font.into()) };
+        // SAFETY: self.hdc_mem 有效；new_font 为独占字体；old_font 是被替换的 self.hfont。
+        let old_font = unsafe { SelectObject(self.hdc_mem, new_font.hf.into()) };
         unsafe {
             let _ = DeleteObject(old_font);
         }
-        self.hfont = new_font;
+        self.hfont = new_font.hf;
 
         self.font_size = font_size;
         self.width = width;
         self.height = height;
 
-        // SAFETY: hdc_mem 有效，设置背景模式为透明。
+        // SAFETY: self.hdc_mem 有效。
         unsafe {
             let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
         }
 
-        let arrow_width = measure_arrow_width(self.hdc_mem);
-        self.arrow_width = arrow_width;
+        self.arrow_width = measure_arrow_width(self.hdc_mem);
+
+        // 移交独占资源，避免守卫 Drop 误销毁仍在使用的对象。
+        std::mem::forget(new_bitmap);
+        std::mem::forget(new_font);
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         // SAFETY:
-        // 1. self.hdc_mem 是有效持有的内存设备上下文，还原最初选入上下文的备用 GDI 对象 self.old_bitmap 和 self.old_font 能避免还原默认 GDI 对象时的泄露。
-        // 2. 所持有的 HFONT、HBITMAP、HBRUSH 句柄均由当前结构体独占，使用 DeleteObject 和 DeleteDC 销毁它们可安全归还系统图形资源。
+        // 1. self.hdc_mem 是有效持有的内存设备上下文。还原最初选入上下文的 stock 默认
+        //    位图 self.old_bitmap 与 stock 字体 self.old_font，避免 DeleteDC 因仍持有
+        //    独占对象而拒绝释放。
+        // 2. self.hfont、self.hbitmap、self.hbrush 均由本结构体独占，已被还原出 DC，
+        //    可用 DeleteObject 安全归还系统图形资源。DeleteDC 最后释放 DC 本身。
         unsafe {
             let _ = SelectObject(self.hdc_mem, self.old_bitmap);
             let _ = SelectObject(self.hdc_mem, self.old_font);
@@ -379,7 +570,7 @@ impl Drop for Renderer {
 fn measure_arrow_width(hdc: HDC) -> i32 {
     let arrow_text = to_wide("\u{2191} ");
     let mut size = SIZE::default();
-    // SAFETY: hdc 有效，arrow_text 以 NUL 结尾，size 在栈上。
+    // SAFETY: hdc 有效；arrow_text 以 NUL 结尾；size 在栈上分配。
     unsafe {
         let _ = GetTextExtentPoint32W(hdc, &arrow_text[..arrow_text.len() - 1], &mut size);
     }
@@ -396,8 +587,10 @@ fn create_font(size: i32) -> HFONT {
     let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
     lf.lfFaceName[..font_name.len()].copy_from_slice(&font_name);
     // SAFETY:
-    // 1. lf 已经过完整的零初始化且 lfFaceName 被安全地写入了以 NUL 结尾的 "Segoe UI" 宽字符序列，避免了非法内存溢出。
-    // 2. 传入 LOGFONTW 结构体的指针给 CreateFontIndirectW 调用是内存安全的，返回的 HFONT 句柄所有权将被返回并交由外部进行清理。
+    // 1. lf 已经过完整的零初始化且 lfFaceName 被安全地写入了以 NUL 结尾的 "Segoe UI"
+    //    宽字符序列，避免了非法内存溢出。
+    // 2. 传入 LOGFONTW 结构体的指针给 CreateFontIndirectW 调用是内存安全的，返回的
+    //    HFONT 句柄所有权将被返回并交由外部进行清理。
     unsafe { CreateFontIndirectW(&lf) }
 }
 

@@ -17,9 +17,7 @@ use crate::config::{
     TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
     TIMER_INTERVAL_THERMAL,
 };
-use crate::state::{
-    CONSECUTIVE_ZERO_COUNT, FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS,
-};
+use crate::state::{CONSECUTIVE_ZERO_COUNT, FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS};
 use crate::window::get_taskbar_hwnd;
 
 pub fn is_suspended() -> bool {
@@ -80,16 +78,11 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         TIMER_INTERVAL_NETWORK
     };
     // SAFETY: hwnd 有效，ID 和间隔均为进程内固定常量；返回 0 表示创建失败。
-    let network_ok = unsafe {
-        SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None) != 0
-    };
+    let network_ok = unsafe { SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None) != 0 };
     // SAFETY: 同上，分别创建 CPU/内存与热风险定时器。
-    let cpu_mem_ok = unsafe {
-        SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None) != 0
-    };
-    let thermal_ok = unsafe {
-        SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None) != 0
-    };
+    let cpu_mem_ok = unsafe { SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None) != 0 };
+    let thermal_ok =
+        unsafe { SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None) != 0 };
 
     fullscreen_ok && network_ok && cpu_mem_ok && thermal_ok
 }

@@ -47,3 +47,115 @@ pub static THERMAL_RISK: AtomicU32 = AtomicU32::new(0);
 
 /// 热风险状态机输出：0=Cool, 1=Warm, 2=Hot, 3=Critical。
 pub static THERMAL_STATE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+mod tests {
+    //! 暂停原因状态机测试：使用局部 `AtomicU32` 复现 `suspend_system`/`resume_system`
+    //! 对 `SUSPEND_REASONS` 使用的 `fetch_or`/`fetch_and` 协议，验证多个独立原因叠加时
+    //! 只有全部清除后才解除暂停——避免真实场景下的误恢复 (BUG)。
+    //!
+    //! 不直接调用 `suspend_system`/`resume_system`，因为它们会触发 `sync_monitoring_timers`，
+    //! 需要有效窗口句柄而无法在单元测试中执行。原子操作协议与生产代码完全一致。
+
+    use super::{SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn suspended(state: &AtomicU32) -> bool {
+        state.load(Ordering::Acquire) != 0
+    }
+
+    fn suspend(state: &AtomicU32, reason: u32) {
+        state.fetch_or(reason, Ordering::AcqRel);
+    }
+
+    fn resume(state: &AtomicU32, reason: u32) {
+        state.fetch_and(!reason, Ordering::AcqRel);
+    }
+
+    /// 锁屏 → 显示器关闭 → 显示器开启：必须仍暂停直到解锁。
+    #[test]
+    fn lock_then_monitor_off_then_monitor_on_still_suspended() {
+        let state = AtomicU32::new(0);
+
+        suspend(&state, SUSPEND_REASON_SESSION);
+        assert!(suspended(&state), "锁屏后应暂停");
+
+        suspend(&state, SUSPEND_REASON_MONITOR);
+        assert!(suspended(&state), "锁屏+显示器关后应暂停");
+
+        // 显示器开启不应解除暂停，因锁屏原因仍生效。
+        resume(&state, SUSPEND_REASON_MONITOR);
+        assert!(suspended(&state), "显示器开启但未解锁应仍暂停");
+
+        // 解锁后才完全恢复。
+        resume(&state, SUSPEND_REASON_SESSION);
+        assert!(!suspended(&state), "解锁后应恢复");
+    }
+
+    /// 显示器关闭 → 锁屏 → 解锁：必须仍暂停直到显示器开启。
+    #[test]
+    fn monitor_off_then_lock_then_unlock_still_suspended() {
+        let state = AtomicU32::new(0);
+
+        suspend(&state, SUSPEND_REASON_MONITOR);
+        assert!(suspended(&state), "显示器关后应暂停");
+
+        suspend(&state, SUSPEND_REASON_SESSION);
+        assert!(suspended(&state), "显示器关+锁屏后应暂停");
+
+        // 解锁不应解除暂停，因显示器关闭原因仍生效。
+        resume(&state, SUSPEND_REASON_SESSION);
+        assert!(suspended(&state), "解锁但显示器仍关应仍暂停");
+
+        // 显示器开启后才完全恢复。
+        resume(&state, SUSPEND_REASON_MONITOR);
+        assert!(!suspended(&state), "显示器开启后应恢复");
+    }
+
+    /// 三种原因全部叠加，必须按任意顺序全部清除才恢复。
+    #[test]
+    fn all_three_reasons_must_clear() {
+        let state = AtomicU32::new(0);
+
+        suspend(&state, SUSPEND_REASON_SYSTEM);
+        suspend(&state, SUSPEND_REASON_SESSION);
+        suspend(&state, SUSPEND_REASON_MONITOR);
+        assert!(suspended(&state));
+
+        resume(&state, SUSPEND_REASON_SYSTEM);
+        assert!(suspended(&state), "剩两原因未清");
+
+        resume(&state, SUSPEND_REASON_SESSION);
+        assert!(suspended(&state), "剩一原因未清");
+
+        resume(&state, SUSPEND_REASON_MONITOR);
+        assert!(!suspended(&state), "全部清除后应恢复");
+    }
+
+    /// 重复清除同一原因不应误清其它原因（fetch_and 幂等性）。
+    #[test]
+    fn resume_idempotent_preserves_other_reasons() {
+        let state = AtomicU32::new(0);
+
+        suspend(&state, SUSPEND_REASON_SESSION | SUSPEND_REASON_MONITOR);
+        resume(&state, SUSPEND_REASON_SESSION);
+        assert!(suspended(&state), "MONITOR 原因仍在");
+
+        resume(&state, SUSPEND_REASON_SESSION); // 重置已清位，无害。
+        assert!(suspended(&state), "重置已清位后 MONITOR 仍在");
+
+        resume(&state, SUSPEND_REASON_MONITOR);
+        assert!(!suspended(&state));
+    }
+
+    /// 单一原因无叠加：清除后立即恢复。
+    #[test]
+    fn single_reason_clears_immediately() {
+        let state = AtomicU32::new(0);
+
+        suspend(&state, SUSPEND_REASON_SESSION);
+        assert!(suspended(&state));
+        resume(&state, SUSPEND_REASON_SESSION);
+        assert!(!suspended(&state));
+    }
+}

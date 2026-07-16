@@ -1,7 +1,7 @@
 //! 任务栏窗口管理：查找 Shell_TrayWnd、计算嵌入位置、嵌入与位置更新。
 
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT, SetLastError, WIN32_ERROR};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
     IsWindow, LWA_COLORKEY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
@@ -83,17 +83,50 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
         }
     };
 
-    // SAFETY: hwnd 和 h_taskbar 均为已验证的有效句柄。
+    // SAFETY:
+    // 1. 输入与依赖校验：hwnd 与 h_taskbar 均为已通过有效性校验的窗口句柄；
+    //    rect 由 calc_widget_rect 计算得到的有效几何。
+    // 2. 状态不变性约束：必须严格按 AGENTS.md 既定顺序执行
+    //    （SetParent → GWL_STYLE → 重新应用 WS_EX_LAYERED → SetWindowPos →
+    //    SetLayeredWindowAttributes）。调换会导致分层透明失效或被任务栏图标遮挡。
+    //    任一步失败立即返回 false，避免任务栏嵌入进入不可恢复的中间状态。
     unsafe {
-        let _ = SetParent(hwnd, Some(h_taskbar));
-        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
+        if SetParent(hwnd, Some(h_taskbar)).is_err() {
+            show_error("Failed to SetParent into taskbar");
+            return false;
+        }
+
+        // SetWindowLongPtrW 返回 isize（前值），0 既可能表示"前值就是 0"也可能表示失败，
+        // 必须先 SetLastError(WIN32_ERROR(0)) 再调用，事后用 GetLastError 才能可靠区分。
+        SetLastError(WIN32_ERROR(0));
+        let prev_style = SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
+        if prev_style == 0 {
+            let last = GetLastError();
+            if last.0 != 0 {
+                show_error(&format!("Failed to override GWL_STYLE: 0x{:08X}", last.0));
+                return false;
+            }
+        }
+
         let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(
+        SetLastError(WIN32_ERROR(0));
+        let prev_ex = SetWindowLongPtrW(
             hwnd,
             GWL_EXSTYLE,
             current_ex_style | (WS_EX_LAYERED.0 as isize),
         );
-        let _ = SetWindowPos(
+        if prev_ex == 0 {
+            let last = GetLastError();
+            if last.0 != 0 {
+                show_error(&format!(
+                    "Failed to reapply WS_EX_LAYERED: 0x{:08X}",
+                    last.0
+                ));
+                return false;
+            }
+        }
+
+        if SetWindowPos(
             hwnd,
             Some(HWND_TOP),
             display_x,
@@ -101,7 +134,12 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
             display_width,
             display_height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-        );
+        )
+        .is_err()
+        {
+            show_error("Failed to SetWindowPos in taskbar");
+            return false;
+        }
         if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(COLOR_KEY), 0, LWA_COLORKEY) {
             show_error(&format!("Failed to set layered window attributes: {:?}", e));
             return false;
