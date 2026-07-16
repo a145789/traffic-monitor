@@ -49,6 +49,9 @@ pub const LOWORD_MASK: u32 = 0xFFFF;
 // 针对 Meteor Lake H (Core Ultra 7 155H) + 16" 轻薄本标定。
 // 其他机型需重新标定常量。拔电时用电池放电功率直测总发热,
 // 插电时用 CPU/MEM/内核比多信号推断(有 GPU/NPU 盲区)。
+//
+// 热容：die（快）← 功率，skin/chassis（慢）← die，模拟机身蓄热与冷却滞后。
+// 降频地板：高占用 + 低频比 → 至少 WARM/HOT 边界，避免 throttle 后假凉快。
 
 pub const P_IDLE_PLUG_MW: i32 = 7000;
 pub const A_CPU_MW_PER_PCT: i32 = 350;
@@ -56,18 +59,30 @@ pub const B_MEM_MW_PER_PCT: i32 = 100;
 pub const C_KERNEL_HEAVY_MW: i32 = 8000;
 pub const KERNEL_GATE_CPU_PCT: i32 = 30;
 pub const KU_HEAVY_THRESHOLD_Q8: u32 = 384;
-pub const EMA_ALPHA_FAST_Q8: u32 = 23;
-pub const EMA_ALPHA_SLOW_Q8: u32 = 6;
+/// die 节点 EMA α（Q8），τ≈12s @ 1Hz。
+pub const TAU_DIE_ALPHA_Q8: u32 = 23;
+/// skin/chassis 节点 EMA α（Q8），从 die 耦合，τ≈90s @ 1Hz。
+pub const TAU_SKIN_ALPHA_Q8: u32 = 6;
+/// die−skin 温差（mW 当量）上升趋势门槛。
 pub const TREND_RISE_MW: i32 = 8000;
 pub const TREND_FALL_MW: i32 = 5000;
 pub const TREND_BONUS_UP: i32 = 10;
 pub const TREND_BONUS_DN: i32 = -5;
 pub const FP_BREAKS_MW: [i32; 5] = [0, 12000, 22000, 35000, 50000];
 pub const FP_BREAKS_RISK: [i32; 5] = [0, 20, 50, 80, 100];
+/// 高占用门槛：与低频比组合判定 thermal throttle。
+pub const THROTTLE_CPU_PCT: i32 = 55;
+/// 频率比 Q8 上限（≈62.5% MaxMhz）：高占用且不高于此视为降频保护。
+pub const THROTTLE_FREQ_Q8: u32 = 160;
+/// 降频时风险下限（对齐 ST_WARM_TO_HOT，至少推到 HOT 边界）。
+pub const THROTTLE_RISK_FLOOR: u32 = 55;
 pub const ST_COOL_TO_WARM: u32 = 25;
 pub const ST_WARM_TO_COOL: u32 = 15;
 pub const ST_WARM_TO_HOT: u32 = 55;
 pub const ST_HOT_TO_WARM: u32 = 45;
 pub const ST_HOT_TO_CRIT: u32 = 85;
 pub const ST_CRIT_TO_HOT: u32 = 75;
+/// 升级最短驻留（秒）：防抖。
 pub const ST_DWELL_SECS: u32 = 5;
+/// 降级最短驻留（秒）：机身仍烫时不立刻退色。
+pub const ST_DWELL_DOWN_SECS: u32 = 20;

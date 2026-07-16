@@ -95,6 +95,6 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 | [src/update/version.rs](src/update/version.rs) | 版本号解析与远端 metadata 严格解析（纯字符串/字节处理，无 I/O，支持单测），判断目录类型。                     |
 | [src/update/http.rs](src/update/http.rs) | WinHTTP 网络数据抓取与友好的中文错误映射。                                                                     |
 | [src/update/crypto.rs](src/update/crypto.rs) | BCrypt SHA-256 哈希计算与 RAII 句柄安全守卫。                                                                  |
-| [src/thermal.rs](src/thermal.rs)     | 设备过热风险推断引擎：电池放电功率直测（拔电）/CPU·内存·内核比多信号推断（插电）、双 EMA 热容模拟、滞回状态机。 |
+| [src/thermal.rs](src/thermal.rs)     | 设备过热风险推断引擎：电池放电功率直测（拔电）/CPU·内存·内核比多信号推断（插电）、die/skin 双节点蓄热、降频风险地板、升级/降级不对称驻留状态机。 |
 | [src/ffi_guard.rs](src/ffi_guard.rs) | 跨模块复用的通用 Win32 句柄 RAII 守卫（`MutexGuard`、`MenuGuard`）。业务专属守卫留在各自业务文件。              |
 | [src/util.rs](src/util.rs)           | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                                            |

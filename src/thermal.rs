@@ -6,16 +6,19 @@
 //! - 拔电：电池放电功率 = 系统总发热（能量守恒直测，精度高）
 //! - 插电：CPU% + MEM% + 内核/用户比 多信号推断（有 GPU/NPU 盲区）
 //!
-//! 双 EMA（τ=10s 快 / τ=90s 慢）模拟皮肤热容滞后，对齐用户体感。
-//! 状态机带滞回 + 最小驻留，把"何时该降温"变成明确的 HOT/CRITICAL 事件。
+//! 双节点热容（die 快 / skin 慢）：功率先加热 die，再耦合到机身节点，
+//! 对齐"持续中载会越来越烫、停载后掌托仍烫一会儿"的体感。
+//! 降频地板：高占用 + 低频比时抬高风险下限，避免 throttle 后功耗下降造成假凉快。
+//! 状态机带滞回 + 升级/降级不对称驻留。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::config::{
-    A_CPU_MW_PER_PCT, B_MEM_MW_PER_PCT, C_KERNEL_HEAVY_MW, EMA_ALPHA_FAST_Q8, EMA_ALPHA_SLOW_Q8,
-    FP_BREAKS_MW, FP_BREAKS_RISK, KERNEL_GATE_CPU_PCT, KU_HEAVY_THRESHOLD_Q8, P_IDLE_PLUG_MW,
-    ST_COOL_TO_WARM, ST_CRIT_TO_HOT, ST_DWELL_SECS, ST_HOT_TO_CRIT, ST_HOT_TO_WARM,
-    ST_WARM_TO_COOL, ST_WARM_TO_HOT, TREND_BONUS_DN, TREND_BONUS_UP, TREND_FALL_MW, TREND_RISE_MW,
+    A_CPU_MW_PER_PCT, B_MEM_MW_PER_PCT, C_KERNEL_HEAVY_MW, FP_BREAKS_MW, FP_BREAKS_RISK,
+    KERNEL_GATE_CPU_PCT, KU_HEAVY_THRESHOLD_Q8, P_IDLE_PLUG_MW, ST_COOL_TO_WARM, ST_CRIT_TO_HOT,
+    ST_DWELL_DOWN_SECS, ST_DWELL_SECS, ST_HOT_TO_CRIT, ST_HOT_TO_WARM, ST_WARM_TO_COOL,
+    ST_WARM_TO_HOT, TAU_DIE_ALPHA_Q8, TAU_SKIN_ALPHA_Q8, THROTTLE_CPU_PCT, THROTTLE_FREQ_Q8,
+    THROTTLE_RISK_FLOOR, TREND_BONUS_DN, TREND_BONUS_UP, TREND_FALL_MW, TREND_RISE_MW,
 };
 use crate::state::{MEM_USAGE, THERMAL_RISK, THERMAL_STATE};
 
@@ -25,16 +28,17 @@ static PREV_KERNEL: AtomicU64 = AtomicU64::new(0);
 static PREV_USER: AtomicU64 = AtomicU64::new(0);
 static TIMES_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-// 双 EMA 状态（mW，定点整数）
-static P_FAST: AtomicI32 = AtomicI32::new(0);
-static P_SLOW: AtomicI32 = AtomicI32::new(0);
-static EMA_INITIALIZED: AtomicBool = AtomicBool::new(false);
-// EMA 初始化阶段：前 3 个样本取均值，避免启动时负载尖峰导致误报。
+// 双节点热当量（mW 单位：稳态时节点值趋近输入功率）
+static T_DIE: AtomicI32 = AtomicI32::new(0);
+static T_SKIN: AtomicI32 = AtomicI32::new(0);
+static THERMAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
+// 初始化：前 3 个样本取均值，避免启动尖峰把慢节点拉高导致数分钟误报。
 static INIT_COUNT: AtomicU32 = AtomicU32::new(0);
 static INIT_SUM: AtomicI32 = AtomicI32::new(0);
 
-// 状态机驻留计数
+// 状态机：连续同向意图的驻留秒数，以及上一拍意图 (+1 升级 / -1 降级 / 0 无)
 static DWELL: AtomicU32 = AtomicU32::new(0);
+static DWELL_INTENT: AtomicI8 = AtomicI8::new(0);
 
 use windows::Win32::System::Power::{
     CallNtPowerInformation, ProcessorInformation, SystemBatteryState,
@@ -133,10 +137,9 @@ fn read_battery() -> (bool, bool, i32) {
 ///
 /// `ratio_q8 = ΣCurrentMhz / ΣMaxMhz × 256`，范围 \[1, 256\]。
 ///
-/// 用于动态缩放插电路径的 `A_CPU_MW_PER_PCT`，使热模型自动适应：
-/// - 电源方案切换（静谧模式频率被 cap → ratio 下降 → CPU 功耗系数降低）
-/// - 过热降频（thermal throttling → ratio 下降 → 模型跟踪功耗变化）
-/// - 不同 CPU 型号（i3/i7/i9 的 MaxMhz 不同 → ratio 归一化）
+/// 用于：
+/// - 动态缩放插电路径的 `A_CPU_MW_PER_PCT`
+/// - 降频地板（高占用 + 低频比 → 抬风险下限）
 ///
 /// 传感器不可用或 sum_max 为 0 时返回 256（即 ratio=1.0，退化为原始静态系数）。
 fn read_cpu_freq_ratio_q8() -> u32 {
@@ -195,6 +198,7 @@ fn read_cpu_freq_ratio_q8() -> u32 {
 ///
 /// 沿 `FP_BREAKS_MW` / `FP_BREAKS_RISK` 断点插值，纯整数运算无浮点。
 /// 输入负值或超出上限时分别夹紧到 0 / 100。
+/// 热节点值与功率同量纲（mW 当量），稳态时节点≈输入功率，故复用此映射。
 fn f_p_to_risk(p_mw: i32) -> i32 {
     if p_mw <= FP_BREAKS_MW[0] {
         return 0;
@@ -212,16 +216,92 @@ fn f_p_to_risk(p_mw: i32) -> i32 {
     100
 }
 
-/// 状态机转移函数。升级需满足 dwell 门槛（防抖），降级立即（快速恢复）。
-fn next_state(cur: u8, r: u32, dwell: u32) -> u8 {
-    match (cur, r) {
-        (0, r) if r >= ST_COOL_TO_WARM && dwell >= ST_DWELL_SECS => 1,
-        (1, r) if r >= ST_WARM_TO_HOT && dwell >= ST_DWELL_SECS => 2,
-        (2, r) if r >= ST_HOT_TO_CRIT && dwell >= ST_DWELL_SECS => 3,
-        (1, r) if r <= ST_WARM_TO_COOL => 0,
-        (2, r) if r <= ST_HOT_TO_WARM => 1,
-        (3, r) if r <= ST_CRIT_TO_HOT => 2,
-        _ => cur,
+/// 双节点热容一步：die 跟踪功率，skin 跟踪 die（机身滞后）。
+///
+/// `T' = α·input + (1−α)·T`，α 为 Q8（/256）。单位均为 mW 当量。
+fn step_thermal_nodes(p_mw: i32, t_die: i32, t_skin: i32) -> (i32, i32) {
+    let ad = TAU_DIE_ALPHA_Q8 as i32;
+    let as_ = TAU_SKIN_ALPHA_Q8 as i32;
+    let new_die = (ad * p_mw + (256 - ad) * t_die) / 256;
+    let new_skin = (as_ * new_die + (256 - as_) * t_skin) / 256;
+    (new_die, new_skin)
+}
+
+/// 由 die/skin 节点合成风险指数（未施加降频地板）。
+///
+/// 以 skin（体感）为主、die 为辅；die−skin 温差提供上升/回落趋势修正。
+fn risk_from_nodes(t_die: i32, t_skin: i32) -> i32 {
+    let r_skin = f_p_to_risk(t_skin);
+    let r_die = f_p_to_risk(t_die);
+    let trend = t_die - t_skin;
+    let bonus = if trend > TREND_RISE_MW {
+        TREND_BONUS_UP
+    } else if trend < -TREND_FALL_MW {
+        TREND_BONUS_DN
+    } else {
+        0
+    };
+    (7 * r_skin + 3 * r_die) / 10 + bonus
+}
+
+/// 高占用 + 低频比 → 判定为 thermal throttle（或强限频），抬风险下限。
+///
+/// 返回应施加的 floor；不满足条件时返回 0（调用方 `r.max(floor)` 无影响）。
+fn throttle_risk_floor(cpu_pct: i32, freq_ratio_q8: u32) -> u32 {
+    if cpu_pct >= THROTTLE_CPU_PCT && freq_ratio_q8 <= THROTTLE_FREQ_Q8 {
+        THROTTLE_RISK_FLOOR
+    } else {
+        0
+    }
+}
+
+/// 状态转移意图：+1 升级，−1 降级，0 滞回带内不动。
+fn transition_intent(cur: u8, r: u32) -> i8 {
+    match cur {
+        0 if r >= ST_COOL_TO_WARM => 1,
+        1 if r >= ST_WARM_TO_HOT => 1,
+        1 if r <= ST_WARM_TO_COOL => -1,
+        2 if r >= ST_HOT_TO_CRIT => 1,
+        2 if r <= ST_HOT_TO_WARM => -1,
+        3 if r <= ST_CRIT_TO_HOT => -1,
+        _ => 0,
+    }
+}
+
+/// 滞回状态机一步：升级/降级均需连续同向意图达到各自 dwell 门槛。
+///
+/// 返回 `(next_state, new_dwell, new_intent)`。
+fn step_state_machine(cur: u8, r: u32, dwell: u32, prev_intent: i8) -> (u8, u32, i8) {
+    let intent = transition_intent(cur, r);
+    if intent == 0 {
+        return (cur, 0, 0);
+    }
+
+    let new_dwell = if intent == prev_intent {
+        dwell.saturating_add(1)
+    } else {
+        1
+    };
+
+    let need = if intent > 0 {
+        ST_DWELL_SECS
+    } else {
+        ST_DWELL_DOWN_SECS
+    };
+
+    if new_dwell >= need {
+        let next = match (cur, intent) {
+            (0, 1) => 1,
+            (1, 1) => 2,
+            (2, 1) => 3,
+            (1, -1) => 0,
+            (2, -1) => 1,
+            (3, -1) => 2,
+            _ => cur,
+        };
+        (next, 0, 0)
+    } else {
+        (cur, new_dwell, intent)
     }
 }
 
@@ -284,8 +364,8 @@ fn sample_cpu_times() -> Option<(i32, u32)> {
 
 /// 热风险采集入口。每秒由 `TIMER_ID_THERMAL` 调用。
 ///
-/// 开销：1 次 `CallNtPowerInformation` + 1 次 `GetSystemTimes` + 纯整数运算 + 6 次原子 store。
-/// 总开销 < 20μs，1Hz 下 CPU 占用可忽略。
+/// 开销：最多 2 次 `CallNtPowerInformation` + 1 次 `GetSystemTimes` + 纯整数运算。
+/// 总开销仍远低于 1Hz 可感知阈值。
 pub fn collect_thermal() {
     // 1. 采集电池状态
     let (ac, discharging, batt_mw) = read_battery();
@@ -299,75 +379,59 @@ pub fn collect_thermal() {
     // 3. 读取内存负载（由 collector 每 5s 更新，热模型容忍 5s 滞后）
     let mem = MEM_USAGE.load(Ordering::Relaxed) as i32;
 
-    // 4. 估计热功率 (mW)
+    // 4. 频率比：插电功耗缩放 + 全路径降频地板
+    let freq_ratio_q8 = read_cpu_freq_ratio_q8();
+
+    // 5. 估计热功率 (mW)
     let p_mw = if !ac && discharging && batt_mw > 0 {
         // 拔电放电：放电功率即系统总发热（能量守恒直测）
         batt_mw
     } else {
         // 插电或传感器失败：多信号推断
-        // CPU 功耗系数按频率比动态缩放，自动适配电源方案切换、过热降频、
-        // 不同 CPU 型号等场景。ratio_q8 为 Q8 定点，(0, 256]。
-        let freq_ratio_q8 = read_cpu_freq_ratio_q8() as i32;
-        let a_dynamic = A_CPU_MW_PER_PCT * freq_ratio_q8 / 256;
+        let a_dynamic = A_CPU_MW_PER_PCT * freq_ratio_q8 as i32 / 256;
         let ku_heavy = cpu > KERNEL_GATE_CPU_PCT && ku_q8 > KU_HEAVY_THRESHOLD_Q8;
         let k = if ku_heavy { C_KERNEL_HEAVY_MW } else { 0 };
         P_IDLE_PLUG_MW + cpu * a_dynamic + mem * B_MEM_MW_PER_PCT + k
     };
 
-    // 5. 双 EMA（定点 Q8: alpha = N/256）
-    // 前 3 个样本取均值再初始化，避免启动时的瞬时负载尖峰（如后台
-    // 编译 .NET 缓存、杀毒扫描）把慢 EMA（τ=90s）拉到极高值，
-    // 导致数分钟内持续误报过热。
-    if !EMA_INITIALIZED.load(Ordering::Relaxed) {
+    // 6. 双节点热容
+    // 前 3 个样本取均值再初始化，避免启动尖峰把 skin（τ≈90s）拉高。
+    if !THERMAL_INITIALIZED.load(Ordering::Relaxed) {
         let count = INIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         INIT_SUM.fetch_add(p_mw, Ordering::Relaxed);
         if count < 3 {
             return;
         }
         let init_val = INIT_SUM.load(Ordering::Relaxed) / count as i32;
-        P_FAST.store(init_val, Ordering::Relaxed);
-        P_SLOW.store(init_val, Ordering::Relaxed);
-        EMA_INITIALIZED.store(true, Ordering::Release);
-        THERMAL_RISK.store(
-            f_p_to_risk(init_val).clamp(0, 100) as u32,
-            Ordering::Release,
-        );
+        T_DIE.store(init_val, Ordering::Relaxed);
+        T_SKIN.store(init_val, Ordering::Relaxed);
+        THERMAL_INITIALIZED.store(true, Ordering::Release);
+        let r = risk_from_nodes(init_val, init_val)
+            .clamp(0, 100)
+            .max(throttle_risk_floor(cpu, freq_ratio_q8) as i32) as u32;
+        THERMAL_RISK.store(r.min(100), Ordering::Release);
         return;
     }
-    let prev_fast = P_FAST.load(Ordering::Relaxed);
-    let prev_slow = P_SLOW.load(Ordering::Relaxed);
-    let af = EMA_ALPHA_FAST_Q8 as i32;
-    let as_ = EMA_ALPHA_SLOW_Q8 as i32;
-    let new_fast = (af * p_mw + (256 - af) * prev_fast) / 256;
-    let new_slow = (as_ * p_mw + (256 - as_) * prev_slow) / 256;
-    P_FAST.store(new_fast, Ordering::Relaxed);
-    P_SLOW.store(new_slow, Ordering::Relaxed);
 
-    // 6. 风险指数 R(t) ∈ [0, 100]
-    let r_slow = f_p_to_risk(new_slow);
-    let r_fast = f_p_to_risk(new_fast);
-    let trend = new_fast - new_slow;
-    let bonus = if trend > TREND_RISE_MW {
-        TREND_BONUS_UP
-    } else if trend < -TREND_FALL_MW {
-        TREND_BONUS_DN
-    } else {
-        0
-    };
-    let r = (7 * r_slow + 3 * r_fast) / 10 + bonus;
-    let r = r.clamp(0, 100) as u32;
+    let prev_die = T_DIE.load(Ordering::Relaxed);
+    let prev_skin = T_SKIN.load(Ordering::Relaxed);
+    let (new_die, new_skin) = step_thermal_nodes(p_mw, prev_die, prev_skin);
+    T_DIE.store(new_die, Ordering::Relaxed);
+    T_SKIN.store(new_skin, Ordering::Relaxed);
+
+    // 7. 风险指数 R(t) ∈ [0, 100] + 降频地板
+    let r = risk_from_nodes(new_die, new_skin).clamp(0, 100) as u32;
+    let r = r.max(throttle_risk_floor(cpu, freq_ratio_q8)).min(100);
     THERMAL_RISK.store(r, Ordering::Release);
 
-    // 7. 状态机（滞回 + 最小驻留）
-    // saturating_add 防止长期滞留同一状态时 u32 溢出回绕到 0 触发意外跳变。
-    let mut dwell = DWELL.load(Ordering::Relaxed).saturating_add(1);
+    // 8. 状态机（滞回 + 升级/降级不对称驻留）
+    let dwell = DWELL.load(Ordering::Relaxed);
+    let prev_intent = DWELL_INTENT.load(Ordering::Relaxed);
     let cur = THERMAL_STATE.load(Ordering::Relaxed);
-    let next = next_state(cur, r, dwell);
-    if next != cur {
-        dwell = 0;
-    }
+    let (next, new_dwell, new_intent) = step_state_machine(cur, r, dwell, prev_intent);
     THERMAL_STATE.store(next, Ordering::Release);
-    DWELL.store(dwell, Ordering::Relaxed);
+    DWELL.store(new_dwell, Ordering::Relaxed);
+    DWELL_INTENT.store(new_intent, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -400,84 +464,174 @@ mod tests {
     }
 
     #[test]
-    fn test_ema_converges_to_constant_input() {
-        // 连续输入相同 P，EMA 应逐步趋近 P。
-        // 用纯函数模拟，不触碰全局原子。
+    fn test_nodes_converge_to_constant_power() {
+        // 恒定功率下 die/skin 均应趋近 P。
         let p = 30000i32;
-        let af = EMA_ALPHA_FAST_Q8 as i32;
-        let as_ = EMA_ALPHA_SLOW_Q8 as i32;
-        let mut fast = 0i32;
-        let mut slow = 0i32;
+        let mut die = 0i32;
+        let mut skin = 0i32;
         for _ in 0..1000 {
-            fast = (af * p + (256 - af) * fast) / 256;
-            slow = (as_ * p + (256 - as_) * slow) / 256;
+            let step = step_thermal_nodes(p, die, skin);
+            die = step.0;
+            skin = step.1;
         }
-        // 定点截断误差允许 ±100mW（slow EMA 的 α=3/256 极小，截断累积）。
-        assert!((fast - p).abs() < 50, "fast EMA not converged: {fast}");
-        assert!((slow - p).abs() < 100, "slow EMA not converged: {slow}");
+        assert!((die - p).abs() < 50, "die not converged: {die}");
+        assert!((skin - p).abs() < 100, "skin not converged: {skin}");
     }
 
     #[test]
-    fn test_ema_fast_responsiveness() {
-        // 快 EMA 应比慢 EMA 更快响应阶跃输入。
+    fn test_skin_lags_die_on_step() {
+        // 阶跃功率后 die 应领先 skin（机身蓄热滞后）。
         let p = 40000i32;
-        let af = EMA_ALPHA_FAST_Q8 as i32;
-        let as_ = EMA_ALPHA_SLOW_Q8 as i32;
-        let mut fast = 0i32;
-        let mut slow = 0i32;
+        let mut die = 0i32;
+        let mut skin = 0i32;
         for _ in 0..30 {
-            fast = (af * p + (256 - af) * fast) / 256;
-            slow = (as_ * p + (256 - as_) * slow) / 256;
+            let step = step_thermal_nodes(p, die, skin);
+            die = step.0;
+            skin = step.1;
         }
         assert!(
-            fast > slow,
-            "fast should lead slow after step: fast={fast} slow={slow}"
+            die > skin,
+            "die should lead skin after step: die={die} skin={skin}"
+        );
+    }
+
+    #[test]
+    fn test_skin_holds_heat_after_power_drop() {
+        // 先蓄热再掉功率：skin 回落应慢于 die（停载后仍烫一会儿）。
+        let mut die = 0i32;
+        let mut skin = 0i32;
+        for _ in 0..200 {
+            let step = step_thermal_nodes(40000, die, skin);
+            die = step.0;
+            skin = step.1;
+        }
+        for _ in 0..20 {
+            let step = step_thermal_nodes(5000, die, skin);
+            die = step.0;
+            skin = step.1;
+        }
+        assert!(
+            skin > die,
+            "skin should retain heat after power drop: die={die} skin={skin}"
+        );
+    }
+
+    #[test]
+    fn test_throttle_floor_applies() {
+        assert_eq!(
+            throttle_risk_floor(THROTTLE_CPU_PCT, THROTTLE_FREQ_Q8),
+            THROTTLE_RISK_FLOOR
+        );
+        assert_eq!(
+            throttle_risk_floor(100, THROTTLE_FREQ_Q8),
+            THROTTLE_RISK_FLOOR
+        );
+    }
+
+    #[test]
+    fn test_throttle_floor_not_when_idle_or_full_freq() {
+        // 空闲即使低频也不抬（电源方案限频但无负载）
+        assert_eq!(throttle_risk_floor(10, 80), 0);
+        // 满频高占用不抬（正常性能，非 throttle 特征）
+        assert_eq!(throttle_risk_floor(90, 256), 0);
+        // 刚好未达门槛
+        assert_eq!(
+            throttle_risk_floor(THROTTLE_CPU_PCT - 1, THROTTLE_FREQ_Q8),
+            0
+        );
+        assert_eq!(
+            throttle_risk_floor(THROTTLE_CPU_PCT, THROTTLE_FREQ_Q8 + 1),
+            0
         );
     }
 
     #[test]
     fn test_state_machine_upgrade_with_dwell() {
-        // dwell 不够时不升级
-        assert_eq!(next_state(0, 30, ST_DWELL_SECS - 1), 0);
-        // dwell 达标后升级
-        assert_eq!(next_state(0, 25, ST_DWELL_SECS), 1);
-        assert_eq!(next_state(0, 99, ST_DWELL_SECS), 1);
-        assert_eq!(next_state(1, 55, ST_DWELL_SECS), 2);
-        assert_eq!(next_state(2, 85, ST_DWELL_SECS), 3);
+        // 首拍：意图建立，dwell=1，未升级
+        let (s, d, i) = step_state_machine(0, 30, 0, 0);
+        assert_eq!((s, d, i), (0, 1, 1));
+        // 连续意图但未满 ST_DWELL_SECS
+        let (s, d, i) = step_state_machine(0, 30, ST_DWELL_SECS - 2, 1);
+        assert_eq!(s, 0);
+        assert_eq!(d, ST_DWELL_SECS - 1);
+        assert_eq!(i, 1);
+        // 再一拍达标 → 升级并清零 dwell
+        let (s, d, i) = step_state_machine(0, 25, ST_DWELL_SECS - 1, 1);
+        assert_eq!((s, d, i), (1, 0, 0));
+        let (s, _, _) = step_state_machine(1, 55, ST_DWELL_SECS - 1, 1);
+        assert_eq!(s, 2);
+        let (s, _, _) = step_state_machine(2, 85, ST_DWELL_SECS - 1, 1);
+        assert_eq!(s, 3);
     }
 
     #[test]
-    fn test_state_machine_downgrade_immediate() {
-        // 降级不需要 dwell
-        assert_eq!(next_state(1, 15, 0), 0);
-        assert_eq!(next_state(1, 10, 0), 0);
-        assert_eq!(next_state(2, 45, 0), 1);
-        assert_eq!(next_state(3, 75, 0), 2);
+    fn test_state_machine_downgrade_needs_dwell() {
+        // 降级需要 ST_DWELL_DOWN_SECS，不再立即跳变
+        let (s, d, i) = step_state_machine(1, 10, 0, 0);
+        assert_eq!(s, 1);
+        assert_eq!(d, 1);
+        assert_eq!(i, -1);
+
+        let (s, d, i) = step_state_machine(1, 10, ST_DWELL_DOWN_SECS - 1, -1);
+        assert_eq!(s, 0);
+        assert_eq!(d, 0);
+        assert_eq!(i, 0);
+
+        let (s, _, _) = step_state_machine(2, 45, ST_DWELL_DOWN_SECS - 1, -1);
+        assert_eq!(s, 1);
+        let (s, _, _) = step_state_machine(3, 75, ST_DWELL_DOWN_SECS - 1, -1);
+        assert_eq!(s, 2);
+    }
+
+    #[test]
+    fn test_state_machine_intent_reset_on_direction_change() {
+        // 升级意图中途跌回滞回带再降：驻留重新计数
+        let (s, d, i) = step_state_machine(1, 60, 3, 1);
+        assert_eq!(s, 1);
+        assert_eq!(d, 4);
+        assert_eq!(i, 1);
+        // 意图翻转为降级，dwell 从 1 起算
+        let (s, d, i) = step_state_machine(1, 10, 4, 1);
+        assert_eq!(s, 1);
+        assert_eq!(d, 1);
+        assert_eq!(i, -1);
     }
 
     #[test]
     fn test_state_machine_hysteresis() {
-        // 滞回带内不抖动：WARM 态 R=20（在 15-25 之间）保持不动
-        assert_eq!(next_state(1, 20, 100), 1);
-        // HOT 态 R=50（在 45-55 之间）保持不动
-        assert_eq!(next_state(2, 50, 100), 2);
-        // CRITICAL 态 R=80（在 75-85 之间）保持不动
-        assert_eq!(next_state(3, 80, 100), 3);
+        // 滞回带内不抖动
+        assert_eq!(transition_intent(1, 20), 0);
+        assert_eq!(transition_intent(2, 50), 0);
+        assert_eq!(transition_intent(3, 80), 0);
+        let (s, d, i) = step_state_machine(1, 20, 100, 1);
+        assert_eq!((s, d, i), (1, 0, 0));
     }
 
     #[test]
     fn test_state_machine_stays_in_cool() {
-        // COOL 态低风险保持不动
-        assert_eq!(next_state(0, 10, 100), 0);
-        assert_eq!(next_state(0, 24, 100), 0);
+        assert_eq!(transition_intent(0, 10), 0);
+        assert_eq!(transition_intent(0, 24), 0);
+        let (s, _, _) = step_state_machine(0, 10, 100, 0);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn test_risk_weights_skin_over_die() {
+        // skin 主导：skin 高 die 低时风险应明显高于反过来的情况
+        let high_skin = risk_from_nodes(10000, 40000);
+        let high_die = risk_from_nodes(40000, 10000);
+        assert!(
+            high_skin > high_die,
+            "skin should dominate risk: high_skin={high_skin} high_die={high_die}"
+        );
     }
 
     #[test]
     fn test_real_battery_read() {
         let (ac, discharging, mw) = read_battery();
         println!("Real Battery Status:");
-        println!("  AC Online  : {}", ac);
-        println!("  Discharging: {}", discharging);
-        println!("  Power (mW) : {}", mw);
+        println!("  AC Online  : {ac}");
+        println!("  Discharging: {discharging}");
+        println!("  Power (mW) : {mw}");
     }
 }
