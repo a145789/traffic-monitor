@@ -16,17 +16,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::config::{
-    APP_NAME, DISPLAY_HEIGHT, DISPLAY_WIDTH, MENU_ID_AUTO_UPDATE_TOGGLE,
-    MENU_ID_CHECK_UPDATE_MANUAL, WINDOW_CLASS, WINDOW_TITLE,
+    APP_NAME, DISPLAY_HEIGHT, DISPLAY_WIDTH, MENU_ID_AUTO_UPDATE_TOGGLE, MENU_ID_AUTOSTART,
+    MENU_ID_CHECK_UPDATE_MANUAL, MENU_ID_EXIT, WINDOW_CLASS, WINDOW_TITLE,
 };
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::to_wide;
 
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
-pub const MENU_ID_AUTOSTART: u32 = 1001;
-pub const MENU_ID_EXIT: u32 = 1002;
-
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 thread_local! {

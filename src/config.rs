@@ -39,6 +39,8 @@ pub const COLOR_CRIT_TEXT: u32 = 0x003030FF;
 
 pub const FONT_BASE_SIZE: i32 = 13;
 
+pub const MENU_ID_AUTOSTART: u32 = 1001;
+pub const MENU_ID_EXIT: u32 = 1002;
 pub const MENU_ID_AUTO_UPDATE_TOGGLE: u32 = 1005;
 pub const MENU_ID_CHECK_UPDATE_MANUAL: u32 = 1006;
 

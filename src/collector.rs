@@ -78,20 +78,20 @@ pub fn collect_cpu() -> bool {
     }
 
     if !CPU_INITIALIZED.load(Ordering::Acquire) {
-        PREV_IDLE_TIME.store(idle_time, Ordering::Release);
-        PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
-        PREV_USER_TIME.store(user_time, Ordering::Release);
+        PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);
+        PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
+        PREV_USER_TIME.store(user_time, Ordering::Relaxed);
         CPU_INITIALIZED.store(true, Ordering::Release);
         return false;
     }
 
-    let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Acquire));
-    let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Acquire));
-    let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Acquire));
+    let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Relaxed));
+    let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Relaxed));
+    let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Relaxed));
 
-    PREV_IDLE_TIME.store(idle_time, Ordering::Release);
-    PREV_KERNEL_TIME.store(kernel_time, Ordering::Release);
-    PREV_USER_TIME.store(user_time, Ordering::Release);
+    PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);
+    PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
+    PREV_USER_TIME.store(user_time, Ordering::Relaxed);
 
     let total = kernel_diff + user_diff;
     if total == 0 {
@@ -101,14 +101,16 @@ pub fn collect_cpu() -> bool {
     let usage = ((total - idle_diff) * 100 / total).min(100) as u32;
     // GetSystemTimes 的 kernel 含 idle，扣除后才是纯内核时间，否则空闲时 ku 会被严重高估。
     let kernel_actual = kernel_diff.saturating_sub(idle_diff);
+    // ku 在 user_diff==0 时无定义（纯内核/空闲态）；填 Q8≈1.0(255/256)，
+    // 使此路径永不会触发 ku_heavy（255 < KU_HEAVY_THRESHOLD_Q8=384），保守不误判。
     let ku_q8 = if user_diff > 0 {
         ((kernel_actual << 8) / user_diff) as u32
     } else {
         255
     };
 
-    CPU_USAGE.store(usage, Ordering::Release);
-    CPU_KU_Q8.store(ku_q8, Ordering::Release);
+    CPU_USAGE.store(usage, Ordering::Relaxed);
+    CPU_KU_Q8.store(ku_q8, Ordering::Relaxed);
     true
 }
 
@@ -124,7 +126,7 @@ pub fn collect_memory() {
     let ok = unsafe { GlobalMemoryStatusEx(&mut mem_info).is_ok() };
 
     if ok {
-        MEM_USAGE.store(mem_info.dwMemoryLoad as u32, Ordering::Release);
+        MEM_USAGE.store(mem_info.dwMemoryLoad as u32, Ordering::Relaxed);
     }
 }
 
@@ -205,7 +207,7 @@ pub fn collect_network() {
                     history.insert(*luid, (*in_octets, *out_octets, now));
                 }
             });
-            NET_INITIALIZED.store(true, Ordering::Release);
+            NET_INITIALIZED.store(true, Ordering::Relaxed);
             return;
         }
 
@@ -213,8 +215,8 @@ pub fn collect_network() {
         let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
             .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
 
-        NET_SPEED_DOWN.store(best_speed_down, Ordering::Release);
-        NET_SPEED_UP.store(best_speed_up, Ordering::Release);
+        NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
+        NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
 
         if best_speed_down == 0 && best_speed_up == 0 && !has_up_interface {
             let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -232,7 +234,7 @@ pub fn collect_network() {
                 }
             }
         } else {
-            CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
+            CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
             if NETWORK_BACKOFF.load(Ordering::Acquire) {
                 NETWORK_BACKOFF.store(false, Ordering::Release);
                 let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire));

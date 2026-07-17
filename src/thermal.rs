@@ -106,7 +106,7 @@ fn read_battery() -> (bool, bool, i32) {
     // 2. InformationLevel=SystemBatteryState 只读不写输入，传入 None 安全。
     // 3. CallNtPowerInformation 成功时填充 OutputBuffer，失败时不修改缓冲区（保持 Default）。
     // 4. 结构体为 repr(C)，与 Windows SYSTEM_BATTERY_STATE 逐字段对齐（32 bytes）。
-    //    编译期断言 const _ below 保证布局变更时立即报错。
+    //    编译期断言 const _ above 保证布局变更时立即报错。
     let status = unsafe {
         CallNtPowerInformation(
             SystemBatteryState,
@@ -340,11 +340,11 @@ pub fn collect_thermal() {
         let init_val = INIT_SUM.load(Ordering::Relaxed) / count as i32;
         T_DIE.store(init_val, Ordering::Relaxed);
         T_SKIN.store(init_val, Ordering::Relaxed);
-        THERMAL_INITIALIZED.store(true, Ordering::Release);
+        THERMAL_INITIALIZED.store(true, Ordering::Relaxed);
         let r = risk_from_nodes(init_val, init_val)
             .clamp(0, 100)
             .max(throttle_risk_floor(cpu, freq_ratio_q8) as i32) as u32;
-        THERMAL_RISK.store(r.min(100), Ordering::Release);
+        THERMAL_RISK.store(r.min(100), Ordering::Relaxed);
         return;
     }
 
@@ -357,14 +357,14 @@ pub fn collect_thermal() {
     // 7. 风险指数 R(t) ∈ [0, 100] + 降频地板
     let r = risk_from_nodes(new_die, new_skin).clamp(0, 100) as u32;
     let r = r.max(throttle_risk_floor(cpu, freq_ratio_q8)).min(100);
-    THERMAL_RISK.store(r, Ordering::Release);
+    THERMAL_RISK.store(r, Ordering::Relaxed);
 
     // 8. 状态机（滞回 + 升级/降级不对称驻留）
     let dwell = DWELL.load(Ordering::Relaxed);
     let prev_intent = DWELL_INTENT.load(Ordering::Relaxed);
     let cur = THERMAL_STATE.load(Ordering::Relaxed);
     let (next, new_dwell, new_intent) = step_state_machine(cur, r, dwell, prev_intent);
-    THERMAL_STATE.store(next, Ordering::Release);
+    THERMAL_STATE.store(next, Ordering::Relaxed);
     DWELL.store(new_dwell, Ordering::Relaxed);
     DWELL_INTENT.store(new_intent, Ordering::Relaxed);
 }
@@ -559,14 +559,5 @@ mod tests {
             high_skin > high_die,
             "skin should dominate risk: high_skin={high_skin} high_die={high_die}"
         );
-    }
-
-    #[test]
-    fn test_real_battery_read() {
-        let (ac, discharging, mw) = read_battery();
-        println!("Real Battery Status:");
-        println!("  AC Online  : {ac}");
-        println!("  Discharging: {discharging}");
-        println!("  Power (mW) : {mw}");
     }
 }
