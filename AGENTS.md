@@ -10,12 +10,6 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 > [!IMPORTANT]
 > **默认禁止阅读 `docs/`**（含 `docs/archive/`）。其中为历史 RFC、审计、研究笔记与旧实现说明，**可能过时**，不得当作现行约束。
 
-| 默认可读 | 默认禁止（除非用户明确指定） |
-| :------- | :--------------------------- |
-| 本文件 `AGENTS.md` | `docs/` 整树 |
-| 用户点名的源码 / 路径 | `docs/archive/**`（backup） |
-| `README.md`（仅当任务涉及用户可见说明或发布文案时） | 主动 `list`/`grep`/`read` 去「逛文档」 |
-
 **何时可以读 archive**：用户明确给出路径/文件名，或明确说「查 docs / 查 archive / 看 RFC / 看审计 / 按 unsafe policy」等。  
 **禁止**：为「更全面了解项目」而自行打开 archive；现行不变量以本文件 + 源码为准。
 
@@ -95,19 +89,19 @@ bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号
 
 所有的具体常量数值（如像素宽、高、定时器间隔、颜色等）均统定义在 [src/config.rs](src/config.rs) 中。AI 在修改或读取时应直接查阅该文件，避免在其他模块中硬编码。
 
-| 文件                                 | 职责说明                                                                                                        |
-| :----------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
-| [src/main.rs](src/main.rs)           | 窗口创建、UI 消息循环、单例 Mutex 锁。                                                                          |
-| [src/config.rs](src/config.rs)       | 全局常量定义、窗口与字体基准大小、定时器 ID 等配置。                                                            |
-| [src/state.rs](src/state.rs)         | 共享多线程无锁原子变量（Atomic）定义与运行时全局状态。                                                          |
-| [src/window.rs](src/window.rs)       | 任务栏窗口查找、嵌入位置计算、任务栏嵌入以及窗口位置动态更新。                                                  |
-| [src/suspend.rs](src/suspend.rs)     | 系统挂起/恢复处理、全屏检测、Windows 主题（深浅色）变更检测。                                                   |
-| [src/collector.rs](src/collector.rs) | CPU 与内存采集、网卡接口过滤、单网卡锁定算法、网络断开与恢复消息发送。                                          |
-| [src/renderer.rs](src/renderer.rs)   | GDI 双缓冲绘制（位图缓存 `hdc_mem` -> 窗口 `hdc`）、字体、DPI 缩放、文字排版与对齐。                            |
-| [src/tray.rs](src/tray.rs)           | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                                                |
-| [src/update/mod.rs](src/update/mod.rs) | 自动/手动检查更新业务编排、子进程协议、安装器启动、注册表开关读写。                                            |
-| [src/update/version.rs](src/update/version.rs) | 版本号解析与远端 metadata 严格解析（纯字符串/字节处理，无 I/O，支持单测），判断目录类型。                     |
-| [src/update/http.rs](src/update/http.rs) | WinHTTP 网络数据抓取与友好的中文错误映射。                                                                     |
-| [src/update/crypto.rs](src/update/crypto.rs) | BCrypt SHA-256 哈希计算与 RAII 句柄安全守卫。                                                                  |
-| [src/ffi_guard.rs](src/ffi_guard.rs) | 跨模块复用的通用 Win32 句柄 RAII 守卫（`MutexGuard`、`MenuGuard`）。业务专属守卫留在各自业务文件。              |
-| [src/util.rs](src/util.rs)           | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                                            |
+| 文件                                           | 职责说明                                                                                           |
+| :--------------------------------------------- | :------------------------------------------------------------------------------------------------- |
+| [src/main.rs](src/main.rs)                     | 窗口创建、UI 消息循环、单例 Mutex 锁。                                                             |
+| [src/config.rs](src/config.rs)                 | 全局常量定义、窗口与字体基准大小、定时器 ID 等配置。                                               |
+| [src/state.rs](src/state.rs)                   | 共享多线程无锁原子变量（Atomic）定义与运行时全局状态。                                             |
+| [src/window.rs](src/window.rs)                 | 任务栏窗口查找、嵌入位置计算、任务栏嵌入以及窗口位置动态更新。                                     |
+| [src/suspend.rs](src/suspend.rs)               | 系统挂起/恢复处理、全屏检测、Windows 主题（深浅色）变更检测。                                      |
+| [src/collector.rs](src/collector.rs)           | CPU 与内存采集、网卡接口过滤、单网卡锁定算法、网络断开与恢复消息发送。                             |
+| [src/renderer.rs](src/renderer.rs)             | GDI 双缓冲绘制（位图缓存 `hdc_mem` -> 窗口 `hdc`）、字体、DPI 缩放、文字排版与对齐。               |
+| [src/tray.rs](src/tray.rs)                     | 托盘图标生命周期维护、系统托盘右键菜单响应、开机自启写入与读取。                                   |
+| [src/update/mod.rs](src/update/mod.rs)         | 自动/手动检查更新业务编排、子进程协议、安装器启动、注册表开关读写。                                |
+| [src/update/version.rs](src/update/version.rs) | 版本号解析与远端 metadata 严格解析（纯字符串/字节处理，无 I/O，支持单测），判断目录类型。          |
+| [src/update/http.rs](src/update/http.rs)       | WinHTTP 网络数据抓取与友好的中文错误映射。                                                         |
+| [src/update/crypto.rs](src/update/crypto.rs)   | BCrypt SHA-256 哈希计算与 RAII 句柄安全守卫。                                                      |
+| [src/ffi_guard.rs](src/ffi_guard.rs)           | 跨模块复用的通用 Win32 句柄 RAII 守卫（`MutexGuard`、`MenuGuard`）。业务专属守卫留在各自业务文件。 |
+| [src/util.rs](src/util.rs)                     | UTF-16/字符串互转、Windows API MessageBox 弹窗封装、注册表快速读写。                               |
