@@ -15,8 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 use crate::config::BACKOFF_ZERO_THRESHOLD;
 use crate::state::{
-    CONSECUTIVE_ZERO_COUNT, CPU_KU_Q8, CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP,
-    NETWORK_BACKOFF,
+    CONSECUTIVE_ZERO_COUNT, CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP, NETWORK_BACKOFF,
 };
 
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
@@ -52,9 +51,9 @@ pub fn init_network_listener(hwnd: HWND) {
     MAIN_HWND_NETWORK.store(hwnd.0, Ordering::Release);
 }
 
-/// 采样 `GetSystemTimes`，更新 `CPU_USAGE` 与 `CPU_KU_Q8`。
+/// 采样 `GetSystemTimes`，更新 `CPU_USAGE`。
 ///
-/// 为热模型与 UI 的**唯一** CPU 采样源（由 1Hz 热定时器调用）。
+/// 由 `TIMER_ID_CPU_MEM`（5s）调用；首轮仅建立基线，不产生有效差分。
 /// 返回 `true` 表示本周期得到有效差分；首轮初始化或 API/差分失败时返回 `false`。
 pub fn collect_cpu() -> bool {
     let mut idle_time = 0u64;
@@ -93,24 +92,14 @@ pub fn collect_cpu() -> bool {
     PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
     PREV_USER_TIME.store(user_time, Ordering::Relaxed);
 
+    // GetSystemTimes 的 kernel 时间包含 idle，total = kernel + user 为全部时钟滴答。
     let total = kernel_diff + user_diff;
     if total == 0 {
         return false;
     }
 
     let usage = ((total - idle_diff) * 100 / total).min(100) as u32;
-    // GetSystemTimes 的 kernel 含 idle，扣除后才是纯内核时间，否则空闲时 ku 会被严重高估。
-    let kernel_actual = kernel_diff.saturating_sub(idle_diff);
-    // ku 在 user_diff==0 时无定义（纯内核/空闲态）；填 Q8≈1.0(255/256)，
-    // 使此路径永不会触发 ku_heavy（255 < KU_HEAVY_THRESHOLD_Q8=384），保守不误判。
-    let ku_q8 = if user_diff > 0 {
-        ((kernel_actual << 8) / user_diff) as u32
-    } else {
-        255
-    };
-
     CPU_USAGE.store(usage, Ordering::Relaxed);
-    CPU_KU_Q8.store(ku_q8, Ordering::Relaxed);
     true
 }
 

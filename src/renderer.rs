@@ -8,10 +8,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use crate::config::{
-    COLOR_CRIT_TEXT, COLOR_DARK_TEXT, COLOR_HOT_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT,
-    DISPLAY_WIDTH, FONT_BASE_SIZE,
+    COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE,
 };
-use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP, THERMAL_STATE};
+use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
 use crate::util::{reg_read_dword, to_wide};
 
 /// `Renderer::new()` 失败的具体原因。所有失败均发生在 GDI 资源创建阶段，
@@ -320,7 +319,6 @@ impl Renderer {
         let speed_down = NET_SPEED_DOWN.load(Ordering::Relaxed);
         let cpu = CPU_USAGE.load(Ordering::Relaxed);
         let mem = MEM_USAGE.load(Ordering::Relaxed);
-        let thermal_state = THERMAL_STATE.load(Ordering::Relaxed);
 
         let half_height = self.height / 2;
         let scale = self.width as f64 / DISPLAY_WIDTH as f64;
@@ -418,17 +416,6 @@ impl Renderer {
         let cpu_right = speed_left - col_gap;
         let cpu_left = cpu_right - (76.0 * scale).round() as i32;
 
-        // 仅 CPU 行根据热风险状态变色，其余行保持默认色。
-        let thermal_color = match thermal_state {
-            2 => COLORREF(COLOR_HOT_TEXT),
-            3 => COLORREF(COLOR_CRIT_TEXT),
-            _ => self.text_color,
-        };
-        // SAFETY: hdc_mem 有效。
-        unsafe {
-            SetTextColor(self.hdc_mem, thermal_color);
-        }
-
         let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", cpu);
         let mut rc_cpu = RECT {
             left: cpu_left,
@@ -444,11 +431,6 @@ impl Renderer {
                 &mut rc_cpu,
                 DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_RIGHT,
             );
-        }
-
-        // SAFETY: hdc_mem 有效。
-        unsafe {
-            SetTextColor(self.hdc_mem, self.text_color);
         }
 
         let h = self.height;

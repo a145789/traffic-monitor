@@ -6,7 +6,6 @@ mod ffi_guard;
 mod renderer;
 mod state;
 mod suspend;
-mod thermal;
 mod tray;
 mod update;
 mod util;
@@ -41,18 +40,16 @@ use crate::collector::{
 };
 use crate::config::{
     LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK,
-    TIMER_ID_THERMAL,
 };
 use crate::renderer::Renderer;
 use crate::state::{
     CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, NETWORK_BACKOFF,
-    SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM, THERMAL_STATE,
+    SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM,
 };
 use crate::suspend::{
     check_fullscreen, is_immersive_color_set, is_suspended, resume_system, suspend_system,
     sync_monitoring_timers,
 };
-use crate::thermal::collect_thermal;
 use crate::tray::{
     WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
 };
@@ -325,27 +322,10 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_CPU_MEM => {
             if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-                // CPU 已由 1Hz 热定时器同源采样；此处仅采内存（5s）。
+                let _ = collect_cpu();
                 collect_memory();
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-            }
-        }
-        TIMER_ID_THERMAL => {
-            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-                // 先写 CPU atomics，再跑热模型（同 1Hz 窗口，单一 GetSystemTimes 源）。
-                if !collect_cpu() {
-                    return LRESULT(0);
-                }
-                let prev = THERMAL_STATE.load(Ordering::Relaxed);
-                collect_thermal();
-                // 仅状态跳变时重绘，避免每秒空转 DWM。
-                // 网速定时器约 1s 也会 Invalidate，UI 的 CPU% 随之刷新。
-                if THERMAL_STATE.load(Ordering::Relaxed) != prev {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
                 }
             }
         }

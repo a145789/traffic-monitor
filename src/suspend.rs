@@ -13,9 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::collector::trim_working_set;
 use crate::config::{
-    CPU_MEM_INTERVAL, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK, TIMER_ID_THERMAL,
+    CPU_MEM_INTERVAL, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK,
     TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
-    TIMER_INTERVAL_THERMAL,
 };
 use crate::state::{CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS};
 use crate::window::get_taskbar_hwnd;
@@ -51,7 +50,6 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
-        KillTimer(Some(hwnd), TIMER_ID_THERMAL).ok();
     }
 
     if is_suspended() {
@@ -79,12 +77,10 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
     };
     // SAFETY: hwnd 有效，ID 和间隔均为进程内固定常量；返回 0 表示创建失败。
     let network_ok = unsafe { SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None) != 0 };
-    // SAFETY: 同上，分别创建 CPU/内存与热风险定时器。
+    // SAFETY: 同上，创建 CPU/内存定时器。
     let cpu_mem_ok = unsafe { SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None) != 0 };
-    let thermal_ok =
-        unsafe { SetTimer(Some(hwnd), TIMER_ID_THERMAL, TIMER_INTERVAL_THERMAL, None) != 0 };
 
-    fullscreen_ok && network_ok && cpu_mem_ok && thermal_ok
+    fullscreen_ok && network_ok && cpu_mem_ok
 }
 
 pub fn check_fullscreen(hwnd: HWND) {

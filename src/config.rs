@@ -1,4 +1,4 @@
-//! 编译期常量：窗口尺寸、颜色、定时器 ID/间隔、热模型参数等。
+//! 编译期常量：窗口尺寸、颜色、定时器 ID/间隔等。
 //!
 //! 运行时可变状态见 `state.rs`。
 //!
@@ -17,13 +17,11 @@ pub const GAP: i32 = -3;
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 pub const TIMER_ID_FULLSCREEN: usize = 3;
-pub const TIMER_ID_THERMAL: usize = 4;
 pub const TIMER_ID_INIT_TRIM: usize = 99;
 
 pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
 pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
 pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
-pub const TIMER_INTERVAL_THERMAL: u32 = 1000;
 pub const CPU_MEM_INTERVAL: u32 = 5000;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
@@ -34,8 +32,6 @@ pub const HTTP_READ_CHUNK_BYTES: usize = 64 * 1024;
 pub const COLOR_KEY: u32 = 0x00FF00FF;
 pub const COLOR_DARK_TEXT: u32 = 0x00282828;
 pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;
-pub const COLOR_HOT_TEXT: u32 = 0x00008CFF;
-pub const COLOR_CRIT_TEXT: u32 = 0x003030FF;
 
 pub const FONT_BASE_SIZE: i32 = 13;
 
@@ -46,45 +42,3 @@ pub const MENU_ID_CHECK_UPDATE_MANUAL: u32 = 1006;
 
 /// 从 WPARAM/LPARAM 提取低 16 位（LOWORD）的掩码，用于菜单 ID 与托盘事件。
 pub const LOWORD_MASK: u32 = 0xFFFF;
-
-// ===== 热风险模型 (Thermal Risk) =====
-// 针对 Meteor Lake H (Core Ultra 7 155H) + 16" 轻薄本标定。
-// 其他机型需重新标定常量。拔电时用电池放电功率直测总发热,
-// 插电时用 CPU/MEM/内核比多信号推断(有 GPU/NPU 盲区)。
-//
-// 热容：die（快）← 功率，skin/chassis（慢）← die，模拟机身蓄热与冷却滞后。
-// 降频地板：高占用 + 低频比 → 至少 WARM/HOT 边界，避免 throttle 后假凉快。
-
-pub const P_IDLE_PLUG_MW: i32 = 7000;
-pub const A_CPU_MW_PER_PCT: i32 = 350;
-pub const B_MEM_MW_PER_PCT: i32 = 100;
-pub const C_KERNEL_HEAVY_MW: i32 = 8000;
-pub const KERNEL_GATE_CPU_PCT: i32 = 30;
-pub const KU_HEAVY_THRESHOLD_Q8: u32 = 384;
-/// die 节点 EMA α（Q8），τ≈12s @ 1Hz。
-pub const TAU_DIE_ALPHA_Q8: u32 = 23;
-/// skin/chassis 节点 EMA α（Q8），从 die 耦合，τ≈90s @ 1Hz。
-pub const TAU_SKIN_ALPHA_Q8: u32 = 6;
-/// die−skin 温差（mW 当量）上升趋势门槛。
-pub const TREND_RISE_MW: i32 = 8000;
-pub const TREND_FALL_MW: i32 = 5000;
-pub const TREND_BONUS_UP: i32 = 10;
-pub const TREND_BONUS_DN: i32 = -5;
-pub const FP_BREAKS_MW: [i32; 5] = [0, 12000, 22000, 35000, 50000];
-pub const FP_BREAKS_RISK: [i32; 5] = [0, 20, 50, 80, 100];
-/// 高占用门槛：与低频比组合判定 thermal throttle。
-pub const THROTTLE_CPU_PCT: i32 = 55;
-/// 频率比 Q8 上限（≈62.5% MaxMhz）：高占用且不高于此视为降频保护。
-pub const THROTTLE_FREQ_Q8: u32 = 160;
-/// 降频时风险下限（对齐 ST_WARM_TO_HOT，至少推到 HOT 边界）。
-pub const THROTTLE_RISK_FLOOR: u32 = 55;
-pub const ST_COOL_TO_WARM: u32 = 25;
-pub const ST_WARM_TO_COOL: u32 = 15;
-pub const ST_WARM_TO_HOT: u32 = 55;
-pub const ST_HOT_TO_WARM: u32 = 45;
-pub const ST_HOT_TO_CRIT: u32 = 85;
-pub const ST_CRIT_TO_HOT: u32 = 75;
-/// 升级最短驻留（秒）：防抖。
-pub const ST_DWELL_SECS: u32 = 5;
-/// 降级最短驻留（秒）：机身仍烫时不立刻退色。
-pub const ST_DWELL_DOWN_SECS: u32 = 20;

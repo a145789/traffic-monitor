@@ -6,7 +6,7 @@
 //! - **Relaxed**：单写多读的展示/开关类字段，或同一线程内定时器读写。
 //! - **Acquire / Release / AcqRel**：跨线程握手（更新工作线程、句柄发布/订阅）。
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 /// 系统睡眠导致暂停。
 pub const SUSPEND_REASON_SYSTEM: u32 = 1 << 0;
@@ -40,22 +40,11 @@ pub static NETWORK_BACKOFF: AtomicBool = AtomicBool::new(false);
 /// 连续零速计数。读写：Relaxed（单写路径为主）。
 pub static CONSECUTIVE_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// CPU 使用率（0-100）。读写：Relaxed（采集写、渲染/热模型读）。
+/// CPU 使用率（0-100）。读写：Relaxed（采集写、渲染读）。
 pub static CPU_USAGE: AtomicU32 = AtomicU32::new(0);
-
-/// 内核/用户时间比（Q8 定点：`(kernel_actual << 8) / user`）。
-/// 由 `collector::collect_cpu` 与 `CPU_USAGE` 同源写出；热模型读。
-/// 读写：Relaxed。
-pub static CPU_KU_Q8: AtomicU32 = AtomicU32::new(0);
 
 /// 内存使用率（0-100）。读写：Relaxed。
 pub static MEM_USAGE: AtomicU32 = AtomicU32::new(0);
-
-/// 热风险指数（0-100），预留；当前 UI 主要用 THERMAL_STATE。读写：Relaxed。
-pub static THERMAL_RISK: AtomicU32 = AtomicU32::new(0);
-
-/// 热状态：0=Cool, 1=Warm, 2=Hot, 3=Critical。读写：Relaxed（热定时器单线程）。
-pub static THERMAL_STATE: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(test)]
 mod tests {
