@@ -5,6 +5,20 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 > [!NOTE]
 > **更新指南**：仅在引入新的**“容易改错的隐式设计约束”**或**“非直觉的验证发布命令”**时，方可修改此文档。禁止加入易变的代码数值常量。保持高信噪比。
 
+## 文档阅读策略（AI）
+
+> [!IMPORTANT]
+> **默认禁止阅读 `docs/`**（含 `docs/archive/`）。其中为历史 RFC、审计、研究笔记与旧实现说明，**可能过时**，不得当作现行约束。
+
+| 默认可读 | 默认禁止（除非用户明确指定） |
+| :------- | :--------------------------- |
+| 本文件 `AGENTS.md` | `docs/` 整树 |
+| 用户点名的源码 / 路径 | `docs/archive/**`（backup） |
+| `README.md`（仅当任务涉及用户可见说明或发布文案时） | 主动 `list`/`grep`/`read` 去「逛文档」 |
+
+**何时可以读 archive**：用户明确给出路径/文件名，或明确说「查 docs / 查 archive / 看 RFC / 看审计 / 按 unsafe policy」等。  
+**禁止**：为「更全面了解项目」而自行打开 archive；现行不变量以本文件 + 源码为准。
+
 ## 核心开发约束与设计决策 (AI 必读防坑指南)
 
 > [!IMPORTANT]
@@ -63,7 +77,7 @@ cargo clippy -- -D warnings     # 验证 Clippy 无警告
 cargo fmt                       # 格式化代码
 ```
 
-_注：如果修改涉及到 `unsafe` 代码，必须严格符合 [docs/unsafe-code-policy.md](docs/unsafe-code-policy.md) 中规定的安全要求。上述构建、Clippy 和格式化校验仅在修改了 Rust 相关的源码文件时才需要执行。_
+_注：`unsafe` 须遵守本文件第 9 节风格约束；完整历史 policy 在 `docs/archive/unsafe-code-policy.md`，**仅当用户要求时再读**。上述构建、Clippy 和格式化校验仅在修改了 Rust 相关的源码文件时才需要执行。_
 
 ### 安装包与发布
 
