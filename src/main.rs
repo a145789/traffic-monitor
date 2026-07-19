@@ -11,7 +11,6 @@ mod update;
 mod util;
 mod window;
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
@@ -27,53 +26,36 @@ use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, FindWindowW, KillTimer, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
-    SW_HIDE, SetTimer, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED,
-    WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, FindWindowW, KillTimer, PostMessageW,
+    PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SetTimer, ShowWindow, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_TIMER, WM_WTSSESSION_CHANGE,
 };
 use windows::core::{PCWSTR, w};
 
-use crate::collector::{
-    WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, collect_cpu, collect_memory,
-    collect_network, init_network_listener, trim_working_set,
-};
+use crate::collector::{collect_cpu, collect_memory, collect_network, init_network_listener};
 use crate::config::{
     LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK,
+    TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED,
+    WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
 use crate::state::{
     CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, NETWORK_BACKOFF,
-    SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM,
 };
 use crate::suspend::{
-    check_fullscreen, is_immersive_color_set, is_suspended, resume_system, suspend_system,
-    sync_monitoring_timers,
+    check_fullscreen, handle_power_broadcast, handle_session_change, is_immersive_color_set,
+    is_suspended, sync_monitoring_timers,
 };
-use crate::tray::{
-    WM_APP_TRAY, create_main_window, create_tray_icon, register_window_class, remove_tray_icon,
-};
+use crate::tray::{create_tray_icon, remove_tray_icon};
 use crate::update::{
-    WM_USER_UPDATE_ACTION, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
-    subprocess_main,
+    init_cleanup_temp, load_auto_update_enabled, start_auto_check, subprocess_main,
 };
-use crate::util::show_error;
-use crate::window::{embed_in_taskbar, invalidate_taskbar_cache, update_taskbar_position};
-
-const WTS_SESSION_LOCK: usize = 0x7;
-const WTS_SESSION_UNLOCK: usize = 0x8;
-
-#[repr(C)]
-#[allow(non_snake_case)]
-struct POWERBROADCAST_SETTING {
-    PowerSetting: windows::core::GUID,
-    DataLength: u32,
-    Data: [u8; 1],
-}
-
-thread_local! {
-    static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
-}
+use crate::util::{show_error, trim_working_set};
+use crate::window::{
+    create_main_window, embed_in_taskbar, invalidate_taskbar_cache, register_window_class,
+    update_taskbar_position,
+};
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
@@ -194,23 +176,18 @@ fn main() {
 
     create_tray_icon(hwnd);
 
-    let renderer = match Renderer::new() {
-        Ok(r) => r,
+    match Renderer::new() {
+        Ok(r) => renderer::set_renderer(r),
         Err(e) => {
             show_error(&format!("初始化渲染器失败: {e}"));
             remove_tray_icon();
             return;
         }
-    };
-    RENDERER.with(|r| {
-        *r.borrow_mut() = Some(renderer);
-    });
+    }
 
-    RENDERER.with(|r| {
-        if let Some(renderer) = r.borrow_mut().as_mut() {
-            renderer.update_dpi(hwnd);
-            renderer.update_text_color();
-        }
+    renderer::with_renderer(|r| {
+        r.update_dpi(hwnd);
+        r.update_text_color();
     });
 
     unsafe {
@@ -232,9 +209,14 @@ fn main() {
     init_cleanup_temp();
     start_auto_check(hwnd);
 
-    // 一次性定时器：10s 后 trim 初始化冷页；ID 99 不与监测定时器冲突。
+    // 一次性定时器：到时后 trim 初始化冷页；ID 99 不与监测定时器冲突。
     unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_ID_INIT_TRIM, 10000, None);
+        let _ = SetTimer(
+            Some(hwnd),
+            TIMER_ID_INIT_TRIM,
+            TIMER_INTERVAL_INIT_TRIM,
+            None,
+        );
     }
 
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
@@ -268,9 +250,7 @@ fn main() {
         }
     }
 
-    RENDERER.with(|r| {
-        let _ = r.borrow_mut().take();
-    });
+    renderer::take_renderer();
 }
 
 // --- 窗口过程与消息处理 ---
@@ -283,11 +263,9 @@ fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
     }
     if embed_in_taskbar(hwnd) {
         create_tray_icon(hwnd);
-        RENDERER.with(|r| {
-            if let Some(renderer) = r.borrow_mut().as_mut() {
-                renderer.update_dpi(hwnd);
-                renderer.update_text_color();
-            }
+        renderer::with_renderer(|r| {
+            r.update_dpi(hwnd);
+            r.update_text_color();
         });
 
         if !sync_monitoring_timers(hwnd) {
@@ -334,48 +312,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     LRESULT(0)
 }
 
-fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match wparam.0 as u32 {
-        PBT_APMSUSPEND => {
-            suspend_system(hwnd, SUSPEND_REASON_SYSTEM);
-        }
-        PBT_APMRESUMEAUTOMATIC => {
-            resume_system(hwnd, SUSPEND_REASON_SYSTEM, true);
-        }
-        PBT_POWERSETTINGCHANGE => {
-            let setting = lparam.0 as *const POWERBROADCAST_SETTING;
-            if !setting.is_null() {
-                // SAFETY: PBT_POWERSETTINGCHANGE 时 OS 保证 lparam 指向有效结构。
-                let setting_ref = unsafe { &*setting };
-                if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1
-                {
-                    let monitor_on = setting_ref.Data[0] != 0;
-                    if monitor_on {
-                        resume_system(hwnd, SUSPEND_REASON_MONITOR, true);
-                    } else {
-                        suspend_system(hwnd, SUSPEND_REASON_MONITOR);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    LRESULT(0)
-}
-
-fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
-    match wparam.0 {
-        WTS_SESSION_LOCK => {
-            suspend_system(hwnd, SUSPEND_REASON_SESSION);
-        }
-        WTS_SESSION_UNLOCK => {
-            resume_system(hwnd, SUSPEND_REASON_SESSION, true);
-        }
-        _ => {}
-    }
-    LRESULT(0)
-}
-
 pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
     if msg == tcm && tcm != 0 {
@@ -389,11 +325,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let mut ps = PAINTSTRUCT::default();
             // SAFETY: BeginPaint/EndPaint 必须配对。
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-            RENDERER.with(|r| {
-                if let Some(renderer) = r.borrow_mut().as_mut() {
-                    renderer.render(hdc);
-                }
-            });
+            renderer::with_renderer(|r| r.render(hdc));
             unsafe {
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -423,21 +355,13 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_SETTINGCHANGE => {
             // SAFETY: OS 保证 lparam 指向 NUL 结尾宽字符串（或 null）。
             if unsafe { is_immersive_color_set(lparam) } {
-                RENDERER.with(|r| {
-                    if let Some(renderer) = r.borrow_mut().as_mut() {
-                        renderer.update_text_color();
-                    }
-                });
+                renderer::with_renderer(|r| r.update_text_color());
             }
             LRESULT(0)
         }
 
         WM_DPICHANGED => {
-            RENDERER.with(|r| {
-                if let Some(renderer) = r.borrow_mut().as_mut() {
-                    renderer.update_dpi(hwnd);
-                }
-            });
+            renderer::with_renderer(|r| r.update_dpi(hwnd));
             let _ = embed_in_taskbar(hwnd);
             LRESULT(0)
         }
@@ -460,7 +384,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        x if x == WM_APP_TRAY => {
+        WM_APP_TRAY => {
             let event = (lparam.0 as u32) & LOWORD_MASK;
             if event == WM_CONTEXTMENU {
                 tray::show_context_menu(hwnd);

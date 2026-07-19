@@ -10,8 +10,10 @@ mod crypto;
 mod http;
 mod version;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::process::CommandExt;
+use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -19,11 +21,13 @@ use windows::Win32::Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, WP
 use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_YESNO, MessageBoxW, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
-    WM_USER,
 };
 use windows::core::{PCWSTR, w};
 
-use crate::config::{INSTALLER_MAX_BYTES, VERSION_METADATA_MAX_BYTES};
+use crate::config::{
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_MAX_BYTES, VERSION,
+    VERSION_METADATA_MAX_BYTES, WM_USER_UPDATE_ACTION,
+};
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{
@@ -32,9 +36,7 @@ use crate::util::{
 
 use crypto::{compute_sha256_hex, compute_sha256_hex_file};
 use http::fetch_url;
-use version::{compare_versions, is_installed_version, parse_update_metadata};
-
-pub const WM_USER_UPDATE_ACTION: u32 = WM_USER + 5;
+use version::{compare_versions, parse_update_metadata};
 
 const UPDATE_ACTION_EXIT_MAIN: usize = 1;
 
@@ -46,8 +48,8 @@ const GITHUB_BASE: &str = "https://github.com/a145789/traffic-monitor";
 const RELEASE_PAGE_URL: &str = "https://github.com/a145789/traffic-monitor/releases";
 const TEMP_FILE_NAME: &str = "traffic-monitor-setup-temp.exe";
 
-const AUTO_CHECK_COOLDOWN_SECS: u64 = 3600;
-const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
+/// 安装器文件以只读共享模式打开，阻止其他进程改写已校验文件。
+const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
 
 static LAST_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -73,8 +75,19 @@ fn get_temp_installer_path() -> std::path::PathBuf {
         .join(TEMP_FILE_NAME)
 }
 
+/// 判断当前可执行文件是否位于安装版目录（父目录存在 `unins000.exe`）。
+/// 仅安装版支持原地自更新；便携版提示用户去网页下载。
+fn is_installed_version() -> bool {
+    match std::env::current_exe() {
+        Ok(exe) => match exe.parent() {
+            Some(dir) => dir.join("unins000.exe").exists(),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
 fn open_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
     std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ_ONLY)
@@ -82,7 +95,6 @@ fn open_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::Fil
 }
 
 fn create_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -231,7 +243,7 @@ fn do_update_check() -> CheckResult {
     let latest_version = metadata.version;
     let expected_hash_hex = metadata.hash_hex;
 
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = VERSION;
     if !compare_versions(current_version, &latest_version) {
         return CheckResult::NoUpdate;
     }
@@ -271,29 +283,19 @@ fn do_update_check() -> CheckResult {
         }
     }
 
-    let mut installer_data = fetch_url(DOWNLOAD_HOST, &download_path, true, INSTALLER_MAX_BYTES);
-    let mut err_msg = None;
-
-    if let Err(e) = installer_data {
-        err_msg = Some(format!("从主源下载失败: {e}"));
-        let proxy_path = format!(
-            "/{GITHUB_BASE}/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
-        );
-        match fetch_url(PROXY_HOST, &proxy_path, true, INSTALLER_MAX_BYTES) {
-            Ok(data) => {
-                installer_data = Ok(data);
-            }
-            Err(pe) => {
-                err_msg = Some(format!("主源失败({e}), 代理源失败({pe})"));
-                installer_data = Err(pe);
-            }
-        }
-    }
-
-    let installer_data = match installer_data {
+    // 主源失败时回落到代理源；两者都失败时报组合错误。
+    let installer_data = match fetch_url(DOWNLOAD_HOST, &download_path, true, INSTALLER_MAX_BYTES) {
         Ok(data) => data,
-        Err(_) => {
-            return CheckResult::Error(err_msg.unwrap_or_else(|| "下载安装包失败".to_string()));
+        Err(e) => {
+            let proxy_path = format!(
+                "/{GITHUB_BASE}/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
+            );
+            match fetch_url(PROXY_HOST, &proxy_path, true, INSTALLER_MAX_BYTES) {
+                Ok(data) => data,
+                Err(pe) => {
+                    return CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"));
+                }
+            }
         }
     };
 
@@ -360,8 +362,7 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
     match result {
         CheckResult::NoUpdate => {
             if is_manual {
-                let version = env!("CARGO_PKG_VERSION");
-                show_info(&format!("当前已是最新版本 (v{version})。"));
+                show_info(&format!("当前已是最新版本 (v{VERSION})。"));
             }
             UpdateAction::Done
         }
@@ -417,9 +418,6 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
         Err(_) => return failed(),
     };
 
-    use std::io::Read;
-    use std::os::windows::process::CommandExt;
-    use std::process::Stdio;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     let mut command = std::process::Command::new(exe);

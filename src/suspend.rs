@@ -1,30 +1,47 @@
-//! 系统暂停/恢复与全屏检测逻辑。
+//! 系统暂停/恢复、全屏检测与主题变更检测。
 //!
-//! 负责管理定时器的启停（休眠/锁屏/全屏时暂停），以节省 CPU 资源。
+//! 负责管理定时器的启停（休眠/锁屏/全屏时暂停），以节省 CPU 资源；
+//! 电源广播（WM_POWERBROADCAST）与锁屏（WM_WTSSESSION_CHANGE）消息在此处理。
 
 use std::sync::atomic::Ordering;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
 };
+use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowRect, KillTimer, SetTimer,
+    GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowRect, KillTimer,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SetTimer,
 };
 
-use crate::collector::trim_working_set;
 use crate::config::{
     CPU_MEM_INTERVAL, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK,
     TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
 };
-use crate::state::{CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASONS};
+use crate::state::{
+    CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASON_MONITOR,
+    SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM, SUSPEND_REASONS,
+};
+use crate::util::{trim_working_set, utf16};
 use crate::window::get_taskbar_hwnd;
 
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct POWERBROADCAST_SETTING {
+    PowerSetting: windows::core::GUID,
+    DataLength: u32,
+    Data: [u8; 1],
+}
+
 pub fn is_suspended() -> bool {
-    SUSPEND_REASONS.load(Ordering::Acquire) != 0
+    SUSPEND_REASONS.is_suspended()
 }
 
 pub fn suspend_system(hwnd: HWND, reason: u32) {
-    let previous = SUSPEND_REASONS.fetch_or(reason, Ordering::AcqRel);
+    let previous = SUSPEND_REASONS.suspend(reason);
     MONITOR_FULLSCREEN.store(false, Ordering::Release);
     let _ = sync_monitoring_timers(hwnd);
     if previous == 0 {
@@ -33,12 +50,55 @@ pub fn suspend_system(hwnd: HWND, reason: u32) {
 }
 
 pub fn resume_system(hwnd: HWND, reason: u32, reset_backoff: bool) {
-    SUSPEND_REASONS.fetch_and(!reason, Ordering::AcqRel);
+    SUSPEND_REASONS.resume(reason);
     if reset_backoff {
         CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
         NETWORK_BACKOFF.store(false, Ordering::Release);
     }
     let _ = sync_monitoring_timers(hwnd);
+}
+
+/// WM_POWERBROADCAST 处理：系统休眠/唤醒、显示器开关。
+pub fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match wparam.0 as u32 {
+        PBT_APMSUSPEND => {
+            suspend_system(hwnd, SUSPEND_REASON_SYSTEM);
+        }
+        PBT_APMRESUMEAUTOMATIC => {
+            resume_system(hwnd, SUSPEND_REASON_SYSTEM, true);
+        }
+        PBT_POWERSETTINGCHANGE => {
+            let setting = lparam.0 as *const POWERBROADCAST_SETTING;
+            if !setting.is_null() {
+                // SAFETY: PBT_POWERSETTINGCHANGE 时 OS 保证 lparam 指向有效结构。
+                let setting_ref = unsafe { &*setting };
+                if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1
+                {
+                    if setting_ref.Data[0] != 0 {
+                        resume_system(hwnd, SUSPEND_REASON_MONITOR, true);
+                    } else {
+                        suspend_system(hwnd, SUSPEND_REASON_MONITOR);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+/// WM_WTSSESSION_CHANGE 处理：锁屏/解锁。
+pub fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    match wparam.0 {
+        WTS_SESSION_LOCK => {
+            suspend_system(hwnd, SUSPEND_REASON_SESSION);
+        }
+        WTS_SESSION_UNLOCK => {
+            resume_system(hwnd, SUSPEND_REASON_SESSION, true);
+        }
+        _ => {}
+    }
+    LRESULT(0)
 }
 
 /// 依据暂停原因、全屏状态和网络退避状态，将所有监测定时器收敛到唯一正确集合。
@@ -135,19 +195,6 @@ pub fn check_fullscreen(hwnd: HWND) {
     }
 }
 
-/// Converts an ASCII string to a fixed-size UTF-16 array. Only works for ASCII; non-ASCII bytes
-/// will produce incorrect results.
-pub const fn utf16<const N: usize>(s: &str) -> [u16; N] {
-    let mut buf = [0u16; N];
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        buf[i] = bytes[i] as u16;
-        i += 1;
-    }
-    buf
-}
-
 /// # Safety
 ///
 /// 调用者必须保证 `lparam` 指向一个有效的、以 NUL 结尾的 UTF-16 宽字符序列。
@@ -175,22 +222,6 @@ pub unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::LPARAM;
-
-    // ===== utf16 =====
-
-    #[test]
-    fn test_utf16_ascii() {
-        let result = utf16::<5>("test");
-        // 't'=0x74 'e'=0x65 's'=0x73 't'=0x74 + NUL padding
-        assert_eq!(result, [0x74, 0x65, 0x73, 0x74, 0]);
-    }
-
-    #[test]
-    fn test_utf16_exact_fit() {
-        // 恰好填满缓冲区时不应溢出。
-        let result = utf16::<3>("ab");
-        assert_eq!(result, [b'a' as u16, b'b' as u16, 0]);
-    }
 
     // ===== is_immersive_color_set =====
 

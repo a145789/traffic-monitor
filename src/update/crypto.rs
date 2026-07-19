@@ -23,59 +23,82 @@ impl Drop for BcryptHandles {
     }
 }
 
+/// 增量式 SHA-256 计算。句柄由 RAII 守卫托管，`finish` 后自动销毁。
+pub(super) struct Sha256 {
+    handles: BcryptHandles,
+}
+
+impl Sha256 {
+    fn new() -> Result<Self, String> {
+        let mut h_alg = BCRYPT_ALG_HANDLE::default();
+        // SAFETY: BCRYPT_SHA256_ALGORITHM 是有效算法标识符；&mut h_alg 是输出参数。
+        let status = unsafe {
+            BCryptOpenAlgorithmProvider(
+                &mut h_alg,
+                BCRYPT_SHA256_ALGORITHM,
+                None,
+                Default::default(),
+            )
+        };
+        check_status(status.0, "BCryptOpenAlgorithmProvider")?;
+
+        let mut handles = BcryptHandles {
+            h_hash: BCRYPT_HASH_HANDLE::default(),
+            h_alg,
+        };
+
+        let mut h_hash = BCRYPT_HASH_HANDLE::default();
+        // SAFETY: handles.h_alg 有效；&mut h_hash 是输出参数；SHA-256 无需密钥或 IV。
+        let status = unsafe { BCryptCreateHash(handles.h_alg, &mut h_hash, None, None, 0) };
+        check_status(status.0, "BCryptCreateHash")?;
+        handles.h_hash = h_hash;
+
+        Ok(Self { handles })
+    }
+
+    fn update(&self, data: &[u8]) -> Result<(), String> {
+        // SAFETY: h_hash 有效；data 是 Rust 切片保证的有效缓冲区。
+        let status = unsafe { BCryptHashData(self.handles.h_hash, data, 0) };
+        check_status(status.0, "BCryptHashData")
+    }
+
+    fn finish(self) -> Result<String, String> {
+        let mut hash_bytes = [0u8; 32];
+        // SAFETY: h_hash 有效；hash_bytes 是 32 字节缓冲区，匹配 SHA-256 输出大小。
+        let status = unsafe { BCryptFinishHash(self.handles.h_hash, &mut hash_bytes, 0) };
+        check_status(status.0, "BCryptFinishHash")?;
+        Ok(format_hex(&hash_bytes))
+    }
+}
+
+pub(super) fn compute_sha256_hex(data: &[u8]) -> Result<String, String> {
+    let hash = Sha256::new()?;
+    hash.update(data)?;
+    hash.finish()
+}
+
+pub(super) fn compute_sha256_hex_file(path: &std::path::Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("打开待哈希文件失败: {e}"))?;
+
+    let hash = Sha256::new()?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .map_err(|e| format!("读取待哈希文件失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n])?;
+    }
+    hash.finish()
+}
+
 fn check_status(status: i32, fn_name: &str) -> Result<(), String> {
     if status >= 0 {
         Ok(())
     } else {
         Err(format!("{fn_name} 调用失败: 0x{status:08X}"))
     }
-}
-
-pub(super) fn compute_sha256_hex(data: &[u8]) -> Result<String, String> {
-    let mut h_alg = BCRYPT_ALG_HANDLE::default();
-
-    // SAFETY:
-    // BCRYPT_SHA256_ALGORITHM 是有效的算法标识符。
-    // &mut h_alg 是算法句柄的输出参数。
-    let status = unsafe {
-        BCryptOpenAlgorithmProvider(
-            &mut h_alg,
-            BCRYPT_SHA256_ALGORITHM,
-            None,
-            Default::default(),
-        )
-    };
-    check_status(status.0, "BCryptOpenAlgorithmProvider")?;
-
-    // RAII 守卫：Drop 依次关闭 h_hash（非默认值时）和 h_alg。
-    let mut guard = BcryptHandles {
-        h_hash: BCRYPT_HASH_HANDLE::default(),
-        h_alg,
-    };
-
-    let mut h_hash = BCRYPT_HASH_HANDLE::default();
-
-    // SAFETY:
-    // guard.h_alg 来自 BCryptOpenAlgorithmProvider，有效。
-    // &mut h_hash 是输出参数；SHA-256 无需密钥或 IV。
-    let status = unsafe { BCryptCreateHash(guard.h_alg, &mut h_hash, None, None, 0) };
-    check_status(status.0, "BCryptCreateHash")?;
-    guard.h_hash = h_hash;
-
-    // SAFETY:
-    // h_hash 来自 BCryptCreateHash，有效。
-    // data 是有效的字节切片（Rust 切片保证）。
-    let status = unsafe { BCryptHashData(h_hash, data, 0) };
-    check_status(status.0, "BCryptHashData")?;
-
-    let mut hash_bytes = [0u8; 32];
-
-    // SAFETY:
-    // h_hash 有效；hash_bytes 是 32 字节缓冲区，匹配 SHA-256 输出大小。
-    let status = unsafe { BCryptFinishHash(h_hash, &mut hash_bytes, 0) };
-    check_status(status.0, "BCryptFinishHash")?;
-
-    Ok(format_hex(&hash_bytes))
 }
 
 fn format_hex(bytes: &[u8]) -> String {
@@ -85,64 +108,6 @@ fn format_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02X}");
     }
     s
-}
-
-pub(super) fn compute_sha256_hex_file(path: &std::path::Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("打开待哈希文件失败: {e}"))?;
-
-    let mut h_alg = BCRYPT_ALG_HANDLE::default();
-
-    // SAFETY:
-    // BCRYPT_SHA256_ALGORITHM 是有效的算法标识符。
-    // &mut h_alg 是算法句柄的输出参数。
-    let status = unsafe {
-        BCryptOpenAlgorithmProvider(
-            &mut h_alg,
-            BCRYPT_SHA256_ALGORITHM,
-            None,
-            Default::default(),
-        )
-    };
-    check_status(status.0, "BCryptOpenAlgorithmProvider")?;
-
-    // RAII 守卫：Drop 依次关闭 h_hash（非默认值时）和 h_alg。
-    let mut guard = BcryptHandles {
-        h_hash: BCRYPT_HASH_HANDLE::default(),
-        h_alg,
-    };
-
-    let mut h_hash = BCRYPT_HASH_HANDLE::default();
-
-    // SAFETY:
-    // guard.h_alg 来自 BCryptOpenAlgorithmProvider，有效。
-    // &mut h_hash 是输出参数；SHA-256 无需密钥或 IV。
-    let status = unsafe { BCryptCreateHash(guard.h_alg, &mut h_hash, None, None, 0) };
-    check_status(status.0, "BCryptCreateHash")?;
-    guard.h_hash = h_hash;
-
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = std::io::Read::read(&mut file, &mut buf)
-            .map_err(|e| format!("读取待哈希文件失败: {e}"))?;
-        if n == 0 {
-            break;
-        }
-
-        // SAFETY:
-        // h_hash 来自 BCryptCreateHash，有效。
-        // buf[..n] 是从文件读取的 n 字节有效切片。
-        let status = unsafe { BCryptHashData(h_hash, &buf[..n], 0) };
-        check_status(status.0, "BCryptHashData")?;
-    }
-
-    let mut hash_bytes = [0u8; 32];
-
-    // SAFETY:
-    // h_hash 有效；hash_bytes 是 32 字节缓冲区，匹配 SHA-256 输出大小。
-    let status = unsafe { BCryptFinishHash(h_hash, &mut hash_bytes, 0) };
-    check_status(status.0, "BCryptFinishHash")?;
-
-    Ok(format_hex(&hash_bytes))
 }
 
 #[cfg(test)]
@@ -173,5 +138,17 @@ mod tests {
         let expected = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
         let hash = compute_sha256_hex(b"hello world").unwrap();
         assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn test_sha256_incremental_matches_one_shot() {
+        // 分块 update 应与一次性计算结果一致（Sha256 复用正确性）。
+        let hash = Sha256::new().unwrap();
+        hash.update(b"hello ").unwrap();
+        hash.update(b"world").unwrap();
+        assert_eq!(
+            hash.finish().unwrap(),
+            compute_sha256_hex(b"hello world").unwrap()
+        );
     }
 }

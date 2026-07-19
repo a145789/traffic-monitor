@@ -1,19 +1,68 @@
-//! 任务栏窗口管理：查找 Shell_TrayWnd、计算嵌入位置、嵌入与位置更新。
+//! 窗口创建与任务栏嵌入：窗口类注册、主窗口创建、任务栏查找、嵌入与位置更新。
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT, SetLastError, WIN32_ERROR};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
-    IsWindow, LWA_COLORKEY, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, WS_CHILD,
-    WS_EX_LAYERED, WS_VISIBLE,
+    CreateWindowExW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW,
+    GetWindowRect, HWND_TOP, IsWindow, LWA_COLORKEY, RegisterClassExW, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent,
+    SetWindowLongPtrW, SetWindowPos, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
-use crate::config::{COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP};
-use crate::util::show_error;
+use crate::config::{COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WINDOW_CLASS, WINDOW_TITLE};
+use crate::util::{module_instance, show_error};
 
 static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
+
+pub fn register_window_class() -> Result<(), String> {
+    // WINDOW_CLASS 常量已含尾 NUL。
+    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
+    let hinstance = module_instance()?;
+
+    let wnd_class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(crate::wnd_proc),
+        hInstance: hinstance,
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+
+    // SAFETY: class_name 在调用期间保持存活；wnd_class 字段完整。
+    let atom = unsafe { RegisterClassExW(&wnd_class) };
+    if atom == 0 {
+        return Err("注册窗口类失败".to_string());
+    }
+    Ok(())
+}
+
+pub fn create_main_window() -> Result<HWND, String> {
+    // WINDOW_CLASS / WINDOW_TITLE 常量已含尾 NUL。
+    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
+    let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
+    let hinstance = module_instance()?;
+
+    // SAFETY: 宽字符串缓冲区在调用期间存活。
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(window_name.as_ptr()),
+            WS_POPUP | WS_VISIBLE,
+            0,
+            0,
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+    };
+
+    hwnd.map_err(|e| format!("创建窗口失败: {e:?}"))
+}
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {
     let cached = TASKBAR_HWND.load(Ordering::Acquire);

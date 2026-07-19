@@ -79,18 +79,6 @@ pub(super) fn parse_update_metadata(text: &str) -> Result<ParsedMetadata, String
     })
 }
 
-/// 判断当前可执行文件是否位于安装版目录（父目录存在 `unins000.exe`）。
-/// 仅安装版支持原地自更新；便携版提示用户去网页下载。
-pub(super) fn is_installed_version() -> bool {
-    match std::env::current_exe() {
-        Ok(exe) => match exe.parent() {
-            Some(dir) => dir.join("unins000.exe").exists(),
-            None => false,
-        },
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
