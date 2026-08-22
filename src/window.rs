@@ -7,11 +7,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HWND_TOP, IsWindow, LWA_COLORKEY, RegisterClassExW, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent,
     SetWindowLongPtrW, SetWindowPos, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
-use crate::config::{COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WINDOW_CLASS, WINDOW_TITLE};
+use crate::config::{
+    COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WATCHDOG_CLASS, WINDOW_CLASS, WINDOW_TITLE,
+};
 use crate::util::{module_instance, show_error};
 
 static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -62,6 +64,57 @@ pub fn create_main_window() -> Result<HWND, String> {
     };
 
     hwnd.map_err(|e| format!("创建窗口失败: {e:?}"))
+}
+
+/// 注册看门狗窗口类：隐藏顶层消息窗口，唯一可靠的 TaskbarCreated 接收者。
+pub fn register_watchdog_class() -> Result<(), String> {
+    let class_name: Vec<u16> = WATCHDOG_CLASS.encode_utf16().collect();
+    let hinstance = module_instance()?;
+
+    let wnd_class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(crate::watchdog_wnd_proc),
+        hInstance: hinstance,
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+
+    // SAFETY: class_name 在调用期间保持存活；wnd_class 字段完整。
+    let atom = unsafe { RegisterClassExW(&wnd_class) };
+    if atom == 0 {
+        return Err("注册看门狗窗口类失败".to_string());
+    }
+    Ok(())
+}
+
+/// 创建隐藏的顶层看门狗窗口。
+///
+/// 主窗口 SetParent 进任务栏后成为跨进程子窗口，explorer 销毁任务栏时会将其
+/// 级联销毁，且 TaskbarCreated 广播只投递顶层窗口——主窗口自身永远收不到。
+/// 看门狗永不嵌入、从不显示（无 GDI 位图/DC），常驻开销可忽略。
+pub fn create_watchdog_window() -> Result<HWND, String> {
+    let class_name: Vec<u16> = WATCHDOG_CLASS.encode_utf16().collect();
+    let hinstance = module_instance()?;
+
+    // SAFETY: class_name 缓冲区在调用期间存活；不带 WS_VISIBLE 保持隐藏。
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(class_name.as_ptr()),
+            w!(""),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+    };
+
+    hwnd.map_err(|e| format!("创建看门狗窗口失败: {e:?}"))
 }
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {

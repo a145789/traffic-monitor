@@ -12,6 +12,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_NAME: &str = "TrafficMonitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";
 pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
+/// 隐藏看门狗窗口类名：永不嵌入任务栏的顶层窗口，
+/// 是唯一能可靠接收 TaskbarCreated 广播并触发主窗口重建的常驻接收者。
+pub const WATCHDOG_CLASS: &str = "TrafficMonitorWatchdog\0";
 pub const MUTEX_NAME: &str = "TrafficMonitor_Mutex_Instance\0";
 
 pub const DISPLAY_WIDTH: i32 = 170;

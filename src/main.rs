@@ -26,8 +26,8 @@ use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, FindWindowW, KillTimer, PostMessageW,
-    PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SetTimer, ShowWindow, WM_CLOSE, WM_COMMAND,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow, FindWindowW, IsWindow, KillTimer,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetTimer, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
     WM_TIMER, WM_WTSSESSION_CHANGE,
 };
@@ -53,12 +53,14 @@ use crate::update::{
 };
 use crate::util::{show_error, trim_working_set};
 use crate::window::{
-    create_main_window, embed_in_taskbar, invalidate_taskbar_cache, register_window_class,
-    update_taskbar_position,
+    create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
+    register_watchdog_class, register_window_class, update_taskbar_position,
 };
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// 当前主窗口句柄（isize）。Explorer 重启重建后更新；0 表示暂无主窗口。
+static CURRENT_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn quit_existing_instance() {
     // WINDOW_CLASS 常量已含尾 NUL。
@@ -128,17 +130,14 @@ fn main() {
         return;
     }
 
-    let hwnd = match create_main_window() {
-        Ok(h) => h,
-        Err(e) => {
-            show_error(&e);
-            return;
-        }
-    };
+    // 看门狗是首个创建的顶层窗口；ImmDisableIME 已在其之前执行。
+    if let Err(e) = register_watchdog_class() {
+        show_error(&e);
+        return;
+    }
 
-    init_network_listener(hwnd);
-
-    // RegisterWindowMessageW 失败返回 0；窗口过程用 `msg == tcm && tcm != 0` 防御。
+    // RegisterWindowMessageW 失败返回 0；看门狗过程用 `tcm != 0 && msg == tcm` 防御。
+    // 必须在看门狗窗口创建前注册，保证其能收到首次 TaskbarCreated 广播。
     let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     if taskbar_msg == 0 {
         // SAFETY: 紧随 RegisterWindowMessageW，未插入其他可改写 last-error 的调用。
@@ -147,24 +146,23 @@ fn main() {
     }
     TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::Release);
 
-    // DEVICE_NOTIFY_WINDOW_HANDLE = 0；误用 SERVICE_HANDLE(1) 会把 HWND 当服务句柄，
-    // 返回 ERROR_SERVICE_NOT_IN_EXE (0x8007043B)。
-    let power_notify = unsafe {
-        RegisterPowerSettingNotification(
-            HANDLE(hwnd.0),
-            &GUID_MONITOR_POWER_ON,
-            DEVICE_NOTIFY_WINDOW_HANDLE,
-        )
-    };
-    match power_notify {
-        Ok(handle) => {
-            POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Release);
-        }
-        Err(e) => {
-            // 非致命：仅影响显示器开关节能。
-            show_error(&format!("注册电源设置通知失败: {e:?}"));
-        }
+    if let Err(e) = create_watchdog_window() {
+        show_error(&e);
+        return;
     }
+
+    let hwnd = match create_main_window() {
+        Ok(h) => h,
+        Err(e) => {
+            show_error(&e);
+            return;
+        }
+    };
+    CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
+
+    init_network_listener(hwnd);
+
+    register_power_notify(hwnd);
 
     if !embed_in_taskbar(hwnd) {
         show_error("嵌入任务栏失败。请确认 explorer.exe 正在运行。");
@@ -199,12 +197,7 @@ fn main() {
         return;
     }
 
-    // 失败非致命：锁屏暂停失效，显示器关闭仍可由电源通知覆盖。
-    unsafe {
-        if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
-            show_error(&format!("注册会话通知失败: {e:?}"));
-        }
-    }
+    register_session_notification(hwnd);
 
     init_cleanup_temp();
     start_auto_check(hwnd);
@@ -239,8 +232,12 @@ fn main() {
         }
     }
 
-    unsafe {
-        let _ = WTSUnRegisterSessionNotification(hwnd);
+    // 注销须针对当前主窗口：Explorer 重启重建后原局部 hwnd 已陈旧。
+    let current = CURRENT_MAIN_HWND.load(Ordering::Acquire);
+    if current != 0 {
+        unsafe {
+            let _ = WTSUnRegisterSessionNotification(HWND(current as *mut std::ffi::c_void));
+        }
     }
 
     let power_handle = POWER_NOTIFY_HANDLE.load(Ordering::Acquire);
@@ -253,26 +250,111 @@ fn main() {
     renderer::take_renderer();
 }
 
-// --- 窗口过程与消息处理 ---
+// --- 看门狗窗口与 Explorer 重启恢复 ---
 
-fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
-    invalidate_taskbar_cache();
-    remove_tray_icon();
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
-    }
-    if embed_in_taskbar(hwnd) {
-        create_tray_icon(hwnd);
-        renderer::with_renderer(|r| {
-            r.update_dpi(hwnd);
-            r.update_text_color();
-        });
-
-        if !sync_monitoring_timers(hwnd) {
-            show_error("Explorer 重启后恢复监测定时器失败");
+/// 注册显示器开关电源通知到指定窗口。失败仅影响显示器开关节能（非致命）。
+fn register_power_notify(hwnd: HWND) {
+    // DEVICE_NOTIFY_WINDOW_HANDLE = 0；误用 SERVICE_HANDLE(1) 会把 HWND 当服务句柄，
+    // 返回 ERROR_SERVICE_NOT_IN_EXE (0x8007043B)。
+    let power_notify = unsafe {
+        RegisterPowerSettingNotification(
+            HANDLE(hwnd.0),
+            &GUID_MONITOR_POWER_ON,
+            DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+    };
+    match power_notify {
+        Ok(handle) => {
+            POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Release);
+        }
+        Err(e) => {
+            show_error(&format!("注册电源设置通知失败: {e:?}"));
         }
     }
-    LRESULT(0)
+}
+
+/// 注册会话锁屏通知。失败非致命：锁屏暂停失效，显示器关闭仍由电源通知覆盖。
+fn register_session_notification(hwnd: HWND) {
+    if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
+        show_error(&format!("注册会话通知失败: {e:?}"));
+    }
+}
+
+/// Explorer 重启后的主窗口完整重建。
+///
+/// 不变量：任务栏销毁会级联销毁嵌入其中的跨进程子窗口（旧主窗口已死），
+/// 且 TaskbarCreated 广播只投递顶层窗口——因此重建只能由看门狗触发，
+/// 禁止把该处理挂回主窗口过程。所有绑定在旧 hwnd 上的资源
+/// （网络监听、电源/会话通知、托盘、定时器）必须逐一重绑到新 hwnd。
+fn rebuild_main_window() {
+    invalidate_taskbar_cache();
+
+    let old = CURRENT_MAIN_HWND.swap(0, Ordering::AcqRel);
+    if old != 0 {
+        let old_hwnd = HWND(old as *mut std::ffi::c_void);
+        // SAFETY: 主窗口与看门狗同在 UI 线程创建；IsWindow 过滤陈旧句柄后销毁安全。
+        if unsafe { IsWindow(Some(old_hwnd)) }.as_bool() {
+            unsafe {
+                let _ = DestroyWindow(old_hwnd);
+            }
+        }
+    }
+
+    let hwnd = match create_main_window() {
+        Ok(h) => h,
+        Err(e) => {
+            show_error(&format!("Explorer 重启后重建主窗口失败: {e}"));
+            return;
+        }
+    };
+    CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
+
+    init_network_listener(hwnd);
+
+    // 旧电源通知绑定在已销毁的窗口上，先注销再对新窗口重新注册。
+    let prev_power = POWER_NOTIFY_HANDLE.swap(0, Ordering::AcqRel);
+    if prev_power != 0 {
+        unsafe {
+            let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(prev_power));
+        }
+    }
+    register_power_notify(hwnd);
+    register_session_notification(hwnd);
+
+    remove_tray_icon();
+
+    if !embed_in_taskbar(hwnd) {
+        show_error("Explorer 重启后嵌入任务栏失败");
+        return;
+    }
+
+    create_tray_icon(hwnd);
+    renderer::with_renderer(|r| {
+        r.update_dpi(hwnd);
+        r.update_text_color();
+    });
+
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+
+    if !sync_monitoring_timers(hwnd) {
+        show_error("Explorer 重启后恢复监测定时器失败");
+    }
+}
+
+pub extern "system" fn watchdog_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
+    if tcm != 0 && msg == tcm {
+        rebuild_main_window();
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
@@ -313,11 +395,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
 }
 
 pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
-    if msg == tcm && tcm != 0 {
-        return handle_taskbar_created(hwnd);
-    }
-
     match msg {
         WM_CREATE => LRESULT(0),
 
