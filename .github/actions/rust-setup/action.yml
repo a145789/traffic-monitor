@@ -1,5 +1,5 @@
 name: Rust setup
-description: Checkout 仓库并安装 Rust 工具链与 Cargo 缓存（check / release 共用）
+description: 安装 Rust 工具链与 Cargo 缓存（check / release 共用；本地 action，调用前必须先 actions/checkout）
 
 inputs:
   cache-key:
@@ -9,11 +9,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
