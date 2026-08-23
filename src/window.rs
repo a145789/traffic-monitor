@@ -243,41 +243,36 @@ pub fn embed_in_taskbar(hwnd: HWND) -> bool {
     true
 }
 
-pub fn update_taskbar_position(hwnd: HWND) {
+pub fn update_taskbar_position(hwnd: HWND) -> bool {
     thread_local! {
         static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
     }
 
     let Some((display_x, display_y, display_width, display_height)) = calc_widget_rect(hwnd) else {
-        return;
+        return false;
     };
 
-    let changed = LAST_RECT.with(|lp| match lp.get() {
-        Some((lx, ly, lw, lh))
-            if lx == display_x
-                && ly == display_y
-                && lw == display_width
-                && lh == display_height =>
-        {
-            false
-        }
-        _ => {
-            lp.set(Some((display_x, display_y, display_width, display_height)));
-            true
-        }
-    });
-
-    if changed {
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                display_x,
-                display_y,
-                display_width,
-                display_height,
-                SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER,
-            );
-        }
+    let target = (display_x, display_y, display_width, display_height);
+    if LAST_RECT.with(|lp| lp.get()) == Some(target) {
+        return false;
     }
+
+    // 缓存只在移动成功后提交：SetWindowPos 瞬时失败（如 Explorer 重启竞态）时
+    // 下个周期会重试，而不是因“矩形==缓存”被永久跳过。
+    let moved = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            display_x,
+            display_y,
+            display_width,
+            display_height,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER,
+        )
+        .is_ok()
+    };
+    if moved {
+        LAST_RECT.with(|lp| lp.set(Some(target)));
+    }
+    moved
 }

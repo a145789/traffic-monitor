@@ -1,23 +1,24 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreateSolidBrush,
     DRAW_TEXT_FORMAT, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, FONT_QUALITY, FillRect, GetTextExtentPoint32W, GetWindowDC, HBITMAP,
-    HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, ReleaseDC, SRCCOPY, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, ReleaseDC, SRCCOPY, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE,
-    LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN,
+    LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN, REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
 use crate::util::{push_wide, reg_read_dword, to_wide};
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
+    static LAST_RENDERED_VALUES: Cell<Option<DisplayValues>> = const { Cell::new(None) };
 }
 
 /// 安装渲染器（启动时调用一次）。
@@ -47,6 +48,18 @@ pub fn take_renderer() {
     });
 }
 
+/// 仅在展示数据变化后请求重绘，避免空闲时每秒执行完整 GDI 绘制。
+pub fn invalidate_if_values_changed(hwnd: HWND) {
+    let values = DisplayValues::load();
+    let changed = LAST_RENDERED_VALUES.with(|last| last.get() != Some(values));
+    if changed {
+        // SAFETY: hwnd 是当前 UI 线程拥有的主窗口句柄；InvalidateRect 只投递重绘请求。
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+}
+
 pub struct Renderer {
     hdc_mem: HDC,
     hbitmap: HBITMAP,
@@ -60,6 +73,25 @@ pub struct Renderer {
     height: i32,
     arrow_width: i32,
     buf: Vec<u16>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DisplayValues {
+    speed_up: u32,
+    speed_down: u32,
+    cpu: u32,
+    mem: u32,
+}
+
+impl DisplayValues {
+    fn load() -> Self {
+        Self {
+            speed_up: NET_SPEED_UP.load(Ordering::Relaxed),
+            speed_down: NET_SPEED_DOWN.load(Ordering::Relaxed),
+            cpu: CPU_USAGE.load(Ordering::Relaxed),
+            mem: MEM_USAGE.load(Ordering::Relaxed),
+        }
+    }
 }
 
 // ===== 模块私有 RAII 资源守卫 =====
@@ -301,10 +333,7 @@ impl Renderer {
             bottom: self.height,
         };
 
-        let speed_up = NET_SPEED_UP.load(Ordering::Relaxed);
-        let speed_down = NET_SPEED_DOWN.load(Ordering::Relaxed);
-        let cpu = CPU_USAGE.load(Ordering::Relaxed);
-        let mem = MEM_USAGE.load(Ordering::Relaxed);
+        let values = DisplayValues::load();
 
         let layout = Layout::new(self.width, self.height);
         let arrow_right = layout.speed_left + self.arrow_width;
@@ -335,7 +364,7 @@ impl Renderer {
             right: layout.speed_right,
             bottom: layout.half_height,
         };
-        let up_val = Self::format_speed_wide(&mut self.buf, speed_up);
+        let up_val = Self::format_speed_wide(&mut self.buf, values.speed_up);
         draw_text(self.hdc_mem, up_val, &mut rc_up_val, DT_RIGHT);
 
         let mut rc_down_arrow = RECT {
@@ -353,11 +382,11 @@ impl Renderer {
             right: layout.speed_right,
             bottom: self.height,
         };
-        let down_val = Self::format_speed_wide(&mut self.buf, speed_down);
+        let down_val = Self::format_speed_wide(&mut self.buf, values.speed_down);
         draw_text(self.hdc_mem, down_val, &mut rc_down_val, DT_RIGHT);
 
         // CPU/内存列（左列）：数值右对齐。
-        let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", cpu);
+        let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", values.cpu);
         let mut rc_cpu = RECT {
             left: layout.cpu_left,
             top: 0,
@@ -366,7 +395,7 @@ impl Renderer {
         };
         draw_text(self.hdc_mem, cpu_wide, &mut rc_cpu, DT_RIGHT);
 
-        let mem_wide = Self::format_cpu_mem_wide(&mut self.buf, "MEM", mem);
+        let mem_wide = Self::format_cpu_mem_wide(&mut self.buf, "MEM", values.mem);
         let mut rc_mem = RECT {
             left: layout.cpu_left,
             top: layout.half_height,
@@ -378,8 +407,8 @@ impl Renderer {
         // 把内存 DC 内容一次性 blit 到目标窗口 DC。
         // SAFETY: hdc 与 self.hdc_mem 均为有效 DC；坐标与尺寸基于 self.width / self.height，
         // 与位图选择时的尺寸一致。
-        unsafe {
-            let _ = BitBlt(
+        let copied = unsafe {
+            BitBlt(
                 hdc,
                 0,
                 0,
@@ -389,7 +418,11 @@ impl Renderer {
                 0,
                 0,
                 SRCCOPY,
-            );
+            )
+            .is_ok()
+        };
+        if copied {
+            LAST_RENDERED_VALUES.with(|last| last.set(Some(values)));
         }
     }
 
@@ -537,12 +570,9 @@ fn create_font(size: i32) -> HFONT {
 }
 
 pub fn is_system_light_theme() -> bool {
-    reg_read_dword(
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        "SystemUsesLightTheme",
-    )
-    .map(|v| v == 1)
-    .unwrap_or(false)
+    reg_read_dword(REG_PATH_PERSONALIZE, "SystemUsesLightTheme")
+        .map(|v| v == 1)
+        .unwrap_or(false)
 }
 
 fn push_ascii(buf: &mut Vec<u16>, s: &str) {

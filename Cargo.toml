@@ -22,7 +22,9 @@ windows = { version = "0.62", features = [
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    # windows 0.62 中 UI::Shell 的 ShellExecuteExW/SHELLEXECUTEINFOW 实际由此 feature 门控
     "Win32_System_Registry",
     "Win32_System_Power",
     "Win32_System_LibraryLoader",

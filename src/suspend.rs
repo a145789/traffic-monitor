@@ -6,17 +6,19 @@
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
+    GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
 };
 use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowRect, KillTimer,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SetTimer,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SetCoalescableTimer,
 };
 
 use crate::config::{
-    CPU_MEM_INTERVAL, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK,
-    TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
+    CPU_MEM_INTERVAL, TIMER_COALESCING_TOLERANCE_MS, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM,
+    TIMER_ID_FULLSCREEN, TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK, TIMER_INTERVAL_AUTO_UPDATE,
+    TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_MEMORY_MAINTENANCE, TIMER_INTERVAL_NETWORK,
+    TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::state::{
     CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASON_MONITOR,
@@ -40,6 +42,14 @@ pub fn is_suspended() -> bool {
     SUSPEND_REASONS.is_suspended()
 }
 
+/// 挂起/全屏期间分层窗口表面可能被系统丢弃（显示模式变化、RDP 重连、DWM 重置），
+/// 而数值未变时增量重绘不会触发；恢复后强制整幅重绘以自愈陈旧画面。
+fn force_repaint(hwnd: HWND) {
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
 pub fn suspend_system(hwnd: HWND, reason: u32) {
     let previous = SUSPEND_REASONS.suspend(reason);
     MONITOR_FULLSCREEN.store(false, Ordering::Release);
@@ -56,6 +66,7 @@ pub fn resume_system(hwnd: HWND, reason: u32, reset_backoff: bool) {
         NETWORK_BACKOFF.store(false, Ordering::Release);
     }
     let _ = sync_monitoring_timers(hwnd);
+    force_repaint(hwnd);
 }
 
 /// WM_POWERBROADCAST 处理：系统休眠/唤醒、显示器开关。
@@ -101,46 +112,113 @@ pub fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     LRESULT(0)
 }
 
-/// 依据暂停原因、全屏状态和网络退避状态，将所有监测定时器收敛到唯一正确集合。
-/// 返回 false 表示至少一个应创建的定时器创建失败。
+#[derive(Debug, PartialEq, Eq)]
+struct TimerPlan {
+    fullscreen: bool,
+    network_interval: Option<u32>,
+    cpu_mem: bool,
+    auto_update: bool,
+    memory_maintenance: bool,
+}
+
+/// 纯函数决定当前状态下应存在的定时器集合，供状态机测试覆盖暂停/恢复对称性。
+fn timer_plan(suspended: bool, fullscreen: bool, network_backoff: bool) -> TimerPlan {
+    if suspended {
+        return TimerPlan {
+            fullscreen: false,
+            network_interval: None,
+            cpu_mem: false,
+            auto_update: false,
+            memory_maintenance: false,
+        };
+    }
+
+    if fullscreen {
+        return TimerPlan {
+            fullscreen: true,
+            network_interval: None,
+            cpu_mem: false,
+            auto_update: false,
+            memory_maintenance: false,
+        };
+    }
+
+    TimerPlan {
+        fullscreen: true,
+        network_interval: Some(if network_backoff {
+            TIMER_INTERVAL_NETWORK_BACKOFF
+        } else {
+            TIMER_INTERVAL_NETWORK
+        }),
+        cpu_mem: true,
+        auto_update: true,
+        memory_maintenance: true,
+    }
+}
+
+/// 依据暂停原因、全屏状态和网络退避状态，将所有周期任务定时器收敛到唯一正确集合。
+///
+/// 返回值仅反映**核心监测定时器**（全屏检测/网络/CPU 内存）的创建结果：
+/// 任一失败返回 false。辅助定时器（自动更新、内存维护）为 best-effort，
+/// 失败被刻意忽略——它们不影响监测主功能，不应触发错误弹窗或窗口退出。
 pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
+    let plan = timer_plan(
+        is_suspended(),
+        MONITOR_FULLSCREEN.load(Ordering::Acquire),
+        NETWORK_BACKOFF.load(Ordering::Acquire),
+    );
+
     // 先统一移除，再按当前状态重建，避免调用方各自维护不完整的定时器子集。
     // SAFETY: hwnd 是主窗口句柄；移除不存在的定时器只会返回错误，不会破坏状态。
     unsafe {
         KillTimer(Some(hwnd), TIMER_ID_NETWORK).ok();
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
+        KillTimer(Some(hwnd), TIMER_ID_AUTO_UPDATE).ok();
+        KillTimer(Some(hwnd), TIMER_ID_MEMORY_MAINTENANCE).ok();
     }
 
-    if is_suspended() {
-        return true;
-    }
-
-    // SAFETY: hwnd 有效，ID 和间隔均为进程内固定常量；返回 0 表示创建失败。
-    let fullscreen_ok = unsafe {
-        SetTimer(
-            Some(hwnd),
-            TIMER_ID_FULLSCREEN,
-            TIMER_INTERVAL_FULLSCREEN,
-            None,
-        ) != 0
-    };
-
-    if MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-        return fullscreen_ok;
-    }
-
-    let network_interval = if NETWORK_BACKOFF.load(Ordering::Acquire) {
-        TIMER_INTERVAL_NETWORK_BACKOFF
+    let fullscreen_ok = if plan.fullscreen {
+        set_coalescable_timer(hwnd, TIMER_ID_FULLSCREEN, TIMER_INTERVAL_FULLSCREEN)
     } else {
-        TIMER_INTERVAL_NETWORK
+        true
     };
-    // SAFETY: hwnd 有效，ID 和间隔均为进程内固定常量；返回 0 表示创建失败。
-    let network_ok = unsafe { SetTimer(Some(hwnd), TIMER_ID_NETWORK, network_interval, None) != 0 };
-    // SAFETY: 同上，创建 CPU/内存定时器。
-    let cpu_mem_ok = unsafe { SetTimer(Some(hwnd), TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL, None) != 0 };
+
+    let network_ok = plan
+        .network_interval
+        .is_none_or(|interval| set_coalescable_timer(hwnd, TIMER_ID_NETWORK, interval));
+    let cpu_mem_ok = if plan.cpu_mem {
+        set_coalescable_timer(hwnd, TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL)
+    } else {
+        true
+    };
+
+    // 这些是辅助功能，失败不应让核心监测窗口退出或弹出错误框。
+    if plan.auto_update {
+        let _ = set_coalescable_timer(hwnd, TIMER_ID_AUTO_UPDATE, TIMER_INTERVAL_AUTO_UPDATE);
+    }
+    if plan.memory_maintenance {
+        let _ = set_coalescable_timer(
+            hwnd,
+            TIMER_ID_MEMORY_MAINTENANCE,
+            TIMER_INTERVAL_MEMORY_MAINTENANCE,
+        );
+    }
 
     fullscreen_ok && network_ok && cpu_mem_ok
+}
+
+fn set_coalescable_timer(hwnd: HWND, timer_id: usize, interval: u32) -> bool {
+    // SAFETY: hwnd 由当前 UI 线程拥有；定时器 ID/间隔为受控常量；不使用回调函数。
+    unsafe {
+        SetCoalescableTimer(
+            Some(hwnd),
+            timer_id,
+            interval,
+            None,
+            TIMER_COALESCING_TOLERANCE_MS,
+        ) != 0
+    }
 }
 
 pub fn check_fullscreen(hwnd: HWND) {
@@ -154,6 +232,7 @@ pub fn check_fullscreen(hwnd: HWND) {
         if was {
             MONITOR_FULLSCREEN.store(false, Ordering::Release);
             let _ = sync_monitoring_timers(hwnd);
+            force_repaint(hwnd);
         }
         return;
     }
@@ -192,6 +271,9 @@ pub fn check_fullscreen(hwnd: HWND) {
 
     if should_suspend != was {
         let _ = sync_monitoring_timers(hwnd);
+        if !should_suspend {
+            force_repaint(hwnd);
+        }
     }
 }
 
@@ -221,6 +303,7 @@ pub unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AUTO_CHECK_COOLDOWN_SECS;
     use windows::Win32::Foundation::LPARAM;
 
     // ===== is_immersive_color_set =====
@@ -255,5 +338,59 @@ mod tests {
         // SAFETY: partial 在栈上，指针有效。
         let result = unsafe { is_immersive_color_set(LPARAM(partial.as_ptr() as isize)) };
         assert!(!result);
+    }
+
+    // ===== timer_plan =====
+
+    #[test]
+    fn auto_update_poll_interval_must_be_far_below_cooldown() {
+        // sync_monitoring_timers 每次状态切换（息屏/锁屏/全屏/网络事件）都会销毁重建
+        // 全部定时器并使倒计时归零。若轮询周期≈自动检查冷却时长，事件频繁的机器上
+        // 检查会被无限推迟；因此周期必须显著小于冷却，让 LAST_CHECK_TIME 冷却门
+        // 成为唯一权威。此处以 1/10 冷却为上界钉死该关系。
+        assert!(u64::from(TIMER_INTERVAL_AUTO_UPDATE) <= AUTO_CHECK_COOLDOWN_SECS * 1000 / 10);
+    }
+
+    #[test]
+    fn test_timer_plan_suspended_has_no_timers() {
+        assert_eq!(
+            timer_plan(true, false, false),
+            TimerPlan {
+                fullscreen: false,
+                network_interval: None,
+                cpu_mem: false,
+                auto_update: false,
+                memory_maintenance: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_timer_plan_fullscreen_only_keeps_detection_timer() {
+        let plan = timer_plan(false, true, false);
+        assert!(plan.fullscreen);
+        assert_eq!(plan.network_interval, None);
+        assert!(!plan.cpu_mem);
+        assert!(!plan.auto_update);
+        assert!(!plan.memory_maintenance);
+    }
+
+    #[test]
+    fn test_timer_plan_normal_backoff_uses_slow_network_interval() {
+        let plan = timer_plan(false, false, true);
+        assert!(plan.fullscreen);
+        assert_eq!(plan.network_interval, Some(TIMER_INTERVAL_NETWORK_BACKOFF));
+        assert!(plan.cpu_mem);
+        assert!(plan.auto_update);
+        assert!(plan.memory_maintenance);
+    }
+
+    #[test]
+    fn test_timer_plan_normal_online_uses_regular_network_interval() {
+        let plan = timer_plan(false, false, false);
+        assert_eq!(plan.network_interval, Some(TIMER_INTERVAL_NETWORK));
+        assert!(plan.cpu_mem);
+        assert!(plan.auto_update);
+        assert!(plan.memory_maintenance);
     }
 }

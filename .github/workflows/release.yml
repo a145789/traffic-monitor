@@ -13,26 +13,17 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout tag
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
       - name: Extract version from tag
         id: version
         shell: bash
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          shared-key: release
+          cache-key: release
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Cache Inno Setup
         id: cache-is

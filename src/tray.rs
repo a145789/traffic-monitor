@@ -17,7 +17,7 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::config::{
     APP_NAME, MENU_ID_AUTO_UPDATE_TOGGLE, MENU_ID_AUTOSTART, MENU_ID_CHECK_UPDATE_MANUAL,
-    MENU_ID_EXIT, VERSION, WM_APP_TRAY,
+    MENU_ID_EXIT, REG_PATH_RUN, VERSION, WM_APP_TRAY,
 };
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
@@ -226,15 +226,13 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
 
 fn is_autostart_enabled() -> bool {
     windows_registry::CURRENT_USER
-        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .open(REG_PATH_RUN)
         .and_then(|key| key.get_string(APP_NAME))
         .is_ok()
 }
 
 fn toggle_autostart() {
-    if let Ok(key) =
-        windows_registry::CURRENT_USER.create("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-    {
+    if let Ok(key) = windows_registry::CURRENT_USER.create(REG_PATH_RUN) {
         if is_autostart_enabled() {
             let _ = key.remove_value(APP_NAME);
         } else if let Ok(exe_path) = std::env::current_exe() {

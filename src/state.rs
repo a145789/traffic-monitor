@@ -10,6 +10,8 @@
 //! [`SuspendReasons`] 的方法上，调用方不得绕过 API 直接操作内部原子量。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 /// 系统睡眠导致暂停。
 pub const SUSPEND_REASON_SYSTEM: u32 = 1 << 0;
@@ -72,6 +74,25 @@ pub static CPU_USAGE: AtomicU32 = AtomicU32::new(0);
 
 /// 内存使用率（0-100）。读写：Relaxed。
 pub static MEM_USAGE: AtomicU32 = AtomicU32::new(0);
+
+/// 工作集修剪簿记。
+///
+/// 跨线程共享（Mutex 保护）：UI 线程的维护定时器与挂起/初始化路径、
+/// 更新工作线程的 `compact_and_trim` 都会写入，不能放 thread_local。
+#[derive(Default)]
+pub struct TrimBookkeeping {
+    /// 上次执行 trim 的时刻；None 表示本进程尚未 trim 过。
+    pub last_trim_at: Option<Instant>,
+    /// 刚执行过 trim，等待下一个维护周期采样 fault-back 后的稳态工作集。
+    pub pending_baseline: bool,
+    /// 最近一次采样的稳态工作集（字节）；0 表示尚无基线，
+    /// 此时仅按绝对最低门槛判断是否 trim。
+    pub steady_state_bytes: u64,
+}
+
+/// 全局修剪簿记实例。锁内只做字段赋值，无阻塞调用，竞争开销可忽略。
+pub static TRIM_BOOKKEEPING: LazyLock<Mutex<TrimBookkeeping>> =
+    LazyLock::new(|| Mutex::new(TrimBookkeeping::default()));
 
 #[cfg(test)]
 mod tests {

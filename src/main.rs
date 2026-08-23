@@ -35,9 +35,9 @@ use windows::core::{PCWSTR, w};
 
 use crate::collector::{collect_cpu, collect_memory, collect_network, init_network_listener};
 use crate::config::{
-    LOWORD_MASK, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK,
-    TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED,
-    WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
+    LOWORD_MASK, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
+    TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK, TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY,
+    WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
 use crate::state::{
@@ -51,7 +51,7 @@ use crate::tray::{create_tray_icon, remove_tray_icon};
 use crate::update::{
     init_cleanup_temp, load_auto_update_enabled, start_auto_check, subprocess_main,
 };
-use crate::util::{show_error, trim_working_set};
+use crate::util::{show_error, trim_working_set, trim_working_set_if_needed};
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
     register_watchdog_class, register_window_class, update_taskbar_position,
@@ -164,9 +164,10 @@ fn main() {
 
     register_power_notify(hwnd);
 
+    // 嵌入失败不中止启动：看门狗会在 TaskbarCreated 广播时再次尝试嵌入，
+    // 此处先完成托盘/定时器等其余常驻功能，避免留下零定时器的活窗口。
     if !embed_in_taskbar(hwnd) {
         show_error("嵌入任务栏失败。请确认 explorer.exe 正在运行。");
-        return;
     }
 
     let auto_update = load_auto_update_enabled();
@@ -323,9 +324,9 @@ fn rebuild_main_window() {
 
     remove_tray_icon();
 
+    // 嵌入失败同样不中止恢复：托盘与定时器必须重建，嵌入交给后续广播重试。
     if !embed_in_taskbar(hwnd) {
         show_error("Explorer 重启后嵌入任务栏失败");
-        return;
     }
 
     create_tray_icon(hwnd);
@@ -373,10 +374,15 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_NETWORK => {
             if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-                update_taskbar_position(hwnd);
+                // 任务栏通知区域变化时，即使数值不变也必须刷新新位置的画布。
+                let position_changed = update_taskbar_position(hwnd);
                 collect_network();
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                if position_changed {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                } else {
+                    renderer::invalidate_if_values_changed(hwnd);
                 }
             }
         }
@@ -384,9 +390,17 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
                 let _ = collect_cpu();
                 collect_memory();
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+                renderer::invalidate_if_values_changed(hwnd);
+            }
+        }
+        TIMER_ID_AUTO_UPDATE => {
+            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
+                start_auto_check(hwnd);
+            }
+        }
+        TIMER_ID_MEMORY_MAINTENANCE => {
+            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
+                trim_working_set_if_needed();
             }
         }
         _ => {}
@@ -433,6 +447,9 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             // SAFETY: OS 保证 lparam 指向 NUL 结尾宽字符串（或 null）。
             if unsafe { is_immersive_color_set(lparam) } {
                 renderer::with_renderer(|r| r.update_text_color());
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
             LRESULT(0)
         }
@@ -440,6 +457,9 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_DPICHANGED => {
             renderer::with_renderer(|r| r.update_dpi(hwnd));
             let _ = embed_in_taskbar(hwnd);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
             LRESULT(0)
         }
 

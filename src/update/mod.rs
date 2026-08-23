@@ -25,13 +25,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_MAX_BYTES, VERSION,
-    VERSION_METADATA_MAX_BYTES, WM_USER_UPDATE_ACTION,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_MAX_BYTES, REG_PATH_APP,
+    VERSION, VERSION_METADATA_MAX_BYTES, WM_USER_UPDATE_ACTION,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{
-    compact_and_trim, reg_read_dword, reg_write_dword, show_error, show_info, to_wide,
+    compact_and_trim, configure_background_process, reg_read_dword, reg_read_string,
+    reg_write_dword, reg_write_string, show_error, show_info, to_wide,
 };
 
 use crypto::{compute_sha256_hex, compute_sha256_hex_file};
@@ -40,13 +41,27 @@ use version::{compare_versions, parse_update_metadata};
 
 const UPDATE_ACTION_EXIT_MAIN: usize = 1;
 
-const VERSION_HOST: &str = "github.com";
-const VERSION_PATH: &str = "/a145789/traffic-monitor/releases/latest/download/version.txt";
-const DOWNLOAD_HOST: &str = "github.com";
+/// 仓库唯一来源：所有 GitHub 路径与 URL 均从这里派生，更换仓库只需改这一处。
+/// 以宏而非 const 定义，因为 `concat!` 只接受字面量。
+macro_rules! repo_owner_name {
+    () => {
+        "a145789/traffic-monitor"
+    };
+}
+const GITHUB_HOST: &str = "github.com";
 const PROXY_HOST: &str = "ghproxy.cn";
-const GITHUB_BASE: &str = "https://github.com/a145789/traffic-monitor";
-const RELEASE_PAGE_URL: &str = "https://github.com/a145789/traffic-monitor/releases";
+const GITHUB_REPOSITORY_URL: &str = concat!("https://github.com/", repo_owner_name!());
+const RELEASE_PAGE_URL: &str = concat!("https://github.com/", repo_owner_name!(), "/releases");
+const VERSION_PATH: &str = concat!(
+    "/",
+    repo_owner_name!(),
+    "/releases/latest/download/version.txt"
+);
 const TEMP_FILE_NAME: &str = "traffic-monitor-setup-temp.exe";
+
+/// 用户在更新确认框点「否」后记住的版本号（REG_SZ）。
+/// 后续自动检查遇到同一版本不再弹框，直到出现更新的版本。
+const REG_VALUE_SKIPPED_VERSION: &str = "SkippedUpdateVersion";
 
 /// 安装器文件以只读共享模式打开，阻止其他进程改写已校验文件。
 const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
@@ -54,14 +69,14 @@ const FILE_SHARE_READ_ONLY: u32 = 0x0000_0001;
 static LAST_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn load_auto_update_enabled() -> bool {
-    reg_read_dword("Software\\Traffic Monitor", "EnableAutoUpdate")
+    reg_read_dword(REG_PATH_APP, "EnableAutoUpdate")
         .map(|v| v != 0)
         .unwrap_or(true)
 }
 
 pub fn save_auto_update_enabled(enabled: bool) {
     reg_write_dword(
-        "Software\\Traffic Monitor",
+        REG_PATH_APP,
         "EnableAutoUpdate",
         if enabled { 1 } else { 0 },
     );
@@ -73,6 +88,17 @@ fn get_temp_installer_path() -> std::path::PathBuf {
     std::path::PathBuf::from(local_appdata)
         .join("Traffic Monitor")
         .join(TEMP_FILE_NAME)
+}
+
+/// 读取用户明确拒绝过的更新版本号；无记录返回 None。
+fn read_skipped_version() -> Option<String> {
+    reg_read_string(REG_PATH_APP, REG_VALUE_SKIPPED_VERSION)
+}
+
+/// 记住被拒绝的版本号，避免自动检查周期性重复弹同一版本的确认框；
+/// 出现更新的版本后仍会正常提示。由子进程写入（与弹窗交互同进程）。
+fn record_skipped_version(version: &str) {
+    reg_write_string(REG_PATH_APP, REG_VALUE_SKIPPED_VERSION, version);
 }
 
 /// 判断当前可执行文件是否位于安装版目录（父目录存在 `unins000.exe`）。
@@ -218,12 +244,12 @@ enum InstallerLaunch {
     Failed(u32),
 }
 
-fn do_update_check() -> CheckResult {
-    let mut response = fetch_url(VERSION_HOST, VERSION_PATH, true, VERSION_METADATA_MAX_BYTES);
+fn do_update_check(is_manual: bool) -> CheckResult {
+    let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, true, VERSION_METADATA_MAX_BYTES);
     if response.is_err() {
         // 失败时增加 1 次重试，并等待 500ms 防止抖动
         std::thread::sleep(std::time::Duration::from_millis(500));
-        response = fetch_url(VERSION_HOST, VERSION_PATH, true, VERSION_METADATA_MAX_BYTES);
+        response = fetch_url(GITHUB_HOST, VERSION_PATH, true, VERSION_METADATA_MAX_BYTES);
     }
 
     let response = match response {
@@ -248,13 +274,19 @@ fn do_update_check() -> CheckResult {
         return CheckResult::NoUpdate;
     }
 
+    // 自动检查跳过用户明确拒绝过的版本，且在下载前早退以省流量；
+    // 手动检查不受限（用户主动发起，理应给出完整结果）。
+    if !is_manual && read_skipped_version().as_deref() == Some(latest_version.as_str()) {
+        return CheckResult::NoUpdate;
+    }
+
     if !is_installed_version() {
         return CheckResult::PortableFound(latest_version.to_string());
     }
 
-    let download_path = format!(
-        "/a145789/traffic-monitor/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
-    );
+    let asset_path =
+        format!("releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe");
+    let download_path = format!("/{}/{asset_path}", repo_owner_name!());
 
     let temp_path = get_temp_installer_path();
 
@@ -284,12 +316,10 @@ fn do_update_check() -> CheckResult {
     }
 
     // 主源失败时回落到代理源；两者都失败时报组合错误。
-    let installer_data = match fetch_url(DOWNLOAD_HOST, &download_path, true, INSTALLER_MAX_BYTES) {
+    let installer_data = match fetch_url(GITHUB_HOST, &download_path, true, INSTALLER_MAX_BYTES) {
         Ok(data) => data,
         Err(e) => {
-            let proxy_path = format!(
-                "/{GITHUB_BASE}/releases/download/v{latest_version}/TrafficMonitor-Setup-{latest_version}.exe"
-            );
+            let proxy_path = format!("/{GITHUB_REPOSITORY_URL}/{asset_path}");
             match fetch_url(PROXY_HOST, &proxy_path, true, INSTALLER_MAX_BYTES) {
                 Ok(data) => data,
                 Err(pe) => {
@@ -345,7 +375,10 @@ fn do_update_check() -> CheckResult {
 /// 退出码：0 = 检查流程成功完成，1 = 更新检查失败。手动检查失败时，错误提示
 /// 已由子进程显示；退出码只供主进程决定自动检查的重试冷却时间。
 pub fn subprocess_main(is_manual: bool) -> i32 {
-    let result = do_update_check();
+    // EcoQoS/低内存优先级只加给本短生命周期子进程，不拖慢常驻监控主进程。
+    configure_background_process();
+
+    let result = do_update_check(is_manual);
     let is_error = matches!(result, CheckResult::Error(_));
     let action = complete_update_interaction(result, is_manual);
     let line = match action {
@@ -370,6 +403,8 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
             let msg = format!("发现新版本 v{version}。\n是否打开网页下载免安装版？");
             if show_yes_no(&msg) {
                 open_url(RELEASE_PAGE_URL);
+            } else {
+                record_skipped_version(&version);
             }
             UpdateAction::Done
         }
@@ -379,6 +414,7 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
                 verified.version
             );
             if !show_yes_no(&msg) {
+                record_skipped_version(&verified.version);
                 return UpdateAction::Done;
             }
 

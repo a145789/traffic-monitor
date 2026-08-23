@@ -1,0 +1,23 @@
+name: Rust setup
+description: Checkout 仓库并安装 Rust 工具链与 Cargo 缓存（check / release 共用）
+
+inputs:
+  cache-key:
+    description: Swatinem/rust-cache 的 shared-key
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}

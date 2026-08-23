@@ -1,0 +1,3 @@
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+# Enable Control Flow Guard metadata for MSVC targets only.
+rustflags = ["-C", "control-flow-guard=yes"]

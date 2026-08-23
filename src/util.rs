@@ -1,10 +1,23 @@
+use std::time::Instant;
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
-use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, ProcessMemoryPriority, ProcessPowerThrottling,
+    SetProcessInformation, SetProcessWorkingSetSize,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW,
 };
 use windows::core::PCWSTR;
 use windows_registry::CURRENT_USER;
+
+use crate::config::{
+    WORKING_SET_TRIM_BASELINE_GROWTH_PCT, WORKING_SET_TRIM_COOLDOWN_SECS,
+    WORKING_SET_TRIM_MIN_BYTES,
+};
+use crate::state::TRIM_BOOKKEEPING;
 
 /// 业务字符串 → NUL 结尾 UTF-16。Win32 API 的标准入口。
 ///
@@ -71,6 +84,43 @@ pub fn show_info(msg: &str) {
     }
 }
 
+/// 将进程标记为低优先级后台工作，并降低其默认内存优先级。
+///
+/// 仅用于 `--check-update` 短生命周期子进程：主进程是任务栏常显窗口，
+/// 显式 EcoQoS 会把它钉进效率核/低频调度类并拖慢 1s 采样与 GDI 绘制。
+/// 子进程的内存优先级本就继承自父进程，EcoQoS 则必须显式设置。
+///
+/// 这是最佳努力设置：旧系统或策略限制导致设置失败时不影响功能。
+pub fn configure_background_process() {
+    // SAFETY: 两个结构体均为 Win32 API 要求的固定布局，指针只在同步调用期间有效；
+    // 当前进程伪句柄无需关闭。
+    unsafe {
+        let process = GetCurrentProcess();
+
+        let power = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let _ = SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            &power as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+
+        let memory = MEMORY_PRIORITY_INFORMATION {
+            MemoryPriority: MEMORY_PRIORITY_LOW,
+        };
+        let _ = SetProcessInformation(
+            process,
+            ProcessMemoryPriority,
+            &memory as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        );
+    }
+}
+
 pub fn reg_read_dword(subkey: &str, value_name: &str) -> Option<u32> {
     CURRENT_USER
         .open(subkey)
@@ -85,15 +135,91 @@ pub fn reg_write_dword(subkey: &str, value_name: &str, value: u32) -> bool {
         .is_ok()
 }
 
-/// 修剪当前进程工作集（物理页面退到 Standby List）。
+pub fn reg_read_string(subkey: &str, value_name: &str) -> Option<String> {
+    CURRENT_USER
+        .open(subkey)
+        .and_then(|key| key.get_string(value_name))
+        .ok()
+}
+
+pub fn reg_write_string(subkey: &str, value_name: &str, value: &str) -> bool {
+    CURRENT_USER
+        .create(subkey)
+        .and_then(|key| key.set_string(value_name, value))
+        .is_ok()
+}
+
+/// 修剪当前进程工作集（物理页面退到 Standby List），并更新共享 trim 簿记。
 ///
 /// 与 `compact_and_trim` 的区别：本函数**不**压缩堆，适合挂起、初始化后等
 /// 周期性/一次性场景调用，不会引发工作集反弹。
+///
+/// 所有调用方（维护定时器水位门、INIT_TRIM 一次性定时器、挂起路径、更新线程的
+/// `compact_and_trim`）都经由本函数写入簿记，保证冷却时间戳与稳态基线全进程唯一。
 pub fn trim_working_set() {
     // SAFETY: GetCurrentProcess() 返回当前进程伪句柄，不需关闭；
     // (usize::MAX, usize::MAX) 是系统约定的工作集修剪命令。
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+
+    if let Ok(mut book) = TRIM_BOOKKEEPING.lock() {
+        book.last_trim_at = Some(Instant::now());
+        // 立即采样读到的是接近零的瞬时值，须等下个维护周期 fault-back 后再测稳态。
+        book.pending_baseline = true;
+    }
+}
+
+/// 实际触发阈值：max(绝对最低门槛, 稳态基线 × 增长系数)。
+fn trim_threshold(steady_state_bytes: u64) -> u64 {
+    let baseline_based =
+        steady_state_bytes.saturating_mul(WORKING_SET_TRIM_BASELINE_GROWTH_PCT) / 100;
+    baseline_based.max(WORKING_SET_TRIM_MIN_BYTES as u64)
+}
+
+/// 工作集超过自适应水位且距上次 trim 足够久时，归还冷物理页。
+///
+/// 使用 K32 前缀版本直接调用 Kernel32，避免加载旧版 Psapi 包装 DLL；水位与冷却
+/// 双重限制避免将热页周期性踢出后再次 fault-in。阈值基于上次实测稳态基线校准：
+/// 静态固定值若低于本进程稳态工作集，会造成每个冷却期的周期性全量清洗。
+pub fn trim_working_set_if_needed() {
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    let counters_size = counters.cb;
+
+    // SAFETY: 当前进程伪句柄有效；counters 是与 cb 匹配的栈上可写结构体。
+    let working_set = unsafe {
+        let success =
+            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters_size).as_bool();
+        if success {
+            counters.WorkingSetSize as u64
+        } else {
+            return;
+        }
+    };
+
+    let Ok(mut book) = TRIM_BOOKKEEPING.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if book.last_trim_at.is_some_and(|t| {
+        now.saturating_duration_since(t).as_secs() < WORKING_SET_TRIM_COOLDOWN_SECS
+    }) {
+        return;
+    }
+
+    // 冷却期内（含刚 trim 后的第一个维护 tick）优先补采稳态基线，
+    // 此时 fault-back 已基本完成，读数代表进程实际需要的常驻页。
+    if book.pending_baseline {
+        book.pending_baseline = false;
+        book.steady_state_bytes = working_set;
+    }
+
+    if working_set >= trim_threshold(book.steady_state_bytes) {
+        drop(book);
+        trim_working_set();
     }
 }
 
@@ -109,6 +235,8 @@ pub fn trim_working_set() {
 /// 仅在更新检查等「大量临时堆分配已全部释放」的场景中调用；**不可**用于常规
 /// 周期性 trim，否则会因过度 decommit 导致后续正常分配反复 recommit 页面，
 /// 造成工作集反弹到更高水位。
+///
+/// 经由 `trim_working_set` 收口写入共享簿记，与 UI 线程的水位门共享冷却时钟。
 pub fn compact_and_trim() {
     // SAFETY:
     // 1. GetProcessHeaps(None) 返回进程堆数量，无副作用。
@@ -183,5 +311,28 @@ mod tests {
         // 恰好填满缓冲区时不应溢出。
         let result = utf16::<3>("ab");
         assert_eq!(result, [b'a' as u16, b'b' as u16, 0]);
+    }
+
+    // ===== trim_threshold =====
+
+    #[test]
+    fn test_trim_threshold_without_baseline_uses_floor() {
+        assert_eq!(trim_threshold(0), WORKING_SET_TRIM_MIN_BYTES as u64);
+    }
+
+    #[test]
+    fn test_trim_threshold_baseline_below_floor_is_clamped() {
+        // 基线 ×2 仍低于最低门槛时不放大缺页风险，取门槛值。
+        let low = (WORKING_SET_TRIM_MIN_BYTES / 3) as u64;
+        assert_eq!(trim_threshold(low), WORKING_SET_TRIM_MIN_BYTES as u64);
+    }
+
+    #[test]
+    fn test_trim_threshold_grows_with_baseline() {
+        let baseline = WORKING_SET_TRIM_MIN_BYTES as u64 * 4;
+        assert_eq!(
+            trim_threshold(baseline),
+            baseline * WORKING_SET_TRIM_BASELINE_GROWTH_PCT / 100
+        );
     }
 }
