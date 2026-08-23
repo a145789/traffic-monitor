@@ -393,15 +393,13 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 renderer::invalidate_if_values_changed(hwnd);
             }
         }
-        TIMER_ID_AUTO_UPDATE => {
-            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-                start_auto_check(hwnd);
-            }
+        TIMER_ID_AUTO_UPDATE if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) => {
+            start_auto_check(hwnd);
         }
-        TIMER_ID_MEMORY_MAINTENANCE => {
-            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-                trim_working_set_if_needed();
-            }
+        TIMER_ID_MEMORY_MAINTENANCE
+            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) =>
+        {
+            trim_working_set_if_needed();
         }
         _ => {}
     }

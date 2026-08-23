@@ -71,7 +71,7 @@ cargo clippy -- -D warnings     # 验证 Clippy 无警告
 cargo fmt                       # 格式化代码
 ```
 
-_注：`unsafe` 须遵守本文件第 9 节风格约束；完整历史 policy 在 `docs/archive/unsafe-code-policy.md`，**仅当用户要求时再读**。上述构建、Clippy 和格式化校验仅在修改了 Rust 相关的源码文件时才需要执行。_
+_注：`unsafe` 须遵守本文件第 9 节风格约束；完整历史 policy 在 `docs/archive/unsafe-code-policy.md`，**仅当用户要求时再读**。上述构建、Clippy 和格式化校验仅在修改了 Rust 相关的源码文件时才需要执行。CI（check.yml）使用 `dtolnay/rust-toolchain@stable` 即**最新 stable** 工具链，本地工具链落后时 clippy 可能通过而 CI 挂在新 lint 上；提交前若跨过 Rust 小版本，建议 `rustup update stable` 后复跑 clippy。_
 
 ### 安装包与发布
 
