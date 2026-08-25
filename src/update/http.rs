@@ -6,7 +6,7 @@ use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::{PCWSTR, w};
 
-use crate::config::HTTP_READ_CHUNK_BYTES;
+use crate::config::{APP_TITLE, HTTP_READ_CHUNK_BYTES};
 use crate::util::to_wide;
 
 const HTTP_OK: u32 = 200;
@@ -64,7 +64,7 @@ pub(super) fn fetch_url(
     path: &str,
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    let agent = to_wide("Traffic Monitor");
+    let agent = to_wide(APP_TITLE);
     let host_wide = to_wide(host);
     let path_wide = to_wide(path);
 

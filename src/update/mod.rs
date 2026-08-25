@@ -20,7 +20,7 @@ use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONINFORMATION, MB_YESNO, MessageBoxW, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
+    IDYES, MB_ICONINFORMATION, MB_YESNO, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -31,7 +31,7 @@ use crate::config::{
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{
-    compact_and_trim, configure_background_process, reg_read_dword, reg_read_string,
+    compact_and_trim, configure_background_process, message_box, reg_read_dword, reg_read_string,
     reg_write_dword, reg_write_string, show_error, show_info, to_wide,
 };
 
@@ -522,20 +522,8 @@ pub fn handle_update_action(action: usize) {
 }
 
 fn show_yes_no(msg: &str) -> bool {
-    let title = to_wide("Traffic Monitor");
-    let msg_wide = to_wide(msg);
-    // SAFETY:
-    // title 和 msg_wide 均由 to_wide 创建，包含尾部 NUL，且缓冲区在同步调用
-    // MessageBoxW 返回前始终存活；None 表示对话框不依附其他窗口。
-    let result = unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(msg_wide.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_YESNO | MB_ICONINFORMATION,
-        )
-    };
-    result == windows::Win32::UI::WindowsAndMessaging::IDYES
+    // 复用 util 的统一 MessageBoxW 入口；返回 IDYES 表示用户选择「是」。
+    message_box(msg, MB_YESNO | MB_ICONINFORMATION) == IDYES
 }
 
 fn open_url(url: &str) {

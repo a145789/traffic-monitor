@@ -8,13 +8,13 @@ use windows::Win32::System::Threading::{
     SetProcessInformation, SetProcessWorkingSetSize,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW,
 };
 use windows::core::PCWSTR;
 use windows_registry::CURRENT_USER;
 
 use crate::config::{
-    WORKING_SET_TRIM_BASELINE_GROWTH_PCT, WORKING_SET_TRIM_COOLDOWN_SECS,
+    APP_TITLE, WORKING_SET_TRIM_BASELINE_GROWTH_PCT, WORKING_SET_TRIM_COOLDOWN_SECS,
     WORKING_SET_TRIM_MIN_BYTES,
 };
 use crate::state::TRIM_BOOKKEEPING;
@@ -56,8 +56,10 @@ pub fn module_instance() -> Result<windows::Win32::Foundation::HINSTANCE, String
         .map_err(|e| format!("获取模块句柄失败: {e:?}"))
 }
 
-pub fn show_error(msg: &str) {
-    let title = to_wide("Traffic Monitor");
+/// 统一的 MessageBoxW 入口：所有弹窗都经由本函数创建，避免各处重复拼装
+/// 标题/正文宽字符串。`style` 直接透传 Win32 组合标志，返回用户选择结果。
+pub fn message_box(msg: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let title = to_wide(APP_TITLE);
     let msg_wide = to_wide(msg);
     // SAFETY: title/msg_wide 含尾 NUL，在 MessageBoxW 返回前存活。
     unsafe {
@@ -65,23 +67,17 @@ pub fn show_error(msg: &str) {
             None,
             PCWSTR(msg_wide.as_ptr()),
             PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONERROR,
-        );
+            style,
+        )
     }
 }
 
+pub fn show_error(msg: &str) {
+    message_box(msg, MB_OK | MB_ICONERROR);
+}
+
 pub fn show_info(msg: &str) {
-    let title = to_wide("Traffic Monitor");
-    let msg_wide = to_wide(msg);
-    // SAFETY: 同上。
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(msg_wide.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
+    message_box(msg, MB_OK | MB_ICONINFORMATION);
 }
 
 /// 将进程标记为低优先级后台工作，并降低其默认内存优先级。
@@ -146,6 +142,13 @@ pub fn reg_write_string(subkey: &str, value_name: &str, value: &str) -> bool {
     CURRENT_USER
         .create(subkey)
         .and_then(|key| key.set_string(value_name, value))
+        .is_ok()
+}
+
+pub fn reg_remove_value(subkey: &str, value_name: &str) -> bool {
+    CURRENT_USER
+        .open(subkey)
+        .and_then(|key| key.remove_value(value_name))
         .is_ok()
 }
 
