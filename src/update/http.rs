@@ -62,7 +62,6 @@ fn friendly_error(op: &str, err: windows::core::Error) -> String {
 pub(super) fn fetch_url(
     host: &str,
     path: &str,
-    secure: bool,
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     let agent = to_wide("Traffic Monitor");
@@ -103,11 +102,7 @@ pub(super) fn fetch_url(
         let _ = WinHttpSetTimeouts(handles.h_session, 15000, 15000, 15000, 15000);
     }
 
-    let port = if secure {
-        INTERNET_DEFAULT_HTTPS_PORT
-    } else {
-        INTERNET_DEFAULT_HTTP_PORT
-    };
+    let port = INTERNET_DEFAULT_HTTPS_PORT;
 
     // SAFETY:
     // handles.h_session 有效；host_wide 是有效的 NUL 终止宽字符串。
@@ -134,11 +129,7 @@ pub(super) fn fetch_url(
             None,
             None,
             std::ptr::null(),
-            if secure {
-                WINHTTP_FLAG_SECURE
-            } else {
-                Default::default()
-            },
+            WINHTTP_FLAG_SECURE,
         )
     };
     if handles.h_request.is_null() {

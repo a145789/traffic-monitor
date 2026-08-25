@@ -245,11 +245,11 @@ enum InstallerLaunch {
 }
 
 fn do_update_check(is_manual: bool) -> CheckResult {
-    let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, true, VERSION_METADATA_MAX_BYTES);
+    let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     if response.is_err() {
         // 失败时增加 1 次重试，并等待 500ms 防止抖动
         std::thread::sleep(std::time::Duration::from_millis(500));
-        response = fetch_url(GITHUB_HOST, VERSION_PATH, true, VERSION_METADATA_MAX_BYTES);
+        response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     }
 
     let response = match response {
@@ -316,11 +316,11 @@ fn do_update_check(is_manual: bool) -> CheckResult {
     }
 
     // 主源失败时回落到代理源；两者都失败时报组合错误。
-    let installer_data = match fetch_url(GITHUB_HOST, &download_path, true, INSTALLER_MAX_BYTES) {
+    let installer_data = match fetch_url(GITHUB_HOST, &download_path, INSTALLER_MAX_BYTES) {
         Ok(data) => data,
         Err(e) => {
             let proxy_path = format!("/{GITHUB_REPOSITORY_URL}/{asset_path}");
-            match fetch_url(PROXY_HOST, &proxy_path, true, INSTALLER_MAX_BYTES) {
+            match fetch_url(PROXY_HOST, &proxy_path, INSTALLER_MAX_BYTES) {
                 Ok(data) => data,
                 Err(pe) => {
                     return CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"));

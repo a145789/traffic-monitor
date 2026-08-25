@@ -68,7 +68,6 @@ pub struct Renderer {
     old_font: HGDIOBJ,
     hbrush: HBRUSH,
     text_color: COLORREF,
-    font_size: i32,
     width: i32,
     height: i32,
     arrow_width: i32,
@@ -270,7 +269,6 @@ impl Renderer {
             old_font,
             hbrush: brush.into_raw(),
             text_color: COLORREF(COLOR_LIGHT_TEXT),
-            font_size: FONT_BASE_SIZE,
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
             arrow_width,
@@ -294,10 +292,10 @@ impl Renderer {
 
     fn format_cpu_mem_wide<'a>(buf: &'a mut Vec<u16>, label: &str, value: u32) -> &'a mut [u16] {
         buf.clear();
-        push_ascii(buf, label);
-        push_ascii(buf, ": ");
+        buf.extend(label.encode_utf16());
+        buf.extend(": ".encode_utf16());
         write_u32(buf, value);
-        push_ascii(buf, "%");
+        buf.extend("%".encode_utf16());
         buf.push(0);
         buf
     }
@@ -306,20 +304,20 @@ impl Renderer {
         buf.clear();
         if bytes_per_sec < 1024 {
             write_u32(buf, bytes_per_sec);
-            push_ascii(buf, " B/s");
+            buf.extend(" B/s".encode_utf16());
         } else if bytes_per_sec < 1024 * 1024 {
             // 整数定点：乘 10 后加半除数四舍五入，得到十分位精度值。
             let x = ((bytes_per_sec as u64 * 10 + 512) / 1024) as u32;
             write_u32(buf, x / 10);
             buf.push(b'.' as u16);
             buf.push((b'0' + (x % 10) as u8) as u16);
-            push_ascii(buf, " KB/s");
+            buf.extend(" KB/s".encode_utf16());
         } else {
             let x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
             write_u32(buf, x / 10);
             buf.push(b'.' as u16);
             buf.push((b'0' + (x % 10) as u8) as u16);
-            push_ascii(buf, " MB/s");
+            buf.extend(" MB/s".encode_utf16());
         }
         buf.push(0);
         buf
@@ -472,7 +470,6 @@ impl Renderer {
         }
         self.hfont = new_font.into_raw();
 
-        self.font_size = font_size;
         self.width = width;
         self.height = height;
 
@@ -569,16 +566,10 @@ fn create_font(size: i32) -> HFONT {
     unsafe { CreateFontIndirectW(&lf) }
 }
 
-pub fn is_system_light_theme() -> bool {
+fn is_system_light_theme() -> bool {
     reg_read_dword(REG_PATH_PERSONALIZE, "SystemUsesLightTheme")
         .map(|v| v == 1)
         .unwrap_or(false)
-}
-
-fn push_ascii(buf: &mut Vec<u16>, s: &str) {
-    for b in s.bytes() {
-        buf.push(b as u16);
-    }
 }
 
 fn write_u32(buf: &mut Vec<u16>, mut n: u32) {
@@ -676,16 +667,5 @@ mod tests {
         let mut buf = Vec::new();
         write_u32(&mut buf, u32::MAX);
         assert_eq!(wide_to_string(&buf), "4294967295");
-    }
-
-    // ===== push_ascii =====
-
-    #[test]
-    fn test_push_ascii_roundtrip() {
-        let mut buf = Vec::new();
-        push_ascii(&mut buf, "CPU: ");
-        push_ascii(&mut buf, "100");
-        push_ascii(&mut buf, "%");
-        assert_eq!(wide_to_string(&buf), "CPU: 100%");
     }
 }

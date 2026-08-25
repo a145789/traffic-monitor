@@ -13,8 +13,8 @@ static CPU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// 采样 `GetSystemTimes`，更新 `CPU_USAGE`。
 ///
 /// 由 `TIMER_ID_CPU_MEM` 调用；首轮仅建立基线，不产生有效差分。
-/// 返回 `true` 表示本周期得到有效差分；首轮初始化或 API/差分失败时返回 `false`。
-pub fn collect_cpu() -> bool {
+/// API 调用失败或本周期差分为 0 时保持上次展示值不变。
+pub fn collect_cpu() {
     let mut idle_time = 0u64;
     let mut kernel_time = 0u64;
     let mut user_time = 0u64;
@@ -30,7 +30,7 @@ pub fn collect_cpu() -> bool {
     };
 
     if !ok {
-        return false;
+        return;
     }
 
     if !CPU_INITIALIZED.load(Ordering::Acquire) {
@@ -38,7 +38,7 @@ pub fn collect_cpu() -> bool {
         PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
         PREV_USER_TIME.store(user_time, Ordering::Relaxed);
         CPU_INITIALIZED.store(true, Ordering::Release);
-        return false;
+        return;
     }
 
     let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Relaxed));
@@ -52,12 +52,11 @@ pub fn collect_cpu() -> bool {
     // GetSystemTimes 的 kernel 时间包含 idle，total = kernel + user 为全部时钟滴答。
     let total = kernel_diff + user_diff;
     if total == 0 {
-        return false;
+        return;
     }
 
     let usage = ((total - idle_diff) * 100 / total).min(100) as u32;
     CPU_USAGE.store(usage, Ordering::Relaxed);
-    true
 }
 
 pub fn collect_memory() {
