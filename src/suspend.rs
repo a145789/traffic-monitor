@@ -8,10 +8,12 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
 };
+use windows::Win32::System::Power::POWERBROADCAST_SETTING;
 use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowRect, KillTimer,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SetCoalescableTimer,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use crate::config::{
@@ -26,17 +28,6 @@ use crate::state::{
 };
 use crate::util::{trim_working_set, utf16};
 use crate::window::get_taskbar_hwnd;
-
-const WTS_SESSION_LOCK: usize = 0x7;
-const WTS_SESSION_UNLOCK: usize = 0x8;
-
-#[repr(C)]
-#[allow(non_snake_case)]
-struct POWERBROADCAST_SETTING {
-    PowerSetting: windows::core::GUID,
-    DataLength: u32,
-    Data: [u8; 1],
-}
 
 pub fn is_suspended() -> bool {
     SUSPEND_REASONS.is_suspended()
@@ -100,7 +91,7 @@ pub fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRE
 
 /// WM_WTSSESSION_CHANGE 处理：锁屏/解锁。
 pub fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
-    match wparam.0 {
+    match wparam.0 as u32 {
         WTS_SESSION_LOCK => {
             suspend_system(hwnd, SUSPEND_REASON_SESSION);
         }

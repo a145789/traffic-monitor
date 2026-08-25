@@ -388,7 +388,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_CPU_MEM => {
             if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
-                let _ = collect_cpu();
+                collect_cpu();
                 collect_memory();
                 renderer::invalidate_if_values_changed(hwnd);
             }
