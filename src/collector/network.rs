@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
@@ -28,12 +27,10 @@ static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// 主窗口句柄（isize 存储），断网/恢复时向 UI 线程投递消息。
 static MAIN_HWND_NETWORK: AtomicIsize = AtomicIsize::new(0);
 
-type BlacklistCache = Option<(Rc<HashSet<u64>>, Instant)>;
-
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
-    static VIRTUAL_BLACKLIST: RefCell<BlacklistCache> = const { RefCell::new(None) };
+    static VIRTUAL_BLACKLIST: RefCell<Option<(HashSet<u64>, Instant)>> = const { RefCell::new(None) };
 }
 
 pub fn init_network_listener(hwnd: HWND) {
@@ -79,64 +76,66 @@ pub fn collect_network() {
     }
 
     let table_wrapper = MibTable(table);
-    let virtual_blacklist = get_virtual_blacklist();
-    let mut has_up_interface = false;
 
-    CURRENT_DATA.with(|cell| {
-        let mut current_data = cell.borrow_mut();
-        current_data.clear();
+    with_virtual_blacklist(|virtual_blacklist| {
+        let mut has_up_interface = false;
 
-        for row in table_wrapper.rows() {
-            if !is_valid_interface(row) {
-                continue;
-            }
+        CURRENT_DATA.with(|cell| {
+            let mut current_data = cell.borrow_mut();
+            current_data.clear();
 
-            // SAFETY: 系统已初始化的 InterfaceLuid 联合体，只读 Value。
-            let luid = unsafe { row.InterfaceLuid.Value };
-            if virtual_blacklist.contains(&luid) {
-                continue;
-            }
-
-            if row.OperStatus == IfOperStatusUp {
-                has_up_interface = true;
-                current_data.insert(luid, (row.InOctets, row.OutOctets));
-            }
-        }
-
-        if !NET_INITIALIZED.load(Ordering::Acquire) {
-            // 首次采样：只记基线，不算速率。
-            let now = Instant::now();
-            INTERFACE_HISTORY.with(|hist| {
-                let mut history = hist.borrow_mut();
-                history.clear();
-                for (luid, (in_octets, out_octets)) in current_data.iter() {
-                    history.insert(*luid, (*in_octets, *out_octets, now));
+            for row in table_wrapper.rows() {
+                if !is_valid_interface(row) {
+                    continue;
                 }
-            });
-            NET_INITIALIZED.store(true, Ordering::Release);
-            return;
-        }
 
-        let now = Instant::now();
-        let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
-            .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
+                // SAFETY: 系统已初始化的 InterfaceLuid 联合体，只读 Value。
+                let luid = unsafe { row.InterfaceLuid.Value };
+                if virtual_blacklist.contains(&luid) {
+                    continue;
+                }
 
-        NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
-        NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
-
-        if best_speed_down == 0 && best_speed_up == 0 && !has_up_interface {
-            let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
-                NETWORK_BACKOFF.store(true, Ordering::Release);
-                post_to_main(WM_USER_NETWORK_DISCONNECTED);
+                if row.OperStatus == IfOperStatusUp {
+                    has_up_interface = true;
+                    current_data.insert(luid, (row.InOctets, row.OutOctets));
+                }
             }
-        } else {
-            CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
-            if NETWORK_BACKOFF.load(Ordering::Acquire) {
-                NETWORK_BACKOFF.store(false, Ordering::Release);
-                post_to_main(WM_USER_NETWORK_RECONNECTED);
+
+            if !NET_INITIALIZED.load(Ordering::Acquire) {
+                // 首次采样：只记基线，不算速率。
+                let now = Instant::now();
+                INTERFACE_HISTORY.with(|hist| {
+                    let mut history = hist.borrow_mut();
+                    history.clear();
+                    for (luid, (in_octets, out_octets)) in current_data.iter() {
+                        history.insert(*luid, (*in_octets, *out_octets, now));
+                    }
+                });
+                NET_INITIALIZED.store(true, Ordering::Release);
+                return;
             }
-        }
+
+            let now = Instant::now();
+            let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
+                .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
+
+            NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
+            NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
+
+            if best_speed_down == 0 && best_speed_up == 0 && !has_up_interface {
+                let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
+                    NETWORK_BACKOFF.store(true, Ordering::Release);
+                    post_to_main(WM_USER_NETWORK_DISCONNECTED);
+                }
+            } else {
+                CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
+                if NETWORK_BACKOFF.load(Ordering::Acquire) {
+                    NETWORK_BACKOFF.store(false, Ordering::Release);
+                    post_to_main(WM_USER_NETWORK_RECONNECTED);
+                }
+            }
+        });
     });
 }
 
@@ -260,40 +259,48 @@ fn build_virtual_blacklist() -> Option<HashSet<u64>> {
     Some(blacklist)
 }
 
-fn get_virtual_blacklist() -> Rc<HashSet<u64>> {
-    {
-        let cached = VIRTUAL_BLACKLIST.with(|cell| {
-            let cache = cell.borrow();
-            if let Some((list, last_refresh)) = cache.as_ref()
-                && last_refresh.elapsed().as_secs() < BLACKLIST_REFRESH_SECS
-            {
-                return Some(Rc::clone(list));
-            }
-            None
-        });
-        if let Some(list) = cached {
-            return list;
-        }
-    }
-
-    match build_virtual_blacklist() {
-        Some(set) => {
-            let rc = Rc::new(set);
-            VIRTUAL_BLACKLIST.with(|cell| {
-                *cell.borrow_mut() = Some((Rc::clone(&rc), Instant::now()));
-            });
-            rc
-        }
-        None => VIRTUAL_BLACKLIST.with(|cell| {
+/// 在 UI 线程上以不可变借用读取黑名单；过期时先就地重建缓存。
+///
+/// 闭包执行期间持有 `VIRTUAL_BLACKLIST` 的不可变借用，闭包内禁止再次调用本函数。
+fn with_virtual_blacklist<R>(f: impl FnOnce(&HashSet<u64>) -> R) -> R {
+    VIRTUAL_BLACKLIST.with(|cell| {
+        let now = Instant::now();
+        if blacklist_needs_refresh(&cell.borrow(), now) {
             let mut cache = cell.borrow_mut();
-            let old = cache
-                .as_ref()
-                .map(|(l, _)| Rc::clone(l))
-                .unwrap_or_else(|| Rc::new(HashSet::new()));
-            // 失败也刷新时间戳，避免每 tick 重试 GetAdaptersAddresses；沿用旧表一个缓存周期。
-            *cache = Some((Rc::clone(&old), Instant::now()));
-            old
-        }),
+            rebuild_virtual_blacklist(&mut cache, now, build_virtual_blacklist);
+        }
+
+        // 重建成功或失败回退后缓存必然为 Some；该分支只是类型层面的空名单兜底。
+        let cache = cell.borrow();
+        let Some((blacklist, _)) = cache.as_ref() else {
+            return f(&HashSet::new());
+        };
+        f(blacklist)
+    })
+}
+
+fn blacklist_needs_refresh(cache: &Option<(HashSet<u64>, Instant)>, now: Instant) -> bool {
+    cache.as_ref().is_none_or(|(_, last_refresh)| {
+        now.saturating_duration_since(*last_refresh).as_secs() >= BLACKLIST_REFRESH_SECS
+    })
+}
+
+/// 重建黑名单缓存：成功覆盖；失败保留旧表并刷新时间戳，沿用旧表一个缓存周期。
+fn rebuild_virtual_blacklist(
+    cache: &mut Option<(HashSet<u64>, Instant)>,
+    now: Instant,
+    rebuild: impl FnOnce() -> Option<HashSet<u64>>,
+) {
+    match rebuild() {
+        Some(set) => *cache = Some((set, now)),
+        None => {
+            // 失败也刷新时间戳，避免每 tick 重试 GetAdaptersAddresses。
+            if let Some((_, last_refresh)) = cache.as_mut() {
+                *last_refresh = now;
+            } else {
+                *cache = Some((HashSet::new(), now));
+            }
+        }
     }
 }
 
@@ -396,5 +403,69 @@ mod tests {
             "Realtek PCIe GbE Family Controller"
         ));
         assert!(!is_virtual_friendly_name("Killer Wi-Fi 6 AX1650"));
+    }
+
+    // ===== 黑名单缓存刷新语义 =====
+
+    #[test]
+    fn test_blacklist_needs_refresh_when_empty_or_stale() {
+        let now = Instant::now();
+
+        assert!(blacklist_needs_refresh(&None, now));
+        assert!(blacklist_needs_refresh(
+            &Some((
+                HashSet::new(),
+                now - std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS)
+            )),
+            now
+        ));
+        assert!(!blacklist_needs_refresh(&Some((HashSet::new(), now)), now));
+    }
+
+    #[test]
+    fn test_blacklist_refresh_success_replaces_cache() {
+        let old_time = Instant::now();
+        let mut cache = Some((HashSet::from([1]), old_time));
+        let now = old_time + std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS + 1);
+
+        rebuild_virtual_blacklist(&mut cache, now, || Some(HashSet::from([2])));
+
+        let (list, refreshed_at) = cache.as_ref().unwrap();
+        assert_eq!(list, &HashSet::from([2]));
+        assert!(*refreshed_at >= old_time);
+        assert!(!blacklist_needs_refresh(&cache, now));
+    }
+
+    #[test]
+    fn test_blacklist_refresh_failure_keeps_old_list_and_resets_timer() {
+        let old_time = Instant::now();
+        let mut cache = Some((HashSet::from([7]), old_time));
+        let now = old_time + std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS + 1);
+
+        let mut rebuild_calls = 0;
+        rebuild_virtual_blacklist(&mut cache, now, || {
+            rebuild_calls += 1;
+            None
+        });
+
+        // 失败路径必须保留旧表且只探测一次；刷新后的时间戳保证 30 秒内不会重试。
+        assert_eq!(rebuild_calls, 1);
+        let (list, refreshed_at) = cache.as_ref().unwrap();
+        assert_eq!(list, &HashSet::from([7]));
+        assert_eq!(*refreshed_at, now);
+        assert!(!blacklist_needs_refresh(&cache, now));
+    }
+
+    #[test]
+    fn test_blacklist_refresh_failure_without_old_list_stores_empty_list() {
+        let now = Instant::now();
+        let mut cache = None;
+
+        rebuild_virtual_blacklist(&mut cache, now, || None);
+
+        let (list, refreshed_at) = cache.as_ref().unwrap();
+        assert!(list.is_empty());
+        assert_eq!(*refreshed_at, now);
+        assert!(!blacklist_needs_refresh(&cache, now));
     }
 }
