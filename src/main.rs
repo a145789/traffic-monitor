@@ -51,7 +51,9 @@ use crate::tray::{create_tray_icon, remove_tray_icon};
 use crate::update::{
     init_cleanup_temp, load_auto_update_enabled, start_auto_check, subprocess_main,
 };
-use crate::util::{show_error, trim_working_set, trim_working_set_if_needed};
+use crate::util::{
+    set_low_memory_priority, show_error, trim_working_set, trim_working_set_if_needed,
+};
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
     register_watchdog_class, register_window_class, update_taskbar_position,
@@ -118,6 +120,10 @@ fn main() {
             return;
         }
     };
+
+    // 主进程常驻期间保持低内存优先级：内存紧张时 OS 优先回收本进程页面，
+    // 不影响 CPU 调度与核心选择；EcoQoS 仍只用于 --check-update 子进程。
+    set_low_memory_priority();
 
     // 首个顶层窗口创建前禁用进程 IME，避免更新弹窗焦点回落触发第三方 TSF 常驻。
     // SAFETY: ImmDisableIME(u32::MAX) 仅改本进程输入法状态；须在 CreateWindowExW 前调用。
