@@ -16,12 +16,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::config::{
-    APP_NAME, MENU_ID_AUTO_UPDATE_TOGGLE, MENU_ID_AUTOSTART, MENU_ID_CHECK_UPDATE_MANUAL,
-    MENU_ID_EXIT, REG_PATH_RUN, VERSION, WM_APP_TRAY,
+    APP_NAME, APP_TITLE, MENU_ID_AUTO_UPDATE_TOGGLE, MENU_ID_AUTOSTART,
+    MENU_ID_CHECK_UPDATE_MANUAL, MENU_ID_EXIT, REG_PATH_RUN, VERSION, WM_APP_TRAY,
 };
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
-use crate::util::{module_instance, to_wide};
+use crate::util::{module_instance, reg_read_string, reg_remove_value, reg_write_string, to_wide};
 
 thread_local! {
     static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) };
@@ -52,7 +52,7 @@ pub fn create_tray_icon(hwnd: HWND) {
     };
     nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
 
-    let tip = to_wide("Traffic Monitor");
+    let tip = to_wide(APP_TITLE);
     let copy_len = tip.len().min(nid.szTip.len());
     nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
 
@@ -89,7 +89,7 @@ fn build_menu_entries() -> Vec<MenuEntry> {
     vec![
         MenuEntry::Item {
             id: 0,
-            text: to_wide(&format!("Traffic Monitor v{VERSION}")),
+            text: to_wide(&format!("{APP_TITLE} v{VERSION}")),
             state: MFS_DISABLED.0,
         },
         MenuEntry::Separator,
@@ -225,21 +225,16 @@ pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
 }
 
 fn is_autostart_enabled() -> bool {
-    windows_registry::CURRENT_USER
-        .open(REG_PATH_RUN)
-        .and_then(|key| key.get_string(APP_NAME))
-        .is_ok()
+    reg_read_string(REG_PATH_RUN, APP_NAME).is_some()
 }
 
 fn toggle_autostart() {
-    if let Ok(key) = windows_registry::CURRENT_USER.create(REG_PATH_RUN) {
-        if is_autostart_enabled() {
-            let _ = key.remove_value(APP_NAME);
-        } else if let Ok(exe_path) = std::env::current_exe() {
-            let path_str = exe_path.to_string_lossy().to_string();
-            let path_quoted = format!("\"{path_str}\"");
-            let _ = key.set_string(APP_NAME, &path_quoted);
-        }
+    if is_autostart_enabled() {
+        reg_remove_value(REG_PATH_RUN, APP_NAME);
+    } else if let Ok(exe_path) = std::env::current_exe() {
+        let path_str = exe_path.to_string_lossy().to_string();
+        let path_quoted = format!("\"{path_str}\"");
+        reg_write_string(REG_PATH_RUN, APP_NAME, &path_quoted);
     }
 }
 

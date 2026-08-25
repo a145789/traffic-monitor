@@ -10,6 +10,8 @@ use windows::Win32::UI::WindowsAndMessaging::WM_USER;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const APP_NAME: &str = "TrafficMonitor";
+/// 用户可见显示标题：MessageBox、托盘 tip、HTTP User-Agent 等字符串的统一来源。
+pub const APP_TITLE: &str = "Traffic Monitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";
 pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
 /// 隐藏看门狗窗口类名：永不嵌入任务栏的顶层窗口，

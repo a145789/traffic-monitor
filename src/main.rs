@@ -173,8 +173,6 @@ fn main() {
     let auto_update = load_auto_update_enabled();
     ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Relaxed);
 
-    create_tray_icon(hwnd);
-
     match Renderer::new() {
         Ok(r) => renderer::set_renderer(r),
         Err(e) => {
@@ -184,16 +182,7 @@ fn main() {
         }
     }
 
-    renderer::with_renderer(|r| {
-        r.update_dpi(hwnd);
-        r.update_text_color();
-    });
-
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, false);
-    }
-
-    if !sync_monitoring_timers(hwnd) {
+    if !bind_display_and_timers(hwnd) {
         show_error("创建监测定时器失败");
         return;
     }
@@ -281,6 +270,23 @@ fn register_session_notification(hwnd: HWND) {
     }
 }
 
+/// 启动与 Explorer 重建共用的资源绑定尾段：托盘图标 → 渲染参数 → 窗口失效
+/// → 监测定时器。两条生命周期路径保持唯一实现，失败文案由各自调用方报告。
+fn bind_display_and_timers(hwnd: HWND) -> bool {
+    create_tray_icon(hwnd);
+
+    renderer::with_renderer(|r| {
+        r.update_dpi(hwnd);
+        r.update_text_color();
+    });
+
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+
+    sync_monitoring_timers(hwnd)
+}
+
 /// Explorer 重启后的主窗口完整重建。
 ///
 /// 不变量：任务栏销毁会级联销毁嵌入其中的跨进程子窗口（旧主窗口已死），
@@ -329,17 +335,7 @@ fn rebuild_main_window() {
         show_error("Explorer 重启后嵌入任务栏失败");
     }
 
-    create_tray_icon(hwnd);
-    renderer::with_renderer(|r| {
-        r.update_dpi(hwnd);
-        r.update_text_color();
-    });
-
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, false);
-    }
-
-    if !sync_monitoring_timers(hwnd) {
+    if !bind_display_and_timers(hwnd) {
         show_error("Explorer 重启后恢复监测定时器失败");
     }
 }
