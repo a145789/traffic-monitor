@@ -173,8 +173,6 @@ fn main() {
     let auto_update = load_auto_update_enabled();
     ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Relaxed);
 
-    create_tray_icon(hwnd);
-
     match Renderer::new() {
         Ok(r) => renderer::set_renderer(r),
         Err(e) => {
