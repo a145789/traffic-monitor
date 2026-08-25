@@ -80,7 +80,31 @@ pub fn show_info(msg: &str) {
     message_box(msg, MB_OK | MB_ICONINFORMATION);
 }
 
-/// 将进程标记为低优先级后台工作，并降低其默认内存优先级。
+/// 仅把当前进程的内存优先级调低：系统内存紧张时，OS 会优先回收本进程的
+/// 代码/堆/栈页（退回 Standby），而不是与其他进程争抢物理内存。
+///
+/// 与 EcoQoS（ProcessPowerThrottling）不同，此设置不影响 CPU 调度与核心
+/// 选择，常驻主进程可安全使用；1s 采样定时器触发时的软缺页代价为微秒级。
+/// 内存优先级会被本进程创建的子进程继承。
+///
+/// 这是最佳努力设置：旧系统或策略限制导致设置失败时不影响功能。
+pub fn set_low_memory_priority() {
+    // SAFETY: MEMORY_PRIORITY_INFORMATION 为 Win32 API 要求的固定布局，
+    // 指针只在同步调用期间有效；当前进程伪句柄无需关闭。
+    unsafe {
+        let memory = MEMORY_PRIORITY_INFORMATION {
+            MemoryPriority: MEMORY_PRIORITY_LOW,
+        };
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessMemoryPriority,
+            &memory as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        );
+    }
+}
+
+/// 将进程标记为低优先级后台工作（显式 EcoQoS + 低内存优先级）。
 ///
 /// 仅用于 `--check-update` 短生命周期子进程：主进程是任务栏常显窗口，
 /// 显式 EcoQoS 会把它钉进效率核/低频调度类并拖慢 1s 采样与 GDI 绘制。
@@ -88,33 +112,23 @@ pub fn show_info(msg: &str) {
 ///
 /// 这是最佳努力设置：旧系统或策略限制导致设置失败时不影响功能。
 pub fn configure_background_process() {
-    // SAFETY: 两个结构体均为 Win32 API 要求的固定布局，指针只在同步调用期间有效；
-    // 当前进程伪句柄无需关闭。
+    // SAFETY: PROCESS_POWER_THROTTLING_STATE 为 Win32 API 要求的固定布局，
+    // 指针只在同步调用期间有效；当前进程伪句柄无需关闭。
     unsafe {
-        let process = GetCurrentProcess();
-
         let power = PROCESS_POWER_THROTTLING_STATE {
             Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
             StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         };
         let _ = SetProcessInformation(
-            process,
+            GetCurrentProcess(),
             ProcessPowerThrottling,
             &power as *const _ as *const std::ffi::c_void,
             std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
         );
-
-        let memory = MEMORY_PRIORITY_INFORMATION {
-            MemoryPriority: MEMORY_PRIORITY_LOW,
-        };
-        let _ = SetProcessInformation(
-            process,
-            ProcessMemoryPriority,
-            &memory as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
-        );
     }
+
+    set_low_memory_priority();
 }
 
 pub fn reg_read_dword(subkey: &str, value_name: &str) -> Option<u32> {
