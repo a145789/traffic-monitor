@@ -4,7 +4,7 @@
 - **创建时间**: 2026-08-25
 - **更新记录**:
   - 2026-08-25: 初稿。由全仓简化审计拆分而来（本 RFC 覆盖「复制面收敛」类候选；删除死面类候选见 RFC 0008，黑名单缓存所有权简化见 RFC 0010）
-- **关联文件**: `src/main.rs`, `src/util.rs`, `src/update/mod.rs`, `src/tray.rs`, `src/config.rs`
+- **关联文件**: `src/main.rs`, `src/util.rs`, `src/update/mod.rs`, `src/update/http.rs`, `src/tray.rs`, `src/config.rs`
 
 ---
 
