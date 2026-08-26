@@ -20,9 +20,9 @@ if (tag) {
 
 function findISCC(): string | null {
   const candidates = [
-    "D:\\soft\\Inno Setup 7\\Inno Setup 7\\ISCC.exe",
-    "C:\\Program Files (x86)\\Inno Setup 7\\ISCC.exe",
+    "D:\\soft\\Inno Setup 7\\ISCC.exe",
     "C:\\Program Files\\Inno Setup 7\\ISCC.exe",
+    "C:\\Program Files (x86)\\Inno Setup 7\\ISCC.exe",
   ];
   for (const p of candidates) {
     if (existsSync(p)) return p;

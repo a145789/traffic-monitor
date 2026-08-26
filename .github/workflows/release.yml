@@ -35,21 +35,22 @@ jobs:
         with:
           path: |
             C:\Program Files\Inno Setup 7
-            C:\Program Files (x86)\Inno Setup 7
-            C:\Program Files (x86)\Inno Setup 6
-          key: innosetup-7-v1
+          key: innosetup-7.1.0
 
-      - name: Install Inno Setup
+      - name: Install Inno Setup 7.1.0
         if: steps.cache-is.outputs.cache-hit != 'true'
-        run: choco install innosetup -y
+        run: |
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe"
+          $installer = "$env:TEMP\innosetup-7.1.0-x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/DIR="C:\Program Files\Inno Setup 7"' -Wait
 
       - name: Download Chinese language file
         if: steps.cache-is.outputs.cache-hit != 'true'
         run: |
           $candidatePaths = @(
             "C:\Program Files\Inno Setup 7",
-            "C:\Program Files (x86)\Inno Setup 7",
-            "C:\Program Files (x86)\Inno Setup 6"
+            "C:\Program Files (x86)\Inno Setup 7"
           )
           $innoPath = ""
           foreach ($path in $candidatePaths) {
@@ -79,8 +80,7 @@ jobs:
         run: |
           $candidatePaths = @(
             "C:\Program Files\Inno Setup 7",
-            "C:\Program Files (x86)\Inno Setup 7",
-            "C:\Program Files (x86)\Inno Setup 6"
+            "C:\Program Files (x86)\Inno Setup 7"
           )
           $iscc = ""
           foreach ($path in $candidatePaths) {
