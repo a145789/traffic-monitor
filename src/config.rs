@@ -64,6 +64,16 @@ pub const HTTP_READ_CHUNK_BYTES: usize = 64 * 1024;
 /// 自动检查更新的正常冷却与失败后短冷却（秒）。
 pub const AUTO_CHECK_COOLDOWN_SECS: u64 = 3600;
 pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
+/// 启动安装包遇共享冲突类瞬态错误（如杀软实时扫描瞬时占用刚写完的文件）
+/// 时的最大尝试次数与每次重试前的等待时长。
+pub const INSTALLER_LAUNCH_MAX_ATTEMPTS: u32 = 3;
+pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
+
+/// 子进程发出 EXIT_MAIN 后等待主进程退出（单实例互斥量消失）的总超时与轮询间隔。
+/// 超时后照常启动安装器，由安装器内 taskkill 兜底强杀。
+pub const MAIN_EXIT_WAIT_TIMEOUT_MS: u64 = 5000;
+pub const MAIN_EXIT_POLL_INTERVAL_MS: u64 = 50;
+
 /// 自动更新的定时器轮询间隔。刻意远小于冷却时长：`sync_monitoring_timers` 在
 /// 息屏/锁屏/全屏等状态切换时会销毁重建全部定时器，若轮询周期≈冷却时长，
 /// 倒计时会被反复清零导致检查被无限推迟。因此定时器只做短周期轮询，

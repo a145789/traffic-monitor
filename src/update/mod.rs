@@ -4,20 +4,25 @@
 //! - [`version`]：版本号解析与远端 metadata 严格解析（纯字符串处理）。
 //! - [`http`]：WinHTTP 抓取与友好的中文错误映射。
 //! - [`crypto`]：BCrypt SHA-256 哈希与 RAII 句柄守卫。
-//! - 本文件：自动/手动编排、子进程协议、安装器启动、注册表开关读写。
+//! - 本文件：自动/手动编排、子进程协议（EXIT_MAIN 先于安装器启动）、安装器
+//!   启动重试、注册表开关读写。
 
 mod crypto;
 mod http;
 mod version;
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
-use windows::Win32::Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_CANCELLED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GetLastError,
+    HWND, LPARAM, WPARAM,
+};
+use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
 use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     IDYES, MB_ICONINFORMATION, MB_YESNO, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
@@ -25,8 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_MAX_BYTES, REG_PATH_APP,
-    VERSION, VERSION_METADATA_MAX_BYTES, WM_USER_UPDATE_ACTION,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_LAUNCH_MAX_ATTEMPTS,
+    INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES, MAIN_EXIT_POLL_INTERVAL_MS,
+    MAIN_EXIT_WAIT_TIMEOUT_MS, REG_PATH_APP, VERSION, VERSION_METADATA_MAX_BYTES,
+    WM_USER_UPDATE_ACTION,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
@@ -182,7 +189,7 @@ pub fn start_manual_check(hwnd: HWND) {
 }
 
 fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
-    let outcome = run_check_subprocess(is_manual);
+    let outcome = run_check_subprocess(is_manual, hwnd_raw);
 
     if !is_manual {
         let mut last = LAST_CHECK_TIME.lock().unwrap();
@@ -197,6 +204,12 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
         } else {
             *last = Some(Instant::now());
         }
+    }
+
+    // EXIT_MAIN 在子进程读取阶段就已即时转发（见 run_check_subprocess），
+    // 主进程即将退出，不再重置进行中标志。
+    if outcome.exit_signalled {
+        return;
     }
 
     if outcome.action == UpdateAction::ExitMain && !outcome.is_error {
@@ -235,6 +248,8 @@ enum UpdateAction {
 struct SubprocessOutcome {
     action: UpdateAction,
     is_error: bool,
+    /// 已在 stdout 中读到 EXIT_MAIN 并即时转发给主窗口，worker 无需再补发。
+    exit_signalled: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -370,7 +385,9 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 ///
 /// stdout 单行协议：
 /// - `DONE`：子进程已处理完毕，主进程继续运行。
-/// - `EXIT_MAIN`：安装器已成功启动，主进程应退出。
+/// - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
+///   收到后立即退出并释放 exe 映像句柄，子进程等单实例互斥量消失后才提权
+///   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 ///
 /// 退出码：0 = 检查流程成功完成，1 = 更新检查失败。手动检查失败时，错误提示
 /// 已由子进程显示；退出码只供主进程决定自动检查的重试冷却时间。
@@ -381,13 +398,11 @@ pub fn subprocess_main(is_manual: bool) -> i32 {
     let result = do_update_check(is_manual);
     let is_error = matches!(result, CheckResult::Error(_));
     let action = complete_update_interaction(result, is_manual);
-    let line = match action {
-        UpdateAction::Done => "DONE",
-        UpdateAction::ExitMain => "EXIT_MAIN",
-    };
 
-    let _ = std::io::stdout().write_all(line.as_bytes());
-    let _ = std::io::stdout().flush();
+    // EXIT_MAIN 已在启动安装器之前输出完毕；其余路径统一以 DONE 收尾。
+    if action == UpdateAction::Done {
+        emit_protocol_line("DONE");
+    }
     i32::from(is_error)
 }
 
@@ -418,13 +433,23 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
                 return UpdateAction::Done;
             }
 
-            // 启动安装器，文件锁在 ShellExecuteExW 返回后才释放。
+            // 关键顺序：先发 EXIT_MAIN 让主进程退出让出 exe 映像，等单实例
+            // 互斥量消失后再启动安装器；安装器的 taskkill 仅负责清理残存进程。
+            emit_protocol_line("EXIT_MAIN");
+            wait_main_instance_gone();
+
             match launch_installer(verified) {
                 InstallerLaunch::Started => UpdateAction::ExitMain,
-                InstallerLaunch::Cancelled => UpdateAction::Done,
+                InstallerLaunch::Cancelled => {
+                    // 主进程已按约定退出（如 UAC 被取消），重新拉起应用，
+                    // 避免任务栏小组件凭空消失。
+                    relaunch_main_app();
+                    UpdateAction::ExitMain
+                }
                 InstallerLaunch::Failed(code) => {
                     show_error(&format!("启动安装程序失败 (错误码: {code})"));
-                    UpdateAction::Done
+                    relaunch_main_app();
+                    UpdateAction::ExitMain
                 }
             }
         }
@@ -437,17 +462,68 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
     }
 }
 
-/// 主进程调用：re-exec 自身 `--check-update` 子进程，等待其完成全部更新交互。
+fn emit_protocol_line(line: &str) {
+    let _ = std::io::stdout().write_all(format!("{line}\n").as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+/// 轮询单实例互斥量直至其消失（主进程完全退出），超时则放行交由安装器 taskkill 兜底。
+///
+/// 本子进程在 main() 单例锁创建前即被拦截，自身绝不持有该互斥量。
+fn wait_main_instance_gone() -> bool {
+    let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
+    let deadline = Instant::now() + std::time::Duration::from_millis(MAIN_EXIT_WAIT_TIMEOUT_MS);
+
+    loop {
+        // SAFETY: name 以 NUL 结尾；句柄仅用于存在性探测，立即关闭。
+        match unsafe { OpenMutexW(MUTEX_ALL_ACCESS, false, PCWSTR(name.as_ptr())) } {
+            Err(_) => return true,
+            Ok(handle) => unsafe {
+                let _ = CloseHandle(handle);
+            },
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(MAIN_EXIT_POLL_INTERVAL_MS));
+    }
+}
+
+/// 重新拉起常驻主程序（仅用于 EXIT_MAIN 发出后安装未能继续的场景）。
+fn relaunch_main_app() {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let path_wide = to_wide(&exe.to_string_lossy());
+    // SAFETY: path_wide 含尾 NUL，ShellExecuteW 同步返回前存活。
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(path_wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// 主进程调用：re-exec 自身 `--check-update` 子进程，逐行解析其 stdout 协议。
 ///
 /// winhttp/bcrypt、MessageBox/IME 和 ShellExecute 相关 DLL 只会进入子进程；
-/// 子进程退出后由操作系统整体回收，主进程只解析 `DONE/EXIT_MAIN` 最终动作。
+/// 主进程只解析 `DONE/EXIT_MAIN` 最终动作。读到 `EXIT_MAIN` 时立即转发给主
+/// 窗口而不等子进程退出——此时安装器尚未启动，主进程必须先行退出释放 exe
+/// 映像，子进程才会继续执行提权安装。
 ///
-/// 此处使用 `spawn()` + 手动读取 stdout，而非 `output()`，避免后者为并发读取
+/// 此处使用 `spawn()` + 手动按行读取，而非 `output()`，避免后者为并发读取
 /// stderr 创建一个使用默认 2MB 栈预留的隐藏线程。
-fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
+fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
     let failed = || SubprocessOutcome {
         action: UpdateAction::Done,
         is_error: true,
+        exit_signalled: false,
     };
     let exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -472,21 +548,57 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
         Err(_) => return failed(),
     };
 
-    let mut stdout_data = Vec::new();
-    let read_failed = match child.stdout.take() {
-        Some(mut stdout) => stdout.read_to_end(&mut stdout_data).is_err(),
-        None => true,
-    };
+    let mut parsed_action: Option<UpdateAction> = None;
+    let mut exit_signalled = false;
+    let mut read_failed = false;
+
+    match child.stdout.take() {
+        Some(stdout) => {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Some(action) = parse_update_action(line.as_bytes()) {
+                            if parsed_action.is_none() {
+                                parsed_action = Some(action);
+                            }
+                            if action == UpdateAction::ExitMain && !exit_signalled {
+                                exit_signalled = true;
+                                // 收到即通知，不等子进程退出：主进程须抢在
+                                // 安装器拷贝前退净并让出 exe 映像句柄。
+                                let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+                                post_update_action(hwnd, UPDATE_ACTION_EXIT_MAIN);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        read_failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        None => read_failed = true,
+    }
 
     let exit_status = match child.wait() {
         Ok(status) => status,
-        Err(_) => return failed(),
+        Err(_) => {
+            return SubprocessOutcome {
+                action: parsed_action.unwrap_or(UpdateAction::Done),
+                is_error: true,
+                exit_signalled,
+            };
+        }
     };
 
-    let parsed = parse_update_action(&stdout_data);
     SubprocessOutcome {
-        action: parsed.unwrap_or(UpdateAction::Done),
-        is_error: read_failed || parsed.is_none() || !exit_status.success(),
+        action: parsed_action.unwrap_or(UpdateAction::Done),
+        is_error: read_failed || parsed_action.is_none() || !exit_status.success(),
+        exit_signalled,
     }
 }
 
@@ -541,8 +653,39 @@ fn open_url(url: &str) {
     }
 }
 
+/// 启动安装器，对「文件正被占用」类瞬态错误（典型为杀软实时扫描刚写完的
+/// 安装包）做有限次重试；文件锁保持到最后一次尝试结束后才释放。
 fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
-    let path_str = verified.path.to_string_lossy();
+    let mut attempt = 1;
+    let result = loop {
+        match try_launch_installer(&verified.path) {
+            InstallerLaunch::Started => break InstallerLaunch::Started,
+            other => {
+                if !is_transient_launch_error(&other) || attempt >= INSTALLER_LAUNCH_MAX_ATTEMPTS {
+                    break other;
+                }
+            }
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(
+            INSTALLER_LAUNCH_RETRY_DELAY_MS,
+        ));
+    };
+    drop(verified);
+    result
+}
+
+/// 判定是否值得重试的启动失败：仅共享冲突/锁冲突类瞬态错误。
+fn is_transient_launch_error(launch: &InstallerLaunch) -> bool {
+    matches!(
+        launch,
+        InstallerLaunch::Failed(code)
+            if *code == ERROR_SHARING_VIOLATION.0 || *code == ERROR_LOCK_VIOLATION.0
+    )
+}
+
+fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
+    let path_str = path.to_string_lossy();
     let path_wide = to_wide(&path_str);
     let verb_wide = to_wide("runas");
     let params_wide = to_wide("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
@@ -561,10 +704,6 @@ fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
     // ShellExecuteExW 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体
     // 实际大小一致，未设置需要调用方提供额外指针或接管进程句柄的掩码。
     let launched = unsafe { ShellExecuteExW(&mut sei) };
-
-    // 安装器启动后（或启动失败后）释放文件锁——让 verified 的 _file_lock 在此函数
-    // 返回时 drop，确保 ShellExecuteExW 执行期间安装器文件不可被同权限进程替换。
-    drop(verified);
 
     if launched.is_ok() {
         return InstallerLaunch::Started;
@@ -619,5 +758,26 @@ mod tests {
         ] {
             assert_eq!(parse_update_action(input), None);
         }
+    }
+
+    // ===== is_transient_launch_error =====
+
+    #[test]
+    fn test_transient_launch_errors_are_retried() {
+        // 32 = ERROR_SHARING_VIOLATION，33 = ERROR_LOCK_VIOLATION。
+        assert!(is_transient_launch_error(&InstallerLaunch::Failed(
+            ERROR_SHARING_VIOLATION.0
+        )));
+        assert!(is_transient_launch_error(&InstallerLaunch::Failed(
+            ERROR_LOCK_VIOLATION.0
+        )));
+    }
+
+    #[test]
+    fn test_permanent_launch_errors_are_not_retried() {
+        assert!(!is_transient_launch_error(&InstallerLaunch::Started));
+        assert!(!is_transient_launch_error(&InstallerLaunch::Cancelled));
+        assert!(!is_transient_launch_error(&InstallerLaunch::Failed(5)));
+        assert!(!is_transient_launch_error(&InstallerLaunch::Failed(2)));
     }
 }
