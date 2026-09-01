@@ -535,44 +535,16 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
         Err(_) => return failed(),
     };
 
-    let mut parsed_action: Option<UpdateAction> = None;
-    let mut exit_signalled = false;
-    let mut read_failed = false;
-
-    match child.stdout.take() {
+    let (parsed_action, exit_signalled, read_failed) = match child.stdout.take() {
         Some(stdout) => {
             let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if let Some(action) = parse_update_action(line.as_bytes()) {
-                            if parsed_action.is_none() {
-                                parsed_action = Some(action);
-                            }
-                            // 不变量：读到 EXIT_MAIN 即在此转发且仅转发一次（exit_signalled
-                            // 守卫），worker 无补发路径；转发失败由子进程超时照常启动
-                            // 安装器 + 安装器内 taskkill 兜底。
-                            if action == UpdateAction::ExitMain && !exit_signalled {
-                                exit_signalled = true;
-                                // 收到即通知，不等子进程退出：主进程须抢在
-                                // 安装器拷贝前退净并让出 exe 映像句柄。
-                                let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-                                post_update_action(hwnd);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        read_failed = true;
-                        break;
-                    }
-                }
-            }
+            scan_subprocess_protocol(&mut reader, || {
+                let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+                post_update_action(hwnd);
+            })
         }
-        None => read_failed = true,
-    }
+        None => (None, false, true),
+    };
 
     let exit_status = match child.wait() {
         Ok(status) => status,
@@ -588,6 +560,48 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
         is_error: read_failed || parsed_action.is_none() || !exit_status.success(),
         exit_signalled,
     }
+}
+
+/// 逐行扫描子进程 stdout 协议，返回 (首个有效动作, 是否已转发 EXIT_MAIN, 读取是否失败)。
+///
+/// 不变量（由本模块 tests 以 Cursor 喂协议行钉死）：读到 `EXIT_MAIN` 即调用
+/// `on_exit_main` 转发且仅转发一次（exit_signalled 守卫），转发发生在扫描期间、
+/// 早于 `child.wait()`；调用方无补发路径，转发失败由子进程超时照常启动安装器
+/// + 安装器内 taskkill 兜底。
+fn scan_subprocess_protocol(
+    reader: &mut impl BufRead,
+    mut on_exit_main: impl FnMut(),
+) -> (Option<UpdateAction>, bool, bool) {
+    let mut parsed_action: Option<UpdateAction> = None;
+    let mut exit_signalled = false;
+    let mut read_failed = false;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Some(action) = parse_update_action(line.as_bytes()) {
+                    if parsed_action.is_none() {
+                        parsed_action = Some(action);
+                    }
+                    if action == UpdateAction::ExitMain && !exit_signalled {
+                        exit_signalled = true;
+                        // 收到即转发，不等子进程退出：主进程须抢在安装器拷贝前
+                        // 退净并让出 exe 映像句柄。
+                        on_exit_main();
+                    }
+                }
+            }
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
+        }
+    }
+
+    (parsed_action, exit_signalled, read_failed)
 }
 
 fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
@@ -746,6 +760,80 @@ mod tests {
         ] {
             assert_eq!(parse_update_action(input), None);
         }
+    }
+
+    // ===== scan_subprocess_protocol =====
+
+    /// 用内存缓冲驱动协议扫描，并记录转发回调次数。
+    fn scan(data: &[u8]) -> (Option<UpdateAction>, bool, bool, usize) {
+        let mut reader = std::io::Cursor::new(data);
+        let mut forwards = 0usize;
+        let (parsed, exit_signalled, read_failed) =
+            scan_subprocess_protocol(&mut reader, || forwards += 1);
+        (parsed, exit_signalled, read_failed, forwards)
+    }
+
+    #[test]
+    fn test_scan_exit_main_forwards_exactly_once() {
+        let (parsed, exit_signalled, read_failed, forwards) = scan(b"EXIT_MAIN\n");
+        assert_eq!(parsed, Some(UpdateAction::ExitMain));
+        assert!(exit_signalled);
+        assert!(!read_failed);
+        assert_eq!(forwards, 1);
+    }
+
+    #[test]
+    fn test_scan_duplicate_exit_main_forward_only_once() {
+        // 钉死不变量：无论子进程输出多少行 EXIT_MAIN，转发恰好一次。
+        let (_, exit_signalled, _, forwards) = scan(b"EXIT_MAIN\nEXIT_MAIN\nEXIT_MAIN\n");
+        assert!(exit_signalled);
+        assert_eq!(forwards, 1);
+    }
+
+    #[test]
+    fn test_scan_done_does_not_forward() {
+        let (parsed, exit_signalled, read_failed, forwards) = scan(b"DONE\n");
+        assert_eq!(parsed, Some(UpdateAction::Done));
+        assert!(!exit_signalled);
+        assert!(!read_failed);
+        assert_eq!(forwards, 0);
+    }
+
+    #[test]
+    fn test_scan_garbage_lines_forward_nothing_and_remember_nothing() {
+        let (parsed, exit_signalled, read_failed, forwards) =
+            scan(b"NO_UPDATE\nEXIT_MAIN|extra\n\n");
+        assert_eq!(parsed, None);
+        assert!(!exit_signalled);
+        assert!(!read_failed);
+        assert_eq!(forwards, 0);
+    }
+
+    #[test]
+    fn test_scan_empty_stream() {
+        let (parsed, exit_signalled, read_failed, forwards) = scan(b"");
+        assert_eq!(parsed, None);
+        assert!(!exit_signalled);
+        assert!(!read_failed);
+        assert_eq!(forwards, 0);
+    }
+
+    #[test]
+    fn test_scan_invalid_utf8_marks_read_failed() {
+        let (parsed, exit_signalled, read_failed, forwards) = scan(&[0xFF, 0xFE, b'\n']);
+        assert_eq!(parsed, None);
+        assert!(!exit_signalled);
+        assert!(read_failed);
+        assert_eq!(forwards, 0);
+    }
+
+    #[test]
+    fn test_scan_memo_keeps_first_action_but_still_forwards() {
+        // memo 记录首个有效动作（is_error 判定只消费 is_none）；转发与 memo 无关。
+        let (parsed, exit_signalled, _, forwards) = scan(b"DONE\nEXIT_MAIN\n");
+        assert_eq!(parsed, Some(UpdateAction::Done));
+        assert!(exit_signalled);
+        assert_eq!(forwards, 1);
     }
 
     // ===== is_transient_launch_error =====
