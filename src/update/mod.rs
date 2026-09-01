@@ -46,8 +46,6 @@ use crypto::{compute_sha256_hex, compute_sha256_hex_file};
 use http::fetch_url;
 use version::{compare_versions, parse_update_metadata};
 
-const UPDATE_ACTION_EXIT_MAIN: usize = 1;
-
 /// 仓库唯一来源：所有 GitHub 路径与 URL 均从这里派生，更换仓库只需改这一处。
 /// 以宏而非 const 定义，因为 `concat!` 只接受字面量。
 macro_rules! repo_owner_name {
@@ -155,17 +153,7 @@ pub fn start_auto_check(hwnd: HWND) {
         }
     }
 
-    let hwnd_raw: isize = hwnd.0 as isize;
-
-    if std::thread::Builder::new()
-        .stack_size(64 * 1024)
-        .spawn(move || {
-            update_check_worker(hwnd_raw, false);
-        })
-        .is_err()
-    {
-        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-    }
+    spawn_update_worker(hwnd, false);
 }
 
 pub fn start_manual_check(hwnd: HWND) {
@@ -175,12 +163,20 @@ pub fn start_manual_check(hwnd: HWND) {
         return;
     }
 
+    spawn_update_worker(hwnd, true);
+}
+
+/// spawn 更新工作线程；spawn 失败时复位进行中标志。
+///
+/// 仅负责线程创建与失败复位；自动检查的两道前置门（开关、冷却）保留在
+/// `start_auto_check` 内，占坑与门序不因本函数改变。
+fn spawn_update_worker(hwnd: HWND, is_manual: bool) {
     let hwnd_raw: isize = hwnd.0 as isize;
 
     if std::thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(move || {
-            update_check_worker(hwnd_raw, true);
+            update_check_worker(hwnd_raw, is_manual);
         })
         .is_err()
     {
@@ -212,13 +208,6 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
         return;
     }
 
-    if outcome.action == UpdateAction::ExitMain && !outcome.is_error {
-        let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-        if post_update_action(hwnd, UPDATE_ACTION_EXIT_MAIN) {
-            return;
-        }
-    }
-
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
     compact_and_trim();
 }
@@ -246,9 +235,8 @@ enum UpdateAction {
 }
 
 struct SubprocessOutcome {
-    action: UpdateAction,
     is_error: bool,
-    /// 已在 stdout 中读到 EXIT_MAIN 并即时转发给主窗口，worker 无需再补发。
+    /// 已在 stdout 中读到 EXIT_MAIN 并即时转发给主窗口，worker 无需再做任何事。
     exit_signalled: bool,
 }
 
@@ -521,7 +509,6 @@ fn relaunch_main_app() {
 /// stderr 创建一个使用默认 2MB 栈预留的隐藏线程。
 fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
     let failed = || SubprocessOutcome {
-        action: UpdateAction::Done,
         is_error: true,
         exit_signalled: false,
     };
@@ -565,12 +552,15 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
                             if parsed_action.is_none() {
                                 parsed_action = Some(action);
                             }
+                            // 不变量：读到 EXIT_MAIN 即在此转发且仅转发一次（exit_signalled
+                            // 守卫），worker 无补发路径；转发失败由子进程超时照常启动
+                            // 安装器 + 安装器内 taskkill 兜底。
                             if action == UpdateAction::ExitMain && !exit_signalled {
                                 exit_signalled = true;
                                 // 收到即通知，不等子进程退出：主进程须抢在
                                 // 安装器拷贝前退净并让出 exe 映像句柄。
                                 let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-                                post_update_action(hwnd, UPDATE_ACTION_EXIT_MAIN);
+                                post_update_action(hwnd);
                             }
                         }
                     }
@@ -588,7 +578,6 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
         Ok(status) => status,
         Err(_) => {
             return SubprocessOutcome {
-                action: parsed_action.unwrap_or(UpdateAction::Done),
                 is_error: true,
                 exit_signalled,
             };
@@ -596,7 +585,6 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
     };
 
     SubprocessOutcome {
-        action: parsed_action.unwrap_or(UpdateAction::Done),
         is_error: read_failed || parsed_action.is_none() || !exit_status.success(),
         exit_signalled,
     }
@@ -610,19 +598,19 @@ fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
     }
 }
 
-fn post_update_action(hwnd: HWND, action: usize) -> bool {
+/// 通知主窗口「主进程退出并清理托盘」。单动作协议，消息无载荷。
+fn post_update_action(hwnd: HWND) {
     // SAFETY:
     // hwnd 来自主线程创建的窗口句柄，并且仅在主进程仍持有该窗口期间由工作线程使用。
     // PostMessageW 只向目标线程队列复制整数消息参数，不会跨线程解引用 Rust 内存；
     // 若窗口已销毁，API 会返回错误，调用本身不会访问无效内存。
-    unsafe { PostMessageW(Some(hwnd), WM_USER_UPDATE_ACTION, WPARAM(action), LPARAM(0)).is_ok() }
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_USER_UPDATE_ACTION, WPARAM(0), LPARAM(0));
+    }
 }
 
-pub fn handle_update_action(action: usize) {
+pub fn handle_update_action() {
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-    if action != UPDATE_ACTION_EXIT_MAIN {
-        return;
-    }
 
     remove_tray_icon();
     // SAFETY:

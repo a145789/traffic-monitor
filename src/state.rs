@@ -69,6 +69,18 @@ pub static NETWORK_BACKOFF: AtomicBool = AtomicBool::new(false);
 /// 连续零速计数。读写：Relaxed（采集线程计数）/ Release（主线程恢复路径清零）。
 pub static CONSECUTIVE_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// 复位网络退避：清零连续零速计数并退出退避，恢复快速采样。
+///
+/// 归属说明：退避的置位与自增属主在 `collector::network`，但 suspend 反向调用
+/// collector 会新增依赖边，这里作为两个原子量的家是零新边的中立归属（与
+/// `SuspendReasons` 把位协议封装在状态属主处的既有做法一致）。
+/// 两个 store 须在 `sync_monitoring_timers` 读取 `NETWORK_BACKOFF` 之前完成；
+/// 先后顺序与既有各调用方写法语义等价。
+pub fn reset_network_backoff() {
+    NETWORK_BACKOFF.store(false, Ordering::Release);
+    CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
+}
+
 /// CPU 使用率（0-100）。读写：Relaxed（采集写、渲染读）。
 pub static CPU_USAGE: AtomicU32 = AtomicU32::new(0);
 

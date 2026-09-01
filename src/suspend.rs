@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
+    GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows::Win32::System::Power::POWERBROADCAST_SETTING;
 use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
@@ -23,8 +23,8 @@ use crate::config::{
     TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::state::{
-    CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASON_MONITOR,
-    SUSPEND_REASON_SESSION, SUSPEND_REASON_SYSTEM, SUSPEND_REASONS,
+    MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION,
+    SUSPEND_REASON_SYSTEM, SUSPEND_REASONS, reset_network_backoff,
 };
 use crate::util::{trim_working_set, utf16};
 use crate::window::get_taskbar_hwnd;
@@ -50,12 +50,10 @@ pub fn suspend_system(hwnd: HWND, reason: u32) {
     }
 }
 
-pub fn resume_system(hwnd: HWND, reason: u32, reset_backoff: bool) {
+pub fn resume_system(hwnd: HWND, reason: u32) {
     SUSPEND_REASONS.resume(reason);
-    if reset_backoff {
-        CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
-        NETWORK_BACKOFF.store(false, Ordering::Release);
-    }
+    // 恢复即复位网络退避：唤醒/解锁后立即回到快速采样节奏。
+    reset_network_backoff();
     let _ = sync_monitoring_timers(hwnd);
     force_repaint(hwnd);
 }
@@ -67,7 +65,7 @@ pub fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRE
             suspend_system(hwnd, SUSPEND_REASON_SYSTEM);
         }
         PBT_APMRESUMEAUTOMATIC => {
-            resume_system(hwnd, SUSPEND_REASON_SYSTEM, true);
+            resume_system(hwnd, SUSPEND_REASON_SYSTEM);
         }
         PBT_POWERSETTINGCHANGE => {
             let setting = lparam.0 as *const POWERBROADCAST_SETTING;
@@ -77,7 +75,7 @@ pub fn handle_power_broadcast(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRE
                 if setting_ref.PowerSetting == GUID_MONITOR_POWER_ON && setting_ref.DataLength >= 1
                 {
                     if setting_ref.Data[0] != 0 {
-                        resume_system(hwnd, SUSPEND_REASON_MONITOR, true);
+                        resume_system(hwnd, SUSPEND_REASON_MONITOR);
                     } else {
                         suspend_system(hwnd, SUSPEND_REASON_MONITOR);
                     }
@@ -96,7 +94,7 @@ pub fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             suspend_system(hwnd, SUSPEND_REASON_SESSION);
         }
         WTS_SESSION_UNLOCK => {
-            resume_system(hwnd, SUSPEND_REASON_SESSION, true);
+            resume_system(hwnd, SUSPEND_REASON_SESSION);
         }
         _ => {}
     }
@@ -233,13 +231,16 @@ pub fn check_fullscreen(hwnd: HWND) {
 
     // 前台窗口所在显示器 vs 任务栏所在显示器，仅同屏全屏才暂停。
     let hmon_fg = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
-    let mut mi_fg = MONITORINFOEXW::default();
-    mi_fg.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    // 只读 rcMonitor，用轻量 MONITORINFO 即可（EXW 版仅多 szDevice）。
+    let mut mi_fg = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
     // SAFETY: cbSize 已设；GetMonitorInfoW 写入 mi_fg。
-    let fg_ok = unsafe { GetMonitorInfoW(hmon_fg, &mut mi_fg as *mut MONITORINFOEXW as *mut _) };
+    let fg_ok = unsafe { GetMonitorInfoW(hmon_fg, &mut mi_fg) };
 
     let is_full = if fg_ok.as_bool() {
-        let mon_rect = mi_fg.monitorInfo.rcMonitor;
+        let mon_rect = mi_fg.rcMonitor;
         rect.left == mon_rect.left
             && rect.top == mon_rect.top
             && rect.right == mon_rect.right

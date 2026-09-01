@@ -9,4 +9,4 @@ mod network;
 mod rate;
 
 pub use cpu_mem::{collect_cpu, collect_memory};
-pub use network::{collect_network, init_network_listener};
+pub use network::collect_network;

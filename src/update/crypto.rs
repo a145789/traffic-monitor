@@ -24,7 +24,8 @@ impl Drop for BcryptHandles {
 }
 
 /// 增量式 SHA-256 计算。句柄由 RAII 守卫托管，`finish` 后自动销毁。
-pub(super) struct Sha256 {
+/// 仅在本模块内使用；对外只暴露 `compute_sha256_hex` / `compute_sha256_hex_file`。
+struct Sha256 {
     handles: BcryptHandles,
 }
 

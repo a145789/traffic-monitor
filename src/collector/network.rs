@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -24,17 +24,10 @@ const IF_TYPE_IEEE80211: u32 = 71;
 
 static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// 主窗口句柄（isize 存储），断网/恢复时向 UI 线程投递消息。
-static MAIN_HWND_NETWORK: AtomicIsize = AtomicIsize::new(0);
-
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
     static VIRTUAL_BLACKLIST: RefCell<Option<(HashSet<u64>, Instant)>> = const { RefCell::new(None) };
-}
-
-pub fn init_network_listener(hwnd: HWND) {
-    MAIN_HWND_NETWORK.store(hwnd.0 as isize, Ordering::Release);
 }
 
 struct MibTable(*mut MIB_IF_TABLE2);
@@ -66,7 +59,9 @@ impl Drop for MibTable {
     }
 }
 
-pub fn collect_network() {
+/// 采样一次全网卡流量并更新速率状态；断网/恢复消息投递给调用方提供的
+/// 当前主窗口（UI 线程 WM_TIMER tick 携带的 hwnd，不存在陈旧句柄 tick）。
+pub fn collect_network(hwnd: HWND) {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     // SAFETY: 成功时 OS 分配表，由 MibTable Drop → FreeMibTable 释放。
     let result = unsafe { GetIfTable2(&mut table) };
@@ -126,13 +121,13 @@ pub fn collect_network() {
                 let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
                     NETWORK_BACKOFF.store(true, Ordering::Release);
-                    post_to_main(WM_USER_NETWORK_DISCONNECTED);
+                    post_to_main(hwnd, WM_USER_NETWORK_DISCONNECTED);
                 }
             } else {
                 CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
                 if NETWORK_BACKOFF.load(Ordering::Acquire) {
                     NETWORK_BACKOFF.store(false, Ordering::Release);
-                    post_to_main(WM_USER_NETWORK_RECONNECTED);
+                    post_to_main(hwnd, WM_USER_NETWORK_RECONNECTED);
                 }
             }
         });
@@ -140,8 +135,7 @@ pub fn collect_network() {
 }
 
 /// 向主窗口投递网络状态消息（断网退避/恢复）。
-fn post_to_main(msg: u32) {
-    let hwnd = HWND(MAIN_HWND_NETWORK.load(Ordering::Acquire) as *mut std::ffi::c_void);
+fn post_to_main(hwnd: HWND, msg: u32) {
     // SAFETY: PostMessageW 只投递消息，线程安全；窗口已销毁时返回错误。
     unsafe {
         let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));

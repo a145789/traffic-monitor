@@ -139,7 +139,8 @@ pub fn invalidate_taskbar_cache() {
     TASKBAR_HWND.store(0, Ordering::Release);
 }
 
-pub fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+/// 计算小组件在任务栏上的目标矩形 (x, y, w, h)；仅 window.rs 内部消费。
+fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     let h_taskbar = get_taskbar_hwnd()?;
     // SAFETY: "TrayNotifyWnd" 为系统托盘子窗口类名。
     let h_tray = unsafe { FindWindowExW(Some(h_taskbar), None, w!("TrayNotifyWnd"), w!("")).ok()? };

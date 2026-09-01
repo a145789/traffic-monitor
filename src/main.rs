@@ -33,16 +33,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::collector::{collect_cpu, collect_memory, collect_network, init_network_listener};
+use crate::collector::{collect_cpu, collect_memory, collect_network};
 use crate::config::{
     LOWORD_MASK, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
     TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK, TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY,
     WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
-use crate::state::{
-    CONSECUTIVE_ZERO_COUNT, ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, NETWORK_BACKOFF,
-};
+use crate::state::{ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, reset_network_backoff};
 use crate::suspend::{
     check_fullscreen, handle_power_broadcast, handle_session_change, is_immersive_color_set,
     is_suspended, sync_monitoring_timers,
@@ -165,8 +163,6 @@ fn main() {
         }
     };
     CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
-
-    init_network_listener(hwnd);
 
     register_power_notify(hwnd);
 
@@ -298,7 +294,8 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
 /// 不变量：任务栏销毁会级联销毁嵌入其中的跨进程子窗口（旧主窗口已死），
 /// 且 TaskbarCreated 广播只投递顶层窗口——因此重建只能由看门狗触发，
 /// 禁止把该处理挂回主窗口过程。所有绑定在旧 hwnd 上的资源
-/// （网络监听、电源/会话通知、托盘、定时器）必须逐一重绑到新 hwnd。
+/// （电源/会话通知、托盘、定时器）必须逐一重绑到新 hwnd；
+/// 网络采样由 WM_TIMER tick 携带的 hwnd 直接投递，无需重绑。
 fn rebuild_main_window() {
     invalidate_taskbar_cache();
 
@@ -321,8 +318,6 @@ fn rebuild_main_window() {
         }
     };
     CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
-
-    init_network_listener(hwnd);
 
     // 旧电源通知绑定在已销毁的窗口上，先注销再对新窗口重新注册。
     let prev_power = POWER_NOTIFY_HANDLE.swap(0, Ordering::AcqRel);
@@ -378,7 +373,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
                 // 任务栏通知区域变化时，即使数值不变也必须刷新新位置的画布。
                 let position_changed = update_taskbar_position(hwnd);
-                collect_network();
+                collect_network(hwnd);
                 if position_changed {
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -431,15 +426,14 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         WM_USER_NETWORK_RECONNECTED => {
-            NETWORK_BACKOFF.store(false, Ordering::Release);
-            CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
+            reset_network_backoff();
             let _ = sync_monitoring_timers(hwnd);
             start_auto_check(hwnd);
             LRESULT(0)
         }
 
         WM_USER_UPDATE_ACTION => {
-            crate::update::handle_update_action(wparam.0);
+            crate::update::handle_update_action();
             LRESULT(0)
         }
 
