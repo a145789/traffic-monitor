@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
-    NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, GetCursorPos, HMENU, IDI_APPLICATION, InsertMenuItemW, LoadIconW,
@@ -45,7 +45,10 @@ pub fn create_tray_icon(hwnd: HWND) {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
-        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+        // NOTIFYICON_VERSION_4 默认抑制标准悬浮提示（szTip 不显示），
+        // 必须同时置 NIF_SHOWTIP 才展示 tooltip；v4 又是右键菜单
+        // （WM_CONTEXTMENU 经 lParam 低字分发）所必需，二者缺一不可。
+        uFlags: NIF_ICON | NIF_MESSAGE | NIF_SHOWTIP | NIF_TIP,
         uCallbackMessage: WM_APP_TRAY,
         hIcon: hicon,
         ..Default::default()
