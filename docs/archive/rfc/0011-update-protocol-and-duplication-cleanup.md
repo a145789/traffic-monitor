@@ -1,10 +1,11 @@
 # RFC 0011: 更新动作协议收敛与残留重复状态清理
 
-- **状态**: Draft (草案)
+- **状态**: Implemented (已实施)
 - **创建时间**: 2026-09-01
 - **更新记录**:
   - 2026-09-01: 初稿。对当前 HEAD（4420f79）全部 17 个源文件 + build.rs / installer.iss / scripts / .github / README 做逐符号消费方审计后，仍可验证的剩余候选。
   - 2026-09-01: 复核修正（依据外部逐条复核意见，全部采纳）：2.1 补发分支条件引述更正为 `!outcome.is_error`，并补「对 post 失败场景同样无效」论据；2.5 删去理论化的竞态论据，改为镜像状态消除 + 数据流显式化；2.3 复位对补计 network.rs 第三处、`reset_network_backoff()` 归属改 state.rs；§1 补行号基线与符号定位提醒。
+  - 2026-09-01: 已实施于 71b4cf2（分支 `refactor/rfc-0011-update-protocol-cleanup`），2.1–2.6 全部落地；另将 2.1 读取循环抽为 `scan_subprocess_protocol`，把「读到 EXIT_MAIN 即转发且仅转发一次」不变量升级为测试钉死。
 - **关联文件**: `src/update/mod.rs`, `src/main.rs`, `src/suspend.rs`, `src/collector/network.rs`, `src/collector/mod.rs`, `src/window.rs`, `src/update/crypto.rs`
 
 ---
@@ -71,13 +72,13 @@
 
 ## 4. 实施检查清单
 
-- [ ] **2.1** 删 215-220 行补发分支；`SubprocessOutcome` 去 `action` 字段；`post_update_action` 返回 `()`；在读取循环处补一行注释钉死「读到 EXIT_MAIN 即转发且仅转发一次」的不变量
-- [ ] **2.2** 删 `UPDATE_ACTION_EXIT_MAIN`；`post_update_action(hwnd)` / `handle_update_action()` 无参化；main.rs 442 行调用点同步
-- [ ] **2.3** 删 `reset_backoff` 参数；在 state.rs 抽 `reset_network_backoff()`（注释写明归属理由）并在 main.rs / suspend.rs 两处调用
-- [ ] **2.4** 抽 `spawn_update_worker`；两个入口改调，门序不动
-- [ ] **2.5** `collect_network(hwnd)` 参数化；删静态 / setter / 再导出 / import / 两处调用点
-- [ ] **2.6** `MONITORINFO` 换型并删转型；`calc_widget_rect`、`Sha256` 降私有
-- [ ] 全量 `cargo test` + `cargo build --release` + `cargo clippy -- -D warnings` + `cargo fmt`
+- [x] **2.1** 删 215-220 行补发分支；`SubprocessOutcome` 去 `action` 字段；`post_update_action` 返回 `()`；在读取循环处补一行注释钉死「读到 EXIT_MAIN 即转发且仅转发一次」的不变量
+- [x] **2.2** 删 `UPDATE_ACTION_EXIT_MAIN`；`post_update_action(hwnd)` / `handle_update_action()` 无参化；main.rs 442 行调用点同步
+- [x] **2.3** 删 `reset_backoff` 参数；在 state.rs 抽 `reset_network_backoff()`（注释写明归属理由）并在 main.rs / suspend.rs 两处调用
+- [x] **2.4** 抽 `spawn_update_worker`；两个入口改调，门序不动
+- [x] **2.5** `collect_network(hwnd)` 参数化；删静态 / setter / 再导出 / import / 两处调用点
+- [x] **2.6** `MONITORINFO` 换型并删转型；`calc_widget_rect`、`Sha256` 降私有
+- [x] 全量 `cargo test` + `cargo build --release` + `cargo clippy -- -D warnings` + `cargo fmt`
 - [ ] 真机验证：更新检查（含手动与 UAC 取消）、断网退避恢复、息屏唤醒、Explorer 重启重建
 
 ## 5. 非目标与保留项（附当前代码理由）
