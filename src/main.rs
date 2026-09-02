@@ -35,9 +35,10 @@ use windows::core::{PCWSTR, w};
 
 use crate::collector::{collect_cpu, collect_memory, collect_network};
 use crate::config::{
-    LOWORD_MASK, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
-    TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK, TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY,
-    WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
+    LOWORD_MASK, RELAUNCHED_BY_UPDATE_ARG, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM,
+    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK,
+    TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED,
+    WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
 use crate::state::{ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, reset_network_backoff};
@@ -47,7 +48,8 @@ use crate::suspend::{
 };
 use crate::tray::{create_tray_icon, remove_tray_icon};
 use crate::update::{
-    init_cleanup_temp, load_auto_update_enabled, start_auto_check, subprocess_main,
+    defer_initial_auto_check, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
+    subprocess_main,
 };
 use crate::util::{
     set_low_memory_priority, show_error, trim_working_set, trim_working_set_if_needed,
@@ -192,6 +194,11 @@ fn main() {
     register_session_notification(hwnd);
 
     init_cleanup_temp();
+    // 更新流程 relaunch 拉起的进程：刚发生过 UAC 取消或安装器启动失败，
+    // 推迟首个自动检查周期，避免立刻再弹同一版本的更新确认框。
+    if args.iter().any(|a| a == RELAUNCHED_BY_UPDATE_ARG) {
+        defer_initial_auto_check();
+    }
     start_auto_check(hwnd);
 
     // 一次性定时器：到时后 trim 初始化冷页；ID 99 不与监测定时器冲突。

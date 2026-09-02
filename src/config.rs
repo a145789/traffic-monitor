@@ -74,6 +74,16 @@ pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
 pub const MAIN_EXIT_WAIT_TIMEOUT_MS: u64 = 5000;
 pub const MAIN_EXIT_POLL_INTERVAL_MS: u64 = 50;
 
+/// 重新拉起主进程时携带的一次性参数：更新确认框刚被用户决策过（UAC 取消
+/// 或安装器启动失败），拉起后的首个自动检查冷却周期被推迟，避免立刻
+/// 再弹同一版本的确认框。
+pub const RELAUNCHED_BY_UPDATE_ARG: &str = "--relaunched-by-update";
+
+/// 临时安装包缓存有效期（秒），超时才在启动期清理。有效期内是否复用由
+/// 哈希校验裁决（不匹配由 do_update_check 自行删除重下）；无条件删除会
+/// 摧毁有效缓存，迫使每次检查都重新下载。
+pub const INSTALLER_CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
 /// 自动更新的定时器轮询间隔。刻意远小于冷却时长：`sync_monitoring_timers` 在
 /// 息屏/锁屏/全屏等状态切换时会销毁重建全部定时器，若轮询周期≈冷却时长，
 /// 倒计时会被反复清零导致检查被无限推迟。因此定时器只做短周期轮询，

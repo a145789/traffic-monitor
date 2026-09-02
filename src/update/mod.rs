@@ -23,17 +23,19 @@ use windows::Win32::Foundation::{
     HWND, LPARAM, WPARAM,
 };
 use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
-use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW};
+use windows::Win32::UI::Shell::{
+    SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     IDYES, MB_ICONINFORMATION, MB_YESNO, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_LAUNCH_MAX_ATTEMPTS,
-    INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES, MAIN_EXIT_POLL_INTERVAL_MS,
-    MAIN_EXIT_WAIT_TIMEOUT_MS, REG_PATH_APP, VERSION, VERSION_METADATA_MAX_BYTES,
-    WM_USER_UPDATE_ACTION,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_CACHE_MAX_AGE_SECS,
+    INSTALLER_LAUNCH_MAX_ATTEMPTS, INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES,
+    MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS, REG_PATH_APP, RELAUNCHED_BY_UPDATE_ARG,
+    VERSION, VERSION_METADATA_MAX_BYTES, WM_USER_UPDATE_ACTION,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
@@ -212,11 +214,22 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
     compact_and_trim();
 }
 
+/// 把启动期自动检查推迟一个冷却周期（relaunch 场景调用）。
+///
+/// 将 LAST_CHECK_TIME 置为当前时刻，使启动与断网重连触发的自动检查都命中
+/// 冷却门；一个冷却周期后由定时器轮询恢复正常检查节奏。
+pub fn defer_initial_auto_check() {
+    let mut last = LAST_CHECK_TIME.lock().unwrap();
+    *last = Some(Instant::now());
+}
+
 #[derive(Debug)]
 struct VerifiedInstaller {
     version: String,
     path: std::path::PathBuf,
-    // 保持只读共享句柄直到 ShellExecuteExW 返回，阻止其他进程改写或替换已校验文件。
+    // 保持只读共享句柄直到 ShellExecuteExW 返回：拒绝其他进程改写或替换已
+    // 校验文件，且不与映像加载器的 FILE_SHARE_READ|FILE_SHARE_DELETE 打开
+    // 方式冲突（加载器不容纳并存句柄的写访问权，持写句柄启动必失败 32）。
     _file_lock: std::fs::File,
 }
 
@@ -362,11 +375,24 @@ fn do_update_check(is_manual: bool) -> CheckResult {
         return CheckResult::Error("写入安装包文件失败".to_string());
     }
 
-    CheckResult::InstalledReady(VerifiedInstaller {
-        version: latest_version.to_string(),
-        path: temp_path,
-        _file_lock: file_lock,
-    })
+    // 写入完成立刻降级为只读共享锁：映像加载器（及 Shell 提权预检查）以
+    // FILE_SHARE_READ|FILE_SHARE_DELETE 打开安装包、不容纳并存句柄的写访问权，
+    // 若继续持有写句柄直到启动安装器，启动必然 ERROR_SHARING_VIOLATION(32)。
+    // 顺序必须先关写句柄再开只读锁：只读锁的共享模式容纳不了仍持有写访问权
+    // 的句柄，反过来会开锁失败。两次打开之间是极短无锁窗口，防篡改语义由
+    // 只读锁延续（依然拒绝其他进程写入）。
+    drop(file_lock);
+    match open_locked_installer(&temp_path) {
+        Ok(file_lock) => CheckResult::InstalledReady(VerifiedInstaller {
+            version: latest_version.to_string(),
+            path: temp_path,
+            _file_lock: file_lock,
+        }),
+        Err(_) => {
+            let _ = std::fs::remove_file(&temp_path);
+            CheckResult::Error("锁定已下载的安装包失败".to_string())
+        }
+    }
 }
 
 /// 子进程入口：完成更新检查、用户交互和外部动作，仅将最终动作回传主进程。
@@ -479,19 +505,22 @@ fn wait_main_instance_gone() -> bool {
 }
 
 /// 重新拉起常驻主程序（仅用于 EXIT_MAIN 发出后安装未能继续的场景）。
+/// 携带一次性参数让新进程推迟首个自动检查冷却周期：更新确认框刚被用户
+/// 决策过，立刻再弹同一版本的确认框属于骚扰；下个冷却周期恢复正常。
 fn relaunch_main_app() {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(_) => return,
     };
     let path_wide = to_wide(&exe.to_string_lossy());
-    // SAFETY: path_wide 含尾 NUL，ShellExecuteW 同步返回前存活。
+    let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
+    // SAFETY: 两个缓冲均含尾 NUL，ShellExecuteW 同步返回前存活。
     unsafe {
         let _ = ShellExecuteW(
             None,
             w!("open"),
             PCWSTR(path_wide.as_ptr()),
-            None,
+            PCWSTR(args_wide.as_ptr()),
             None,
             SW_SHOWNORMAL,
         );
@@ -655,8 +684,9 @@ fn open_url(url: &str) {
     }
 }
 
-/// 启动安装器，对「文件正被占用」类瞬态错误（典型为杀软实时扫描刚写完的
-/// 安装包）做有限次重试；文件锁保持到最后一次尝试结束后才释放。
+/// 启动安装器，对「文件正被外部进程占用」类瞬态错误（典型为杀软实时扫描
+/// 刚写完的安装包）做有限次重试；只读锁保持到最后一次尝试结束后才释放，
+/// 它不与映像加载器冲突，重试只针对外部占用者。
 fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
     let mut attempt = 1;
     let result = loop {
@@ -694,6 +724,10 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
 
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        // 失败时抑制 Shell 自带错误框（如「另一个程序正在使用此文件」）：
+        // 重试期间会连弹多个标准错误框，且与子进程的 show_error 形成双重
+        // 弹窗；统一由子进程报告错误码。
+        fMask: SEE_MASK_FLAG_NO_UI,
         lpVerb: PCWSTR(verb_wide.as_ptr()),
         lpFile: PCWSTR(path_wide.as_ptr()),
         lpParameters: PCWSTR(params_wide.as_ptr()),
@@ -704,7 +738,8 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
     // SAFETY:
     // path_wide、verb_wide 和 params_wide 都是 NUL 终止的 UTF-16 缓冲区，并在
     // ShellExecuteExW 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体
-    // 实际大小一致，未设置需要调用方提供额外指针或接管进程句柄的掩码。
+    // 实际大小一致；fMask 仅含 SEE_MASK_FLAG_NO_UI，不含需要调用方提供额外
+    // 指针或接管进程句柄的掩码。
     let launched = unsafe { ShellExecuteExW(&mut sei) };
 
     if launched.is_ok() {
@@ -722,9 +757,19 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
     }
 }
 
+/// 启动期清理长期残留的临时安装包：仅删除超过缓存有效期的文件。
+///
+/// 有效期内的文件是已通过哈希校验的可复用缓存（哈希不匹配的残留由
+/// `do_update_check` 自行删除重下）；无条件删除会摧毁缓存，迫使每次
+/// 检查都重新下载。时钟回拨导致 mtime 不可解析时保守保留。
 pub fn init_cleanup_temp() {
     let path = get_temp_installer_path();
-    if path.exists() {
+    let expired = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|mtime| mtime.elapsed().ok())
+        .is_some_and(|age| age.as_secs() > INSTALLER_CACHE_MAX_AGE_SECS);
+    if expired {
         let _ = std::fs::remove_file(&path);
     }
 }
