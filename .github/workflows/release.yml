@@ -16,6 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Extract version from tag
         id: version
@@ -114,6 +115,57 @@ jobs:
           HASH=$(sha256sum "$INSTALLER" | cut -d' ' -f1 | tr 'a-z' 'A-Z')
           printf "%s\n%s\n" "$VERSION" "$HASH" > version.txt
 
+      # GitHub 原生 --generate-notes 只会列出两个 tag 之间 merge 的 PR；
+      # 直接 push 到 main 的提交会被吞掉，只剩 Full Changelog。
+      # 因此自行遍历 commits 生成 What's Changed：
+      #   - squash 合并的 PR（message 以 (#N) 结尾）-> PR 链接条目
+      #   - merge commit -> 取标题行 -> PR 链接条目
+      #   - 其余直接提交 -> commit 链接条目
+      #   - 过滤 release: 版本提交噪音
+      - name: Generate release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -z "$PREV_TAG" ]; then
+            # 首个发布：回退到仓库首个提交
+            PREV_TAG="$(git rev-list --max-parents=0 HEAD | head -n1)"
+          fi
+          echo "Range: ${PREV_TAG}...${TAG}"
+          {
+            echo "## What's Changed"
+            gh api "repos/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG}" --paginate \
+              --jq '.commits[]
+                | (.commit.message | split("\n")) as $lines
+                | $lines[0] as $subject
+                | select(($subject | startswith("release: ")) | not)
+                | select(($subject | startswith("docs: ")) | not)
+                | (if ($subject | test("^Merge pull request #[0-9]+ ")) and (($lines | length) > 2)
+                   then $lines[2] else $subject end) as $title
+                | select($title != "")
+                | (if ($subject | test("\\(#[0-9]+\\)$")) then ($subject | capture("\\(#(?<pr>[0-9]+)\\)$").pr)
+                   elif ($subject | test("^Merge pull request #[0-9]+")) then ($subject | capture("^Merge pull request #(?<pr>[0-9]+)").pr)
+                   else "" end) as $pr
+                | (.author.login // .commit.author.name // "unknown") as $author
+                | [$title, $author, .sha, $pr]
+                | @tsv' |
+            while IFS=$'\t' read -r title author sha pr; do
+              title="${title%$'\r'}" author="${author%$'\r'}" sha="${sha%$'\r'}" pr="${pr%$'\r'}"
+              title="${title% (*)}"
+              if [[ "$pr" =~ ^[0-9]+$ ]]; then
+                echo "* ${title} by @${author} in https://github.com/${GITHUB_REPOSITORY}/pull/${pr}"
+              else
+                echo "* ${title} by @${author} in https://github.com/${GITHUB_REPOSITORY}/commit/${sha}"
+              fi
+            done
+            echo
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG}"
+          } > release_notes.md
+          echo "----- release_notes.md -----"
+          cat release_notes.md
+
       - name: Upload to Release
         shell: bash
         env:
@@ -121,7 +173,10 @@ jobs:
         run: |
           if ! gh release view "${{ github.ref_name }}" &>/dev/null; then
             echo "Release ${{ github.ref_name }} not found. Creating it..."
-            gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes
+            gh release create "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --notes-file release_notes.md \
+              --latest
           else
             echo "Release ${{ github.ref_name }} already exists."
           fi
