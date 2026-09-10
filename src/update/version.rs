@@ -17,20 +17,9 @@ pub(super) fn compare_versions(current: &str, latest: &str) -> bool {
 }
 
 fn parse_version(value: &str) -> Option<Version> {
-    let (base, suffix) = match value.split_once('-') {
-        Some((base, suffix)) => (base, Some(suffix)),
-        None => (value, None),
-    };
-    if suffix.is_some_and(|suffix| {
-        suffix.is_empty()
-            || !suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return None;
-    }
-
-    let mut parts = base.split('.');
+    // 仅接受严格 `major.minor.patch` 纯数字：任何含 `-` 的后缀都会使对应
+    // 数字段解析失败，从而走统一的“版本号格式不正确”错误路径。
+    let mut parts = value.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
@@ -49,8 +38,9 @@ fn is_valid_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// 严格解析版本元数据文件：必须恰好两行（版本号 + SHA-256），版本号符合
-/// `major.minor.patch`（可选已知后缀），哈希为恰好 64 位 ASCII 十六进制且不含内部 NUL。
+/// 严格解析版本元数据文件：必须恰好两行（版本号 + SHA-256），版本号必须为
+/// 纯数字 `major.minor.patch`（含 `-` 后缀一律拒绝），哈希为恰好 64 位 ASCII
+/// 十六进制且不含内部 NUL。
 /// 解析出的哈希统一转为大写，供后续校验比对。
 pub(super) struct ParsedMetadata {
     pub(super) version: String,
@@ -94,14 +84,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_versions_with_suffix() {
-        assert!(compare_versions("0.4.2", "0.4.3-nightly"));
-        assert!(!compare_versions("0.4.3-nightly", "0.4.2"));
-        assert!(!compare_versions("0.4.2-nightly", "0.4.2-nightly"));
-        assert!(compare_versions("0.4.2-nightly", "0.4.3"));
-    }
-
-    #[test]
     fn test_parse_version_valid() {
         assert_eq!(
             parse_version("0.4.2"),
@@ -119,14 +101,6 @@ mod tests {
                 patch: 0
             })
         );
-        assert_eq!(
-            parse_version("0.4.3-nightly"),
-            Some(Version {
-                major: 0,
-                minor: 4,
-                patch: 3
-            })
-        );
     }
 
     #[test]
@@ -140,8 +114,8 @@ mod tests {
         assert_eq!(parse_version("1.x.3"), None);
         // 空段
         assert_eq!(parse_version("1..3"), None);
-        // 空后缀
-        assert_eq!(parse_version("1.2.3-"), None);
+        // 含 `-` 后缀一律拒绝
+        assert_eq!(parse_version("1.2.3-nightly"), None);
     }
 
     #[test]
@@ -190,8 +164,8 @@ mod tests {
         assert!(parse_update_metadata(&format!("1.x.3\n{good}")).is_err());
         // 空段
         assert!(parse_update_metadata(&format!("1..3\n{good}")).is_err());
-        // 非法后缀
-        assert!(parse_update_metadata(&format!("1.2.3-\n{good}")).is_err());
+        // 带 `-` 后缀的版本行一律拒绝
+        assert!(parse_update_metadata(&format!("1.2.3-nightly\n{good}")).is_err());
         // 仅前缀版本
         assert!(parse_update_metadata(&format!("invalid\n{good}")).is_err());
     }

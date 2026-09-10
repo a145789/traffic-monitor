@@ -26,7 +26,7 @@ use crate::state::{
     MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION,
     SUSPEND_REASON_SYSTEM, SUSPEND_REASONS, reset_network_backoff,
 };
-use crate::util::{trim_working_set, utf16};
+use crate::util::trim_working_set;
 use crate::window::get_taskbar_hwnd;
 
 pub fn is_suspended() -> bool {
@@ -278,8 +278,10 @@ pub unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
     if ptr.is_null() {
         return false;
     }
-    const EXPECTED: &[u16] = &utf16::<18>("ImmersiveColorSet\0");
-    for (i, &expected_char) in EXPECTED.iter().enumerate() {
+    // 低频路径（WM_SETTINGCHANGE 一天至多数次）：运行时比较与原 `utf16::<18>`
+    // 逐字等价（含尾 NUL、长 18），去掉整套 const 展开器与误传非 ASCII 即错的隐式契约。
+    let expected: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
+    for (i, &expected_char) in expected.iter().enumerate() {
         // SAFETY: 调用者保证 ptr 指向有效的 NUL 结尾 UTF-16 序列，按偏移遍历安全。
         let actual_char = unsafe { *ptr.add(i) };
         if actual_char != expected_char {
@@ -329,6 +331,16 @@ mod tests {
         let partial: Vec<u16> = "ImmersiveColor\0".encode_utf16().collect();
         // SAFETY: partial 在栈上，指针有效。
         let result = unsafe { is_immersive_color_set(LPARAM(partial.as_ptr() as isize)) };
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_immersive_color_longer_name_is_rejected() {
+        // 含尾 NUL 精确匹配：更长的 "ImmersiveColorSetFoo" 必须拒绝。
+        // 若改用无尾 NUL 的 17 元素切片比较，此例会被误判为主题变更。
+        let longer: Vec<u16> = "ImmersiveColorSetFoo\0".encode_utf16().collect();
+        // SAFETY: longer 在栈上，指针在调用期间有效。
+        let result = unsafe { is_immersive_color_set(LPARAM(longer.as_ptr() as isize)) };
         assert!(!result);
     }
 

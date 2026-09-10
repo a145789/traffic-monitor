@@ -6,8 +6,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW,
     GetWindowRect, HWND_TOP, IsWindow, LWA_COLORKEY, RegisterClassExW, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent,
-    SetWindowLongPtrW, SetWindowPos, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDPROC, WS_CHILD,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -18,44 +18,52 @@ use crate::util::{module_instance, show_error};
 
 static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 
-pub fn register_window_class() -> Result<(), String> {
-    // WINDOW_CLASS 常量已含尾 NUL。
-    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
+fn register_class(class_name: &str, proc: WNDPROC, err: &str) -> Result<(), String> {
+    // 类名常量已含尾 NUL，直接编码后原样保留；指针仅在本次注册调用期间使用。
+    let class_wide: Vec<u16> = class_name.encode_utf16().collect();
     let hinstance = module_instance()?;
 
     let wnd_class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(crate::wnd_proc),
+        lpfnWndProc: proc,
         hInstance: hinstance,
-        lpszClassName: PCWSTR(class_name.as_ptr()),
+        lpszClassName: PCWSTR(class_wide.as_ptr()),
         ..Default::default()
     };
 
-    // SAFETY: class_name 在调用期间保持存活；wnd_class 字段完整。
+    // SAFETY: class_wide 与 wnd_class 在 RegisterClassExW 返回前存活。
     let atom = unsafe { RegisterClassExW(&wnd_class) };
     if atom == 0 {
-        return Err("注册窗口类失败".to_string());
+        return Err(err.to_string());
     }
     Ok(())
 }
 
-pub fn create_main_window() -> Result<HWND, String> {
-    // WINDOW_CLASS / WINDOW_TITLE 常量已含尾 NUL。
-    let class_name: Vec<u16> = WINDOW_CLASS.encode_utf16().collect();
-    let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
+#[allow(clippy::too_many_arguments)]
+fn create_window(
+    class_name: &str,
+    title: &[u16],
+    width: i32,
+    height: i32,
+    style: WINDOW_STYLE,
+    ex_style: WINDOW_EX_STYLE,
+    err: &str,
+) -> Result<HWND, String> {
+    // 类名常量已含尾 NUL，title 由调用方保证含尾 NUL；指针仅在本次创建调用期间使用。
+    let class_wide: Vec<u16> = class_name.encode_utf16().collect();
     let hinstance = module_instance()?;
 
-    // SAFETY: 宽字符串缓冲区在调用期间存活。
+    // SAFETY: 宽字符串缓冲区在 CreateWindowExW 返回前存活；title 含尾 NUL。
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR(window_name.as_ptr()),
-            WS_POPUP | WS_VISIBLE,
+            ex_style,
+            PCWSTR(class_wide.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            style,
             0,
             0,
-            DISPLAY_WIDTH,
-            DISPLAY_HEIGHT,
+            width,
+            height,
             None,
             None,
             Some(hinstance),
@@ -63,28 +71,34 @@ pub fn create_main_window() -> Result<HWND, String> {
         )
     };
 
-    hwnd.map_err(|e| format!("创建窗口失败: {e:?}"))
+    hwnd.map_err(|e| format!("{err}: {e:?}"))
+}
+
+pub fn register_window_class() -> Result<(), String> {
+    register_class(WINDOW_CLASS, Some(crate::wnd_proc), "注册窗口类失败")
+}
+
+pub fn create_main_window() -> Result<HWND, String> {
+    // WINDOW_TITLE 常量已含尾 NUL。
+    let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
+    create_window(
+        WINDOW_CLASS,
+        &window_name,
+        DISPLAY_WIDTH,
+        DISPLAY_HEIGHT,
+        WS_POPUP | WS_VISIBLE,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "创建窗口失败",
+    )
 }
 
 /// 注册看门狗窗口类：隐藏顶层消息窗口，唯一可靠的 TaskbarCreated 接收者。
 pub fn register_watchdog_class() -> Result<(), String> {
-    let class_name: Vec<u16> = WATCHDOG_CLASS.encode_utf16().collect();
-    let hinstance = module_instance()?;
-
-    let wnd_class = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(crate::watchdog_wnd_proc),
-        hInstance: hinstance,
-        lpszClassName: PCWSTR(class_name.as_ptr()),
-        ..Default::default()
-    };
-
-    // SAFETY: class_name 在调用期间保持存活；wnd_class 字段完整。
-    let atom = unsafe { RegisterClassExW(&wnd_class) };
-    if atom == 0 {
-        return Err("注册看门狗窗口类失败".to_string());
-    }
-    Ok(())
+    register_class(
+        WATCHDOG_CLASS,
+        Some(crate::watchdog_wnd_proc),
+        "注册看门狗窗口类失败",
+    )
 }
 
 /// 创建隐藏的顶层看门狗窗口。
@@ -93,28 +107,17 @@ pub fn register_watchdog_class() -> Result<(), String> {
 /// 级联销毁，且 TaskbarCreated 广播只投递顶层窗口——主窗口自身永远收不到。
 /// 看门狗永不嵌入、从不显示（无 GDI 位图/DC），常驻开销可忽略。
 pub fn create_watchdog_window() -> Result<HWND, String> {
-    let class_name: Vec<u16> = WATCHDOG_CLASS.encode_utf16().collect();
-    let hinstance = module_instance()?;
-
-    // SAFETY: class_name 缓冲区在调用期间存活；不带 WS_VISIBLE 保持隐藏。
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            PCWSTR(class_name.as_ptr()),
-            w!(""),
-            WS_OVERLAPPED,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(hinstance),
-            None,
-        )
-    };
-
-    hwnd.map_err(|e| format!("创建看门狗窗口失败: {e:?}"))
+    // 空标题的 NUL 结尾切片，与原 w!("") 等价。
+    const EMPTY_TITLE: [u16; 1] = [0];
+    create_window(
+        WATCHDOG_CLASS,
+        &EMPTY_TITLE,
+        0,
+        0,
+        WS_OVERLAPPED,
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "创建看门狗窗口失败",
+    )
 }
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {

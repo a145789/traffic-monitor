@@ -35,19 +35,6 @@ pub fn push_wide(buf: &mut Vec<u16>, s: &str) {
     buf.push(0);
 }
 
-/// 编译期把 ASCII 字符串展开为定长 UTF-16 数组。仅适用于 ASCII 输入；
-/// 非 ASCII 字节会产生错误结果（调用方负责保证输入为 ASCII）。
-pub const fn utf16<const N: usize>(s: &str) -> [u16; N] {
-    let mut buf = [0u16; N];
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        buf[i] = bytes[i] as u16;
-        i += 1;
-    }
-    buf
-}
-
 /// 当前进程模块句柄（HINSTANCE），用于注册窗口类、加载内置资源。
 pub fn module_instance() -> Result<windows::Win32::Foundation::HINSTANCE, String> {
     // SAFETY: GetModuleHandleW(None) 查询当前进程模块，无指针参数。
@@ -314,20 +301,6 @@ mod tests {
         push_wide(&mut buf, "B");
         // "A\0" + "B\0"
         assert_eq!(buf, vec![b'A' as u16, 0, b'B' as u16, 0]);
-    }
-
-    #[test]
-    fn test_utf16_ascii() {
-        let result = utf16::<5>("test");
-        // 't'=0x74 'e'=0x65 's'=0x73 't'=0x74 + NUL padding
-        assert_eq!(result, [0x74, 0x65, 0x73, 0x74, 0]);
-    }
-
-    #[test]
-    fn test_utf16_exact_fit() {
-        // 恰好填满缓冲区时不应溢出。
-        let result = utf16::<3>("ab");
-        assert_eq!(result, [b'a' as u16, b'b' as u16, 0]);
     }
 
     // ===== trim_threshold =====
