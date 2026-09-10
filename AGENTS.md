@@ -9,6 +9,8 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 
 > [!IMPORTANT]
 > **默认禁止阅读 `docs/`**（含 `docs/archive/`）。其中为历史 RFC、审计、研究笔记与旧实现说明，**可能过时**，不得当作现行约束。
+>
+> **例外：`docs/rfc/` 可以读、且应读**。它是现行提案目录（未实施的待办 + 刚实施完的笔记），不是历史备份，不过时。约定见 [docs/rfc/README.md](docs/rfc/README.md)。查待办：`grep -rn "^Status: *proposed" docs/rfc/`。
 
 **何时可以读 archive**：用户明确给出路径/文件名，或明确说「查 docs / 查 archive / 看 RFC / 看审计 / 按 unsafe policy」等。  
 **禁止**：为「更全面了解项目」而自行打开 archive；现行不变量以本文件 + 源码为准。
@@ -68,7 +70,7 @@ Stop-Process -Name "traffic-monitor" -Force # 强退旧进程
 ```bash
 cargo test 2>&1   # 验证测试用例通过
 cargo build --release 2>&1      # 验证构建无警告
-cargo clippy -- -D warnings     # 验证 Clippy 无警告
+cargo clippy --all-targets -- -D warnings   # 验证 Clippy 无警告；--all-targets 不可省，否则漏查 test/bench target 而 CI 红
 cargo fmt                       # 格式化代码
 ```
 

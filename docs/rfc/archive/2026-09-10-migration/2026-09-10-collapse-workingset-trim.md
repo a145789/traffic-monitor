@@ -4,7 +4,7 @@ Status: implemented
 
 ## 问题
 
-工作集修剪是全仓生产代码量最大的防御性子系统：[`config.rs`](../../../src/config.rs) 有 3 个水位常量（最低门槛、基线放大百分比、冷却秒数）加 2 套定时器 ID/间隔（`MEMORY_MAINTENANCE` 每 60s、`INIT_TRIM` 一次性 10s），[`state.rs`](../../../src/state.rs) 有跨线程 `Mutex<TrimBookkeeping>`（`last_trim_at` / `pending_baseline` / `steady_state_bytes` 三字段），[`util.rs`](../../../src/util.rs) 有 `trim_working_set`、`trim_working_set_if_needed`、`trim_threshold`、`compact_and_trim` 四个入口加 3 个水位单测，[`suspend.rs`](../../../src/suspend.rs) 的 `TimerPlan` 与 `sync_monitoring_timers` 为它单独保留 `memory_maintenance` 分支，[`main.rs`](../../../src/main.rs) 为它保留两个 `WM_TIMER` 分支，更新子进程的 `compact_and_trim` 还要与 UI 线程共享同一冷却时钟。本体只是一个常驻任务栏、每秒一次 GDI 文本绘制的小组件，且主进程已设置低内存优先级、更新重活全在短命子进程里，水位机的“基线校准 → 百分比放大 → 冷却抖动抑制”三段逻辑成本明显高于它能省下的几 MB Standby 页。
+工作集修剪是全仓生产代码量最大的防御性子系统：[`config.rs`](../../../../src/config.rs) 有 3 个水位常量（最低门槛、基线放大百分比、冷却秒数）加 2 套定时器 ID/间隔（`MEMORY_MAINTENANCE` 每 60s、`INIT_TRIM` 一次性 10s），[`state.rs`](../../../../src/state.rs) 有跨线程 `Mutex<TrimBookkeeping>`（`last_trim_at` / `pending_baseline` / `steady_state_bytes` 三字段），[`util.rs`](../../../../src/util.rs) 有 `trim_working_set`、`trim_working_set_if_needed`、`trim_threshold`、`compact_and_trim` 四个入口加 3 个水位单测，[`suspend.rs`](../../../../src/suspend.rs) 的 `TimerPlan` 与 `sync_monitoring_timers` 为它单独保留 `memory_maintenance` 分支，[`main.rs`](../../../../src/main.rs) 为它保留两个 `WM_TIMER` 分支，更新子进程的 `compact_and_trim` 还要与 UI 线程共享同一冷却时钟。本体只是一个常驻任务栏、每秒一次 GDI 文本绘制的小组件，且主进程已设置低内存优先级、更新重活全在短命子进程里，水位机的“基线校准 → 百分比放大 → 冷却抖动抑制”三段逻辑成本明显高于它能省下的几 MB Standby 页。
 
 ## 提案
 

@@ -4,7 +4,7 @@ Status: implemented
 
 ## 问题
 
-[`register_window_class`](../../../src/window.rs) 与 [`register_watchdog_class`](../../../src/window.rs) 除类名（`WINDOW_CLASS` / `WATCHDOG_CLASS`）、窗口过程（`wnd_proc` / `watchdog_wnd_proc`）与错误文案外逐行相同；[`create_main_window`](../../../src/window.rs) 与 `create_watchdog_window` 同样共享“宽串类名 → `module_instance` → `CreateWindowExW` → `map_err`”骨架。生产调用方只有 [`main.rs`](../../../src/main.rs) 启动序列中的四处相邻调用（注册×2、创建×2，重建路径复用 `create_main_window`），重复体的真实成本是分叉风险：任一分支修了 `cbSize`、`hInstance` 或错误处理，另一分支极易漏改，而两个类在语义上必须保持“除过程与可见性外一致”。
+[`register_window_class`](../../../../src/window.rs) 与 [`register_watchdog_class`](../../../../src/window.rs) 除类名（`WINDOW_CLASS` / `WATCHDOG_CLASS`）、窗口过程（`wnd_proc` / `watchdog_wnd_proc`）与错误文案外逐行相同；[`create_main_window`](../../../../src/window.rs) 与 `create_watchdog_window` 同样共享“宽串类名 → `module_instance` → `CreateWindowExW` → `map_err`”骨架。生产调用方只有 [`main.rs`](../../../../src/main.rs) 启动序列中的四处相邻调用（注册×2、创建×2，重建路径复用 `create_main_window`），重复体的真实成本是分叉风险：任一分支修了 `cbSize`、`hInstance` 或错误处理，另一分支极易漏改，而两个类在语义上必须保持“除过程与可见性外一致”。
 
 ## 提案
 
