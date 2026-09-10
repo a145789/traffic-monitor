@@ -1,6 +1,6 @@
 # Agent Note：折叠主窗口与看门狗窗口的重复注册/创建代码
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

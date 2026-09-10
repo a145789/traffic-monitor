@@ -55,8 +55,7 @@ pub(super) fn select_winner_interface(
 /// `u64 * 1000` 上限约 1.8e22，远小于 u128::MAX，无溢出风险。
 ///
 /// - `delta_bytes`：本周期累计字节增量（已 saturating_sub 过初值）。
-/// - `elapsed_ms`：距上次采样的毫秒数；`max(1)` 规避零除（防御性，正常 > 0；
-///   时间逆转经 `saturating_duration_since` 饱和为 0 时亦走此兜底）。
+/// - `elapsed_ms`：距上次采样的毫秒数；`max(1)` 是纯零除兜底（正常采样间隔恒 > 0）。
 fn normalize_bytes_per_sec(delta_bytes: u64, elapsed_ms: u64) -> u32 {
     let ms = elapsed_ms.max(1) as u128;
     let scaled = delta_bytes as u128 * 1000 / ms;
@@ -97,7 +96,8 @@ mod tests {
     #[test]
     fn test_normalize_zero_elapsed_does_not_panic() {
         // 防御性：elapsed_ms 为 0 时不应零除 panic，按 1ms 处理。
-        // 此分支亦覆盖时间逆转经 saturating_duration_since 饱和为 0 的场景。
+        // 这是 max(1) 零除兜底的唯一覆盖；时间逆转只会被 saturating_duration_since
+        // 饱和为 0 后落到同一分支，无法直接构造 now < prev 的 Instant 单独验证。
         assert_eq!(normalize_bytes_per_sec(5000, 0), 5_000_000);
     }
 
@@ -122,16 +122,6 @@ mod tests {
             per_sec > 1_000_000_000,
             "expected >1GB/s, got {per_sec} (early truncation regression)"
         );
-    }
-
-    #[test]
-    fn test_instant_saturating_duration_since_does_not_panic_on_time_regression() {
-        // 回归守护：确认标准库在时间逆转时走 saturating 路径而非 panic。
-        // 无法直接构造 now < prev 的 Instant，但可断言同瞬时下返回 0 Duration，
-        // 证明我们用的是不会 panic 的 saturating 变体（duration_since 同参也返回 0，
-        // 真正差异在逆转行为，此处至少锁定 API 选择不被误改回 duration_since）。
-        let t = Instant::now();
-        assert_eq!(t.saturating_duration_since(t).as_millis(), 0);
     }
 
     // ===== select_winner_interface =====

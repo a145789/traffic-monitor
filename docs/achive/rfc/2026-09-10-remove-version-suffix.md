@@ -1,6 +1,6 @@
 # Agent Note：删除版本号后缀分支，只接受严格 x.y.z
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

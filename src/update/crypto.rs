@@ -122,15 +122,6 @@ mod tests {
         assert_eq!(format_hex(&[0x12, 0x34, 0x56]), "123456");
     }
 
-    #[test]
-    fn test_hash_hex_case_insensitive() {
-        let data = b"hello world";
-        let hash = compute_sha256_hex(data).unwrap();
-        let upper = hash.to_uppercase();
-        let lower = hash.to_lowercase();
-        assert_eq!(upper, lower.to_uppercase());
-    }
-
     // ===== compute_sha256_hex known-answer =====
 
     #[test]

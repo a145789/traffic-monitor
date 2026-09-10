@@ -306,30 +306,23 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 
     let temp_path = get_temp_installer_path();
 
-    // 若临时文件已存在且哈希匹配，以只读共享锁打开后直接复用。
-    if temp_path.exists() {
-        if let Ok(existing_hash) = compute_sha256_hex_file(&temp_path) {
-            if existing_hash.to_uppercase() == expected_hash_hex {
-                match open_locked_installer(&temp_path) {
-                    Ok(file_lock) => {
-                        return CheckResult::InstalledReady(VerifiedInstaller {
-                            version: latest_version.to_string(),
-                            path: temp_path,
-                            _file_lock: file_lock,
-                        });
-                    }
-                    Err(_) => {
-                        // 无法锁定已有文件，删除后重新下载。
-                        let _ = std::fs::remove_file(&temp_path);
-                    }
-                }
-            } else {
-                let _ = std::fs::remove_file(&temp_path);
-            }
-        } else {
-            let _ = std::fs::remove_file(&temp_path);
-        }
+    // 临时安装包缓存复用：哈希匹配且能以只读共享锁打开才复用；文件缺失、哈希不匹配
+    // 或被占用都统一落到下面的删除后重新下载。不先探针 exists()：哈希与加锁本身就以
+    // Err 表达缺失，探针只会多一层判断，并与删除之间留下 TOCTOU 窗口。
+    if compute_sha256_hex_file(&temp_path)
+        .is_ok_and(|existing_hash| existing_hash.to_uppercase() == expected_hash_hex)
+        && let Ok(file_lock) = open_locked_installer(&temp_path)
+    {
+        return CheckResult::InstalledReady(VerifiedInstaller {
+            version: latest_version.to_string(),
+            path: temp_path,
+            _file_lock: file_lock,
+        });
     }
+
+    // 第一次删除：常规缓存未命中场景（文件不存在或已被改坏）在这里就把文件名腾出来，
+    // 让下载后的 create_new(true) 能直接建新文件。
+    let _ = std::fs::remove_file(&temp_path);
 
     // 主源失败时回落到代理源；两者都失败时报组合错误。
     let installer_data = match fetch_url(GITHUB_HOST, &download_path, INSTALLER_MAX_BYTES) {
@@ -363,7 +356,9 @@ fn do_update_check(is_manual: bool) -> CheckResult {
     if let Some(parent) = temp_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // 先尝试移除可能残留的无效文件（上次哈希不匹配或被中断的下载）。
+    // 第二次删除，与上一次相隔整段下载，二者并非互为重复：上一次若被瞬时占用（杀毒
+    // 实时扫描等）挡下，占用通常在下载的数秒内已自行解除，此处重试即可自愈；缺了这一步
+    // create_new(true) 会在这里报已存在，而用户已经为整包下载付过代价。
     let _ = std::fs::remove_file(&temp_path);
     let mut file_lock = match create_locked_installer(&temp_path) {
         Ok(f) => f,
@@ -845,13 +840,16 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_garbage_lines_forward_nothing_and_remember_nothing() {
+    fn test_scan_invalid_lines_do_not_block_later_exit_main() {
+        // 无效行必须只被跳过，不得阻断其后的有效动作：EXIT_MAIN 故意放在无效行之后。
+        // 旧输入（无效行之后无有效动作）对任何实现都成立，本用例才能真正区分
+        // 「跳过无效行」与「遇无效行即停止读取」两种实现。
         let (parsed, exit_signalled, read_failed, forwards) =
-            scan(b"NO_UPDATE\nEXIT_MAIN|extra\n\n");
-        assert_eq!(parsed, None);
-        assert!(!exit_signalled);
+            scan(b"NO_UPDATE\nEXIT_MAIN|extra\nEXIT_MAIN\n");
+        assert_eq!(parsed, Some(UpdateAction::ExitMain));
+        assert!(exit_signalled);
         assert!(!read_failed);
-        assert_eq!(forwards, 0);
+        assert_eq!(forwards, 1);
     }
 
     #[test]
