@@ -1,6 +1,4 @@
-use std::time::Instant;
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
-use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
     PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
@@ -13,11 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 use windows_registry::CURRENT_USER;
 
-use crate::config::{
-    APP_TITLE, WORKING_SET_TRIM_BASELINE_GROWTH_PCT, WORKING_SET_TRIM_COOLDOWN_SECS,
-    WORKING_SET_TRIM_MIN_BYTES,
-};
-use crate::state::TRIM_BOOKKEEPING;
+use crate::config::APP_TITLE;
 
 /// 业务字符串 → NUL 结尾 UTF-16。Win32 API 的标准入口。
 ///
@@ -153,77 +147,15 @@ pub fn reg_remove_value(subkey: &str, value_name: &str) -> bool {
         .is_ok()
 }
 
-/// 修剪当前进程工作集（物理页面退到 Standby List），并更新共享 trim 簿记。
+/// 修剪当前进程工作集（物理页面退到 Standby List）。
 ///
 /// 与 `compact_and_trim` 的区别：本函数**不**压缩堆，适合挂起、初始化后等
-/// 周期性/一次性场景调用，不会引发工作集反弹。
-///
-/// 所有调用方（维护定时器水位门、INIT_TRIM 一次性定时器、挂起路径、更新线程的
-/// `compact_and_trim`）都经由本函数写入簿记，保证冷却时间戳与稳态基线全进程唯一。
+/// 一次性场景调用，不会引发工作集反弹。
 pub fn trim_working_set() {
     // SAFETY: GetCurrentProcess() 返回当前进程伪句柄，不需关闭；
     // (usize::MAX, usize::MAX) 是系统约定的工作集修剪命令。
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-    }
-
-    if let Ok(mut book) = TRIM_BOOKKEEPING.lock() {
-        book.last_trim_at = Some(Instant::now());
-        // 立即采样读到的是接近零的瞬时值，须等下个维护周期 fault-back 后再测稳态。
-        book.pending_baseline = true;
-    }
-}
-
-/// 实际触发阈值：max(绝对最低门槛, 稳态基线 × 增长系数)。
-fn trim_threshold(steady_state_bytes: u64) -> u64 {
-    let baseline_based =
-        steady_state_bytes.saturating_mul(WORKING_SET_TRIM_BASELINE_GROWTH_PCT) / 100;
-    baseline_based.max(WORKING_SET_TRIM_MIN_BYTES as u64)
-}
-
-/// 工作集超过自适应水位且距上次 trim 足够久时，归还冷物理页。
-///
-/// 使用 K32 前缀版本直接调用 Kernel32，避免加载旧版 Psapi 包装 DLL；水位与冷却
-/// 双重限制避免将热页周期性踢出后再次 fault-in。阈值基于上次实测稳态基线校准：
-/// 静态固定值若低于本进程稳态工作集，会造成每个冷却期的周期性全量清洗。
-pub fn trim_working_set_if_needed() {
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    let counters_size = counters.cb;
-
-    // SAFETY: 当前进程伪句柄有效；counters 是与 cb 匹配的栈上可写结构体。
-    let working_set = unsafe {
-        let success =
-            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters_size).as_bool();
-        if success {
-            counters.WorkingSetSize as u64
-        } else {
-            return;
-        }
-    };
-
-    let Ok(mut book) = TRIM_BOOKKEEPING.lock() else {
-        return;
-    };
-    let now = Instant::now();
-    if book.last_trim_at.is_some_and(|t| {
-        now.saturating_duration_since(t).as_secs() < WORKING_SET_TRIM_COOLDOWN_SECS
-    }) {
-        return;
-    }
-
-    // 冷却期内（含刚 trim 后的第一个维护 tick）优先补采稳态基线，
-    // 此时 fault-back 已基本完成，读数代表进程实际需要的常驻页。
-    if book.pending_baseline {
-        book.pending_baseline = false;
-        book.steady_state_bytes = working_set;
-    }
-
-    if working_set >= trim_threshold(book.steady_state_bytes) {
-        drop(book);
-        trim_working_set();
     }
 }
 
@@ -239,8 +171,6 @@ pub fn trim_working_set_if_needed() {
 /// 仅在更新检查等「大量临时堆分配已全部释放」的场景中调用；**不可**用于常规
 /// 周期性 trim，否则会因过度 decommit 导致后续正常分配反复 recommit 页面，
 /// 造成工作集反弹到更高水位。
-///
-/// 经由 `trim_working_set` 收口写入共享簿记，与 UI 线程的水位门共享冷却时钟。
 pub fn compact_and_trim() {
     // SAFETY:
     // 1. GetProcessHeaps(None) 返回进程堆数量，无副作用。
@@ -301,28 +231,5 @@ mod tests {
         push_wide(&mut buf, "B");
         // "A\0" + "B\0"
         assert_eq!(buf, vec![b'A' as u16, 0, b'B' as u16, 0]);
-    }
-
-    // ===== trim_threshold =====
-
-    #[test]
-    fn test_trim_threshold_without_baseline_uses_floor() {
-        assert_eq!(trim_threshold(0), WORKING_SET_TRIM_MIN_BYTES as u64);
-    }
-
-    #[test]
-    fn test_trim_threshold_baseline_below_floor_is_clamped() {
-        // 基线 ×2 仍低于最低门槛时不放大缺页风险，取门槛值。
-        let low = (WORKING_SET_TRIM_MIN_BYTES / 3) as u64;
-        assert_eq!(trim_threshold(low), WORKING_SET_TRIM_MIN_BYTES as u64);
-    }
-
-    #[test]
-    fn test_trim_threshold_grows_with_baseline() {
-        let baseline = WORKING_SET_TRIM_MIN_BYTES as u64 * 4;
-        assert_eq!(
-            trim_threshold(baseline),
-            baseline * WORKING_SET_TRIM_BASELINE_GROWTH_PCT / 100
-        );
     }
 }

@@ -36,9 +36,8 @@ use windows::core::{PCWSTR, w};
 use crate::collector::{collect_cpu, collect_memory, collect_network};
 use crate::config::{
     LOWORD_MASK, RELAUNCHED_BY_UPDATE_ARG, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK,
-    TIMER_INTERVAL_INIT_TRIM, WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED,
-    WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
+    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_INIT_TRIM,
+    WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
 use crate::state::{ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, reset_network_backoff};
@@ -51,9 +50,7 @@ use crate::update::{
     defer_initial_auto_check, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
     subprocess_main,
 };
-use crate::util::{
-    set_low_memory_priority, show_error, trim_working_set, trim_working_set_if_needed,
-};
+use crate::util::{set_low_memory_priority, show_error, trim_working_set};
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
     register_watchdog_class, register_window_class, update_taskbar_position,
@@ -399,11 +396,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_AUTO_UPDATE if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) => {
             start_auto_check(hwnd);
-        }
-        TIMER_ID_MEMORY_MAINTENANCE
-            if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) =>
-        {
-            trim_working_set_if_needed();
         }
         _ => {}
     }

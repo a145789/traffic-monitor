@@ -18,9 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{
     CPU_MEM_INTERVAL, TIMER_COALESCING_TOLERANCE_MS, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_MEMORY_MAINTENANCE, TIMER_ID_NETWORK, TIMER_INTERVAL_AUTO_UPDATE,
-    TIMER_INTERVAL_FULLSCREEN, TIMER_INTERVAL_MEMORY_MAINTENANCE, TIMER_INTERVAL_NETWORK,
-    TIMER_INTERVAL_NETWORK_BACKOFF,
+    TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK, TIMER_INTERVAL_AUTO_UPDATE, TIMER_INTERVAL_FULLSCREEN,
+    TIMER_INTERVAL_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF,
 };
 use crate::state::{
     MONITOR_FULLSCREEN, NETWORK_BACKOFF, SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION,
@@ -107,7 +106,6 @@ struct TimerPlan {
     network_interval: Option<u32>,
     cpu_mem: bool,
     auto_update: bool,
-    memory_maintenance: bool,
 }
 
 /// 纯函数决定当前状态下应存在的定时器集合，供状态机测试覆盖暂停/恢复对称性。
@@ -118,7 +116,6 @@ fn timer_plan(suspended: bool, fullscreen: bool, network_backoff: bool) -> Timer
             network_interval: None,
             cpu_mem: false,
             auto_update: false,
-            memory_maintenance: false,
         };
     }
 
@@ -128,7 +125,6 @@ fn timer_plan(suspended: bool, fullscreen: bool, network_backoff: bool) -> Timer
             network_interval: None,
             cpu_mem: false,
             auto_update: false,
-            memory_maintenance: false,
         };
     }
 
@@ -141,15 +137,14 @@ fn timer_plan(suspended: bool, fullscreen: bool, network_backoff: bool) -> Timer
         }),
         cpu_mem: true,
         auto_update: true,
-        memory_maintenance: true,
     }
 }
 
 /// 依据暂停原因、全屏状态和网络退避状态，将所有周期任务定时器收敛到唯一正确集合。
 ///
 /// 返回值仅反映**核心监测定时器**（全屏检测/网络/CPU 内存）的创建结果：
-/// 任一失败返回 false。辅助定时器（自动更新、内存维护）为 best-effort，
-/// 失败被刻意忽略——它们不影响监测主功能，不应触发错误弹窗或窗口退出。
+/// 任一失败返回 false。辅助定时器（自动更新）为 best-effort，
+/// 失败被刻意忽略——它不影响监测主功能，不应触发错误弹窗或窗口退出。
 pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
     let plan = timer_plan(
         is_suspended(),
@@ -164,7 +159,6 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         KillTimer(Some(hwnd), TIMER_ID_CPU_MEM).ok();
         KillTimer(Some(hwnd), TIMER_ID_FULLSCREEN).ok();
         KillTimer(Some(hwnd), TIMER_ID_AUTO_UPDATE).ok();
-        KillTimer(Some(hwnd), TIMER_ID_MEMORY_MAINTENANCE).ok();
     }
 
     let fullscreen_ok = if plan.fullscreen {
@@ -182,16 +176,9 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         true
     };
 
-    // 这些是辅助功能，失败不应让核心监测窗口退出或弹出错误框。
+    // 这是辅助功能，失败不应让核心监测窗口退出或弹出错误框。
     if plan.auto_update {
         let _ = set_coalescable_timer(hwnd, TIMER_ID_AUTO_UPDATE, TIMER_INTERVAL_AUTO_UPDATE);
-    }
-    if plan.memory_maintenance {
-        let _ = set_coalescable_timer(
-            hwnd,
-            TIMER_ID_MEMORY_MAINTENANCE,
-            TIMER_INTERVAL_MEMORY_MAINTENANCE,
-        );
     }
 
     fullscreen_ok && network_ok && cpu_mem_ok
@@ -364,7 +351,6 @@ mod tests {
                 network_interval: None,
                 cpu_mem: false,
                 auto_update: false,
-                memory_maintenance: false,
             }
         );
     }
@@ -376,7 +362,6 @@ mod tests {
         assert_eq!(plan.network_interval, None);
         assert!(!plan.cpu_mem);
         assert!(!plan.auto_update);
-        assert!(!plan.memory_maintenance);
     }
 
     #[test]
@@ -386,7 +371,6 @@ mod tests {
         assert_eq!(plan.network_interval, Some(TIMER_INTERVAL_NETWORK_BACKOFF));
         assert!(plan.cpu_mem);
         assert!(plan.auto_update);
-        assert!(plan.memory_maintenance);
     }
 
     #[test]
@@ -395,6 +379,5 @@ mod tests {
         assert_eq!(plan.network_interval, Some(TIMER_INTERVAL_NETWORK));
         assert!(plan.cpu_mem);
         assert!(plan.auto_update);
-        assert!(plan.memory_maintenance);
     }
 }

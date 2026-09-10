@@ -42,7 +42,6 @@ pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 pub const TIMER_ID_FULLSCREEN: usize = 3;
 pub const TIMER_ID_AUTO_UPDATE: usize = 4;
-pub const TIMER_ID_MEMORY_MAINTENANCE: usize = 5;
 pub const TIMER_ID_INIT_TRIM: usize = 99;
 
 pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
@@ -50,7 +49,6 @@ pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
 pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
 pub const TIMER_INTERVAL_INIT_TRIM: u32 = 10000;
 pub const CPU_MEM_INTERVAL: u32 = 5000;
-pub const TIMER_INTERVAL_MEMORY_MAINTENANCE: u32 = 60 * 1000;
 pub const TIMER_COALESCING_TOLERANCE_MS: u32 = 100;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
@@ -89,15 +87,6 @@ pub const INSTALLER_CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// 倒计时会被反复清零导致检查被无限推迟。因此定时器只做短周期轮询，
 /// 是否真正发起检查完全由 `LAST_CHECK_TIME` 冷却门唯一裁决。
 pub const TIMER_INTERVAL_AUTO_UPDATE: u32 = 60 * 1000;
-
-/// 工作集水位的最低门槛。实际触发阈值为 `max(本值, 稳态基线 × 放大系数)`，
-/// 稳态基线在每次 trim 后由下一个维护周期实测校准（见 `state::TrimBookkeeping`），
-/// 避免静态阈值低于进程稳态工作集导致每个冷却期都全量清洗、反复制造缺页。
-pub const WORKING_SET_TRIM_MIN_BYTES: usize = 6 * 1024 * 1024;
-/// 相对上次实测稳态基线的增长百分比门槛（200 = 翻倍才 trim）。
-pub const WORKING_SET_TRIM_BASELINE_GROWTH_PCT: u64 = 200;
-/// 两次水位 trim 的最短间隔，避免共享页或 GDI 页无法立即回收时反复抖动。
-pub const WORKING_SET_TRIM_COOLDOWN_SECS: u64 = 15 * 60;
 
 pub const COLOR_KEY: u32 = 0x00FF00FF;
 pub const COLOR_DARK_TEXT: u32 = 0x00282828;
