@@ -68,11 +68,13 @@ Stop-Process -Name "traffic-monitor" -Force # 强退旧进程
 在任何代码修改后，提交前必须执行并确保无任何警告或错误：
 
 ```bash
-cargo test 2>&1   # 验证测试用例通过
-cargo build --release 2>&1      # 验证构建无警告
-cargo clippy --all-targets -- -D warnings   # 验证 Clippy 无警告；--all-targets 不可省，否则漏查 test/bench target 而 CI 红
+cargo test --locked 2>&1        # 验证测试用例通过
+cargo build --release --locked 2>&1   # 验证构建无警告
+cargo clippy --all-targets --locked -- -D warnings   # 验证 Clippy 无警告；--all-targets 不可省，否则漏查 test/bench target 而 CI 红
 cargo fmt                       # 格式化代码
 ```
+
+与 CI（`check.yml`）对齐：三条 cargo 命令都必须带 `--locked`，缺了会静默改写 `Cargo.lock` 而本地绿、CI 红；`cargo fmt` 是就地格式化，等价于 CI 的 `cargo fmt -- --check`。**改了 `Cargo.toml` 必须把 `Cargo.lock` 一并提交**。
 
 _注：`unsafe` 须遵守本文件第 9 节风格约束；完整历史 policy 在 `docs/archive/unsafe-code-policy.md`，**仅当用户要求时再读**。上述构建、Clippy 和格式化校验仅在修改了 Rust 相关的源码文件时才需要执行。CI（check.yml）使用 `dtolnay/rust-toolchain@stable` 即**最新 stable** 工具链，本地工具链落后时 clippy 可能通过而 CI 挂在新 lint 上；提交前若跨过 Rust 小版本，建议 `rustup update stable` 后复跑 clippy。_
 
