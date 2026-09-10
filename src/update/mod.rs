@@ -307,8 +307,8 @@ fn do_update_check(is_manual: bool) -> CheckResult {
     let temp_path = get_temp_installer_path();
 
     // 临时安装包缓存复用：哈希匹配且能以只读共享锁打开才复用；文件缺失、哈希不匹配
-    // 或被占用都统一落到下面的一次性删除后重新下载。不先探针 exists()：哈希与加锁
-    // 本身就以 Err 表达缺失，探针只会多一层判断，并与删除之间留下 TOCTOU 窗口。
+    // 或被占用都统一落到下面的删除后重新下载。不先探针 exists()：哈希与加锁本身就以
+    // Err 表达缺失，探针只会多一层判断，并与删除之间留下 TOCTOU 窗口。
     if compute_sha256_hex_file(&temp_path)
         .is_ok_and(|existing_hash| existing_hash.to_uppercase() == expected_hash_hex)
         && let Ok(file_lock) = open_locked_installer(&temp_path)
@@ -320,7 +320,8 @@ fn do_update_check(is_manual: bool) -> CheckResult {
         });
     }
 
-    // 复用失败：删除残留文件，保证下面 create_new(true) 能以独占写锁建新文件。
+    // 第一次删除：常规缓存未命中场景（文件不存在或已被改坏）在这里就把文件名腾出来，
+    // 让下载后的 create_new(true) 能直接建新文件。
     let _ = std::fs::remove_file(&temp_path);
 
     // 主源失败时回落到代理源；两者都失败时报组合错误。
@@ -352,10 +353,13 @@ fn do_update_check(is_manual: bool) -> CheckResult {
     }
 
     // 确保父目录存在后，以 create_new(true) + FILE_SHARE_READ 创建独占写锁文件。
-    // 无效残留（哈希不匹配 / 被中断的下载）已在复用判定后统一删除，此处不再重复删除。
     if let Some(parent) = temp_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // 第二次删除，与上一次相隔整段下载，二者并非互为重复：上一次若被瞬时占用（杀毒
+    // 实时扫描等）挡下，占用通常在下载的数秒内已自行解除，此处重试即可自愈；缺了这一步
+    // create_new(true) 会在这里报已存在，而用户已经为整包下载付过代价。
+    let _ = std::fs::remove_file(&temp_path);
     let mut file_lock = match create_locked_installer(&temp_path) {
         Ok(f) => f,
         Err(_) => {
