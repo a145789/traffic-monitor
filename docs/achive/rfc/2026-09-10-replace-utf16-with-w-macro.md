@@ -1,6 +1,6 @@
 # Agent Note：删除手写 const utf16，改用运行时宽串比较
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

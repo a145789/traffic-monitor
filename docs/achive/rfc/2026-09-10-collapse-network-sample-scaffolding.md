@@ -1,6 +1,6 @@
 # Agent Note：删除网速采样路径上与纯函数重复的脚手架状态
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
