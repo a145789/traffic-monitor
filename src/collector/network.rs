@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -22,12 +22,13 @@ use crate::state::{CONSECUTIVE_ZERO_COUNT, NET_SPEED_DOWN, NET_SPEED_UP, NETWORK
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
 
-static NET_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
-    static VIRTUAL_BLACKLIST: RefCell<Option<(HashSet<u64>, Instant)>> = const { RefCell::new(None) };
+    // 值 + 可选时间戳：空名单即合法初值，None 表示从未刷新。
+    // 注：HashSet::new 需要运行时随机种子，无法放进 const 初始化块。
+    static VIRTUAL_BLACKLIST: RefCell<(HashSet<u64>, Option<Instant>)> =
+        RefCell::new((HashSet::new(), None));
 }
 
 struct MibTable(*mut MIB_IF_TABLE2);
@@ -73,8 +74,6 @@ pub fn collect_network(hwnd: HWND) {
     let table_wrapper = MibTable(table);
 
     with_virtual_blacklist(|virtual_blacklist| {
-        let mut has_up_interface = false;
-
         CURRENT_DATA.with(|cell| {
             let mut current_data = cell.borrow_mut();
             current_data.clear();
@@ -91,25 +90,13 @@ pub fn collect_network(hwnd: HWND) {
                 }
 
                 if row.OperStatus == IfOperStatusUp {
-                    has_up_interface = true;
                     current_data.insert(luid, (row.InOctets, row.OutOctets));
                 }
             }
 
-            if !NET_INITIALIZED.load(Ordering::Acquire) {
-                // 首次采样：只记基线，不算速率。
-                let now = Instant::now();
-                INTERFACE_HISTORY.with(|hist| {
-                    let mut history = hist.borrow_mut();
-                    history.clear();
-                    for (luid, (in_octets, out_octets)) in current_data.iter() {
-                        history.insert(*luid, (*in_octets, *out_octets, now));
-                    }
-                });
-                NET_INITIALIZED.store(true, Ordering::Release);
-                return;
-            }
-
+            // 首 tick 基线不需要独立标志：历史表为空时 select_winner_interface 对每个
+            // LUID 都取不到历史并返回 (0, 0)，同时把本次数据写入历史——"无历史即零速"
+            // 是被单测钉死的唯一属主，此处不再维护平行的初始化状态。
             let now = Instant::now();
             let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
                 .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
@@ -117,7 +104,7 @@ pub fn collect_network(hwnd: HWND) {
             NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
             NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
 
-            if best_speed_down == 0 && best_speed_up == 0 && !has_up_interface {
+            if best_speed_down == 0 && best_speed_up == 0 && current_data.is_empty() {
                 let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
                     NETWORK_BACKOFF.store(true, Ordering::Release);
@@ -264,37 +251,29 @@ fn with_virtual_blacklist<R>(f: impl FnOnce(&HashSet<u64>) -> R) -> R {
             rebuild_virtual_blacklist(&mut cache, now, build_virtual_blacklist);
         }
 
-        // 重建成功或失败回退后缓存必然为 Some；该分支只是类型层面的空名单兜底。
+        // 类型即不变量：空名单是合法初值，重建后必然有值，无需再解 Option 兜底。
         let cache = cell.borrow();
-        let Some((blacklist, _)) = cache.as_ref() else {
-            return f(&HashSet::new());
-        };
+        let (blacklist, _) = &*cache;
         f(blacklist)
     })
 }
 
-fn blacklist_needs_refresh(cache: &Option<(HashSet<u64>, Instant)>, now: Instant) -> bool {
-    cache.as_ref().is_none_or(|(_, last_refresh)| {
-        now.saturating_duration_since(*last_refresh).as_secs() >= BLACKLIST_REFRESH_SECS
-    })
+fn blacklist_needs_refresh(cache: &(HashSet<u64>, Option<Instant>), now: Instant) -> bool {
+    let (_, last_refresh) = cache;
+    last_refresh
+        .is_none_or(|t| now.saturating_duration_since(t).as_secs() >= BLACKLIST_REFRESH_SECS)
 }
 
-/// 重建黑名单缓存：成功覆盖；失败保留旧表并刷新时间戳，沿用旧表一个缓存周期。
+/// 重建黑名单缓存：成功覆盖表；失败保留旧表并刷新时间戳，沿用旧表一个缓存周期。
 fn rebuild_virtual_blacklist(
-    cache: &mut Option<(HashSet<u64>, Instant)>,
+    cache: &mut (HashSet<u64>, Option<Instant>),
     now: Instant,
     rebuild: impl FnOnce() -> Option<HashSet<u64>>,
 ) {
     match rebuild() {
-        Some(set) => *cache = Some((set, now)),
-        None => {
-            // 失败也刷新时间戳，避免每 tick 重试 GetAdaptersAddresses。
-            if let Some((_, last_refresh)) = cache.as_mut() {
-                *last_refresh = now;
-            } else {
-                *cache = Some((HashSet::new(), now));
-            }
-        }
+        Some(set) => *cache = (set, Some(now)),
+        // 失败也刷新时间戳，避免每 tick 重试 GetAdaptersAddresses。
+        None => cache.1 = Some(now),
     }
 }
 
@@ -405,35 +384,36 @@ mod tests {
     fn test_blacklist_needs_refresh_when_empty_or_stale() {
         let now = Instant::now();
 
-        assert!(blacklist_needs_refresh(&None, now));
+        // 从未刷新（时间戳为 None）等价于旧表示的空缓存，必须触发重建。
+        assert!(blacklist_needs_refresh(&(HashSet::new(), None), now));
         assert!(blacklist_needs_refresh(
-            &Some((
+            &(
                 HashSet::new(),
-                now - std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS)
-            )),
+                Some(now - std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS))
+            ),
             now
         ));
-        assert!(!blacklist_needs_refresh(&Some((HashSet::new(), now)), now));
+        assert!(!blacklist_needs_refresh(&(HashSet::new(), Some(now)), now));
     }
 
     #[test]
     fn test_blacklist_refresh_success_replaces_cache() {
         let old_time = Instant::now();
-        let mut cache = Some((HashSet::from([1]), old_time));
+        let mut cache = (HashSet::from([1]), Some(old_time));
         let now = old_time + std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS + 1);
 
         rebuild_virtual_blacklist(&mut cache, now, || Some(HashSet::from([2])));
 
-        let (list, refreshed_at) = cache.as_ref().unwrap();
+        let (list, refreshed_at) = &cache;
         assert_eq!(list, &HashSet::from([2]));
-        assert!(*refreshed_at >= old_time);
+        assert!(refreshed_at.is_some_and(|t| t >= old_time));
         assert!(!blacklist_needs_refresh(&cache, now));
     }
 
     #[test]
     fn test_blacklist_refresh_failure_keeps_old_list_and_resets_timer() {
         let old_time = Instant::now();
-        let mut cache = Some((HashSet::from([7]), old_time));
+        let mut cache = (HashSet::from([7]), Some(old_time));
         let now = old_time + std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS + 1);
 
         let mut rebuild_calls = 0;
@@ -444,22 +424,22 @@ mod tests {
 
         // 失败路径必须保留旧表且只探测一次；刷新后的时间戳保证 30 秒内不会重试。
         assert_eq!(rebuild_calls, 1);
-        let (list, refreshed_at) = cache.as_ref().unwrap();
+        let (list, refreshed_at) = &cache;
         assert_eq!(list, &HashSet::from([7]));
-        assert_eq!(*refreshed_at, now);
+        assert_eq!(*refreshed_at, Some(now));
         assert!(!blacklist_needs_refresh(&cache, now));
     }
 
     #[test]
     fn test_blacklist_refresh_failure_without_old_list_stores_empty_list() {
         let now = Instant::now();
-        let mut cache = None;
+        let mut cache = (HashSet::new(), None);
 
         rebuild_virtual_blacklist(&mut cache, now, || None);
 
-        let (list, refreshed_at) = cache.as_ref().unwrap();
+        let (list, refreshed_at) = &cache;
         assert!(list.is_empty());
-        assert_eq!(*refreshed_at, now);
+        assert_eq!(*refreshed_at, Some(now));
         assert!(!blacklist_needs_refresh(&cache, now));
     }
 }
