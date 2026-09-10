@@ -142,6 +142,8 @@ jobs:
                 | $lines[0] as $subject
                 | select(($subject | startswith("release: ")) | not)
                 | select(($subject | startswith("docs: ")) | not)
+                | select(($subject | startswith("ci: ")) | not)
+                | select(($subject | startswith("test: ")) | not)
                 | (if ($subject | test("^Merge pull request #[0-9]+ ")) and (($lines | length) > 2)
                    then $lines[2] else $subject end) as $title
                 | select($title != "")
