@@ -241,7 +241,10 @@ pub fn check_fullscreen(hwnd: HWND) {
             let hmon_tb = unsafe { MonitorFromWindow(h_taskbar, MONITOR_DEFAULTTONEAREST) };
             hmon_fg == hmon_tb
         }
-        None => false,
+        // 任务栏暂不存在（Explorer 重启竞态）：拿不到比对基准，谈不上"不同屏"。
+        // 若按 false 处理会误判成"未全屏"并恢复监测定时器，把上次状态直接丢掉；
+        // 这里保持上次状态直接返回，交给下一次 tick 在任务栏就绪后重新判定。
+        None => return,
     };
 
     let was = MONITOR_FULLSCREEN.load(Ordering::Acquire);

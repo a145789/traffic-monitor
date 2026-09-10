@@ -53,13 +53,16 @@ use crate::update::{
 use crate::util::{set_low_memory_priority, show_error, trim_working_set};
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
-    register_watchdog_class, register_window_class, update_taskbar_position,
+    reembed_if_lost, register_watchdog_class, register_window_class, update_taskbar_position,
 };
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
 /// 当前主窗口句柄（isize）。Explorer 重启重建后更新；0 表示暂无主窗口。
 static CURRENT_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 已注册会话通知的窗口句柄（isize）；0 表示当前无注册。重建路径据此在销毁
+/// 旧窗口前配对注销，避免每次 Explorer 重启留下悬空注册。
+static SESSION_NOTIFY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn quit_existing_instance() {
     // WINDOW_CLASS 常量已含尾 NUL。
@@ -165,10 +168,12 @@ fn main() {
 
     register_power_notify(hwnd);
 
-    // 嵌入失败不中止启动：看门狗会在 TaskbarCreated 广播时再次尝试嵌入，
-    // 此处先完成托盘/定时器等其余常驻功能，避免留下零定时器的活窗口。
-    if !embed_in_taskbar(hwnd) {
-        show_error("嵌入任务栏失败。请确认 explorer.exe 正在运行。");
+    // 嵌入失败不中止启动：此处先完成托盘/定时器等其余常驻功能，避免留下零定时器的
+    // 活窗口；失败后由全屏检测定时器上的 reembed_if_lost 静默重试到成功为止。
+    if let Err(e) = embed_in_taskbar(hwnd) {
+        show_error(&format!(
+            "嵌入任务栏失败: {e}。请确认 explorer.exe 正在运行。"
+        ));
     }
 
     let auto_update = load_auto_update_enabled();
@@ -229,12 +234,8 @@ fn main() {
     }
 
     // 注销须针对当前主窗口：Explorer 重启重建后原局部 hwnd 已陈旧。
-    let current = CURRENT_MAIN_HWND.load(Ordering::Acquire);
-    if current != 0 {
-        unsafe {
-            let _ = WTSUnRegisterSessionNotification(HWND(current as *mut std::ffi::c_void));
-        }
-    }
+    // 会话通知经状态位取当前注册句柄，重建路径已注销过的旧注册不会重复发。
+    unregister_session_notification();
 
     let power_handle = POWER_NOTIFY_HANDLE.load(Ordering::Acquire);
     if power_handle != 0 {
@@ -269,10 +270,31 @@ fn register_power_notify(hwnd: HWND) {
     }
 }
 
-/// 注册会话锁屏通知。失败非致命：锁屏暂停失效，显示器关闭仍由电源通知覆盖。
+/// 注册会话锁屏通知，并记录句柄供 [`unregister_session_notification`] 配对注销。
+/// 失败非致命：锁屏暂停失效，显示器关闭仍由电源通知覆盖。
 fn register_session_notification(hwnd: HWND) {
-    if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
-        show_error(&format!("注册会话通知失败: {e:?}"));
+    match unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
+        // 只有注册成功才记位：失败时无配对可注销，记位会让状态位谎报存在注册。
+        Ok(()) => SESSION_NOTIFY_HWND.store(hwnd.0 as isize, Ordering::Release),
+        Err(e) => show_error(&format!("注册会话通知失败: {e:?}")),
+    }
+}
+
+/// 配对注销会话通知并在成功取出句柄时清零状态位。
+///
+/// WTS 契约要求每个 `WTSRegisterSessionNotification` 都有对应的
+/// `WTSUnRegisterSessionNotification`，且必须在窗口**销毁之前**调用；
+/// 故重建路径在 `DestroyWindow` 旧窗口前调用本函数。窗口销毁后句柄即失效，
+/// 那时再注销已无意义，这也是不能在销毁之后补做的原因。
+///
+/// 仅由 UI 线程调用（启动失败早退路径与 `rebuild_main_window`），
+/// 与同一线程上的注册调用之间无并发写者。
+fn unregister_session_notification() {
+    let registered = SESSION_NOTIFY_HWND.swap(0, Ordering::AcqRel);
+    if registered != 0 {
+        unsafe {
+            let _ = WTSUnRegisterSessionNotification(HWND(registered as *mut std::ffi::c_void));
+        }
     }
 }
 
@@ -303,6 +325,10 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
 fn rebuild_main_window() {
     invalidate_taskbar_cache();
 
+    // 会话通知必须在旧窗口销毁前配对注销：WTS 契约要求注销先于窗口销毁，
+    // 销毁后句柄失效，届时已无法补做。
+    unregister_session_notification();
+
     let old = CURRENT_MAIN_HWND.swap(0, Ordering::AcqRel);
     if old != 0 {
         let old_hwnd = HWND(old as *mut std::ffi::c_void);
@@ -324,6 +350,7 @@ fn rebuild_main_window() {
     CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
 
     // 旧电源通知绑定在已销毁的窗口上，先注销再对新窗口重新注册。
+    // 会话通知的旧注册已在函数开头（销毁前）注销，此处只补新窗口的注册。
     let prev_power = POWER_NOTIFY_HANDLE.swap(0, Ordering::AcqRel);
     if prev_power != 0 {
         unsafe {
@@ -335,9 +362,10 @@ fn rebuild_main_window() {
 
     remove_tray_icon();
 
-    // 嵌入失败同样不中止恢复：托盘与定时器必须重建，嵌入交给后续广播重试。
-    if !embed_in_taskbar(hwnd) {
-        show_error("Explorer 重启后嵌入任务栏失败");
+    // 嵌入失败同样不中止恢复：托盘与定时器必须重建，嵌入由 reembed_if_lost 周期兜底
+    // ——TaskbarCreated 每次任务栏创建只广播一次，不会再来第二轮。
+    if let Err(e) = embed_in_taskbar(hwnd) {
+        show_error(&format!("Explorer 重启后嵌入任务栏失败: {e}"));
     }
 
     if !bind_display_and_timers(hwnd) {
@@ -370,6 +398,14 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_FULLSCREEN => {
             if !is_suspended() {
+                // 常驻 tick（三种非挂起状态下都存在）兼作嵌入自愈：嵌入失败后
+                // TaskbarCreated 不会再来，只能靠这里静默重试；重嵌入成功必须重绘，
+                // 否则刚恢复可见的分层窗口仍是空白画布。
+                if reembed_if_lost(hwnd) {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
                 check_fullscreen(hwnd);
             }
         }
@@ -449,6 +485,8 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
         WM_DPICHANGED => {
             renderer::with_renderer(|r| r.update_dpi(hwnd));
+            // 失败不弹框：DPI 变更本身就是重排，改由 reembed_if_lost 在下一 tick 补做，
+            // 避免跨屏拖动时连环弹窗。
             let _ = embed_in_taskbar(hwnd);
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
