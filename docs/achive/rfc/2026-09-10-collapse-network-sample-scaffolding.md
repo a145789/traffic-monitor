@@ -51,7 +51,7 @@ Status: proposed
 
 ## 验收标准
 
-`grep -n "NET_INITIALIZED" src/` 与 `grep -n "has_up_interface" src/` 均无命中；`grep -n "Option<(HashSet<u64>, Instant)>" src/` 无命中；`grep -n "test_instant_saturating_duration_since\|test_hash_hex_case_insensitive" src/` 无命中；`network.rs` 中 `history.clear()` 无命中。行为一致性：`rate.rs` 首见网卡用例、`test_immersive_color_*` 之外的全部 `network.rs` 过滤与缓存语义用例（`test_is_valid_interface_*`、`test_virtual_name_*`、`test_blacklist_*` 共 13 例）全绿；改造后的流式用例在有区分力的输入下通过，且在旧实现（丢弃无效行后不再转发）下会失败——这是它相对原用例的增量保护。手动验证：断网 ≥5 秒后采样间隔切到 15s 且只弹一次退避状态切换，恢复网络立即回到 1s 且数值无虚假峰值；接着确认首 tick 速率仍显示 0（不出现基于 0 基线的假峰值）。门禁：`cargo test`、`cargo build --release`、`cargo clippy -- -D warnings`、`cargo fmt` 全绿。
+`grep -n "NET_INITIALIZED" src/` 与 `grep -n "has_up_interface" src/` 均无命中；`grep -n "Option<(HashSet<u64>, Instant)>" src/` 无命中；`grep -n "test_instant_saturating_duration_since\|test_hash_hex_case_insensitive" src/` 无命中；`network.rs` 中 `history.clear()` 无命中。行为一致性：`rate.rs` 首见网卡用例、`test_immersive_color_*` 之外的全部 `network.rs` 过滤与缓存语义用例（`test_is_valid_interface_*`、`test_virtual_name_*`、`test_blacklist_*` 共 16 例）全绿；改造后的流式用例在有区分力的输入下通过，且在旧实现（丢弃无效行后不再转发）下会失败——这是它相对原用例的增量保护。手动验证：断网 ≥5 秒后采样间隔切到 15s 且只弹一次退避状态切换，恢复网络立即回到 1s 且数值无虚假峰值；接着确认首 tick 速率仍显示 0（不出现基于 0 基线的假峰值）。门禁：`cargo test`、`cargo build --release`、`cargo clippy -- -D warnings`、`cargo fmt` 全绿。
 
 ## 风险
 
