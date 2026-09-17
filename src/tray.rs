@@ -215,7 +215,7 @@ pub fn show_context_menu(hwnd: HWND) {
     }
 }
 
-pub fn handle_menu_command(hwnd: HWND, item_id: u32) {
+fn handle_menu_command(hwnd: HWND, item_id: u32) {
     match item_id {
         MENU_ID_AUTOSTART => toggle_autostart(),
         MENU_ID_AUTO_UPDATE_TOGGLE => toggle_auto_update(),

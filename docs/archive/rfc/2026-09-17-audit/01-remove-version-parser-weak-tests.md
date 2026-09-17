@@ -1,5 +1,5 @@
 # Agent Note：删除版本解析器中两处与控制流错位的弱测试
-Status: proposed
+Status: implemented
 
 ## 问题
 
