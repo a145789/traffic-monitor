@@ -1,6 +1,6 @@
 # Agent Note：安装器推迟强杀并优先优雅退出
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
