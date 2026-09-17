@@ -1,6 +1,6 @@
 # Agent Note：安装包流水线改为流式写入加锁后重验
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
