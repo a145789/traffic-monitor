@@ -44,8 +44,8 @@ use crate::util::{
     reg_write_dword, reg_write_string, show_error, show_info, to_wide,
 };
 
-use crypto::{compute_sha256_hex, compute_sha256_hex_file};
-use http::fetch_url;
+use crypto::compute_sha256_hex_locked;
+use http::{fetch_to_file, fetch_url};
 use version::{compare_versions, parse_update_metadata};
 
 /// 仓库唯一来源：所有 GitHub 路径与 URL 均从这里派生，更换仓库只需改这一处。
@@ -330,88 +330,121 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 
     let temp_path = get_temp_installer_path();
 
-    // 临时安装包缓存复用：哈希匹配且能以只读共享锁打开才复用；文件缺失、哈希不匹配
-    // 或被占用都统一落到下面的删除后重新下载。不先探针 exists()：哈希与加锁本身就以
-    // Err 表达缺失，探针只会多一层判断，并与删除之间留下 TOCTOU 窗口。
-    if compute_sha256_hex_file(&temp_path)
-        .is_ok_and(|existing_hash| existing_hash.to_uppercase() == expected_hash_hex)
-        && let Ok(file_lock) = open_locked_installer(&temp_path)
+    // 缓存复用：先加锁再对锁定句柄哈希（见 try_reuse_cached_installer），
+    // 同一句柄验证与持有，不按路径另开文件。缺失/占用/不匹配都落到重下。
+    if let Some(verified) =
+        try_reuse_cached_installer(temp_path.clone(), &latest_version, &expected_hash_hex)
     {
-        return CheckResult::InstalledReady(VerifiedInstaller {
-            version: latest_version.to_string(),
-            path: temp_path,
-            _file_lock: file_lock,
-        });
+        return CheckResult::InstalledReady(verified);
     }
-
-    // 第一次删除：常规缓存未命中场景（文件不存在或已被改坏）在这里就把文件名腾出来，
-    // 让下载后的 create_new(true) 能直接建新文件。
-    let _ = std::fs::remove_file(&temp_path);
 
     // 主源失败时回落到代理源；两者都失败时报组合错误。
-    let installer_data = match fetch_url(GITHUB_HOST, &download_path, INSTALLER_MAX_BYTES) {
-        Ok(data) => data,
+    // 流式写入全程不经过整包 Vec（见 fetch_verified_installer）。
+    match fetch_verified_installer(
+        &temp_path,
+        GITHUB_HOST,
+        &download_path,
+        &expected_hash_hex,
+        &latest_version,
+    ) {
+        Ok(verified) => CheckResult::InstalledReady(verified),
         Err(e) => {
             let proxy_path = format!("/{GITHUB_REPOSITORY_URL}/{asset_path}");
-            match fetch_url(PROXY_HOST, &proxy_path, INSTALLER_MAX_BYTES) {
-                Ok(data) => data,
-                Err(pe) => {
-                    return CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"));
-                }
+            match fetch_verified_installer(
+                &temp_path,
+                PROXY_HOST,
+                &proxy_path,
+                &expected_hash_hex,
+                &latest_version,
+            ) {
+                Ok(verified) => CheckResult::InstalledReady(verified),
+                Err(pe) => CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})")),
             }
         }
-    };
-
-    let actual_hash_hex = match compute_sha256_hex(&installer_data) {
-        Ok(h) => h,
-        Err(e) => {
-            return CheckResult::Error(format!("计算安装包哈希失败: {e}"));
-        }
-    };
-
-    if actual_hash_hex.to_uppercase() != expected_hash_hex {
-        return CheckResult::Error(format!(
-            "安装包校验失败 (预期: {}, 实际: {})",
-            expected_hash_hex, actual_hash_hex
-        ));
     }
+}
 
-    // 确保父目录存在后，以 create_new(true) + FILE_SHARE_READ 创建独占写锁文件。
+/// 缓存复用：先加只读共享锁，再对锁定句柄哈希——同一句柄验证与持有。
+/// 不变量：不按路径另开文件做验证，不探针 `exists()`（加锁与哈希以 Err 表达缺失）；
+/// 哈希不匹配/读取失败返回 `None`，调用方删文件后重下。锁随 `VerifiedInstaller`
+/// 持有至安装器启动返回（见 `launch_installer`）。
+fn try_reuse_cached_installer(
+    path: std::path::PathBuf,
+    version: &str,
+    expected_hash_hex: &str,
+) -> Option<VerifiedInstaller> {
+    let mut file_lock = open_locked_installer(&path).ok()?;
+    // 对已锁定句柄哈希：验的就是将要持有的同一句柄，验后换文件无窗口。
+    let existing_hash = compute_sha256_hex_locked(&mut file_lock).ok()?;
+    if existing_hash.to_uppercase() != expected_hash_hex {
+        return None;
+    }
+    Some(VerifiedInstaller {
+        version: version.to_string(),
+        path,
+        _file_lock: file_lock,
+    })
+}
+
+/// 单源流式下载并加锁重验：创建写锁文件 → 流式抓取（边读边哈希边写）
+/// → 流式哈希早验 → 降级只读锁 → 对锁定句柄重算哈希 → 构造持锁体。
+///
+/// 不变量：最终构造的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），
+/// 不采信流式哈希、不按路径另开文件；失败路径一律删文件，不留半写残留。
+/// 错误已带中文 `op`（抓取/哈希/写入/锁定），调用方直接透传。
+fn fetch_verified_installer(
+    temp_path: &std::path::Path,
+    host: &str,
+    url_path: &str,
+    expected_hash_hex: &str,
+    version: &str,
+) -> Result<VerifiedInstaller, String> {
     if let Some(parent) = temp_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // 第二次删除，与上一次相隔整段下载，二者并非互为重复：上一次若被瞬时占用（杀毒
-    // 实时扫描等）挡下，占用通常在下载的数秒内已自行解除，此处重试即可自愈；缺了这一步
-    // create_new(true) 会在这里报已存在，而用户已经为整包下载付过代价。
-    let _ = std::fs::remove_file(&temp_path);
-    let mut file_lock = match create_locked_installer(&temp_path) {
-        Ok(f) => f,
-        Err(_) => {
-            return CheckResult::Error("创建安装包文件失败".to_string());
+    let _ = std::fs::remove_file(temp_path);
+    let mut write_lock =
+        create_locked_installer(temp_path).map_err(|_| "创建安装包文件失败".to_string())?;
+    let streaming_hash = fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock)?;
+    if streaming_hash.to_uppercase() != expected_hash_hex {
+        drop(write_lock);
+        let _ = std::fs::remove_file(temp_path);
+        return Err(format!(
+            "安装包校验失败 (预期: {}, 实际: {})",
+            expected_hash_hex, streaming_hash
+        ));
+    }
+    // 降级为只读共享锁：映像加载器以 FILE_SHARE_READ|FILE_SHARE_DELETE 打开，
+    // 不容纳并存句柄的写访问权，持写句柄启动必失败 32。先关写再开只读，
+    // 反向会因共享模式冲突开锁失败。
+    drop(write_lock);
+    let mut file_lock = open_locked_installer(temp_path).map_err(|_| {
+        let _ = std::fs::remove_file(temp_path);
+        "锁定已下载的安装包失败".to_string()
+    })?;
+    // 对已锁定句柄重算哈希：关写到开读之间的无锁窗口若被篡改，在此现形。
+    let verified_hash = match compute_sha256_hex_locked(&mut file_lock) {
+        Ok(h) => h,
+        Err(e) => {
+            // 先释放锁再删，否则 Windows 下删除被占用文件会失败而残留。
+            drop(file_lock);
+            let _ = std::fs::remove_file(temp_path);
+            return Err(format!("计算安装包哈希失败: {e}"));
         }
     };
-    if file_lock.write_all(&installer_data).is_err() {
-        return CheckResult::Error("写入安装包文件失败".to_string());
+    if verified_hash.to_uppercase() != expected_hash_hex {
+        drop(file_lock);
+        let _ = std::fs::remove_file(temp_path);
+        return Err(format!(
+            "安装包校验失败 (预期: {}, 实际: {})",
+            expected_hash_hex, verified_hash
+        ));
     }
-
-    // 写入完成立刻降级为只读共享锁：映像加载器（及 Shell 提权预检查）以
-    // FILE_SHARE_READ|FILE_SHARE_DELETE 打开安装包、不容纳并存句柄的写访问权，
-    // 若继续持有写句柄直到启动安装器，启动必然 ERROR_SHARING_VIOLATION(32)。
-    // 顺序必须先关写句柄再开只读锁：只读锁的共享模式容纳不了仍持有写访问权
-    // 的句柄，反过来会开锁失败。两次打开之间是极短无锁窗口，防篡改语义由
-    // 只读锁延续（依然拒绝其他进程写入）。
-    drop(file_lock);
-    match open_locked_installer(&temp_path) {
-        Ok(file_lock) => CheckResult::InstalledReady(VerifiedInstaller {
-            version: latest_version.to_string(),
-            path: temp_path,
-            _file_lock: file_lock,
-        }),
-        Err(_) => {
-            let _ = std::fs::remove_file(&temp_path);
-            CheckResult::Error("锁定已下载的安装包失败".to_string())
-        }
-    }
+    Ok(VerifiedInstaller {
+        version: version.to_string(),
+        path: temp_path.to_path_buf(),
+        _file_lock: file_lock,
+    })
 }
 
 /// 子进程入口：完成更新检查、用户交互和外部动作，仅将最终动作回传主进程。
@@ -988,5 +1021,50 @@ mod tests {
         assert!(!is_transient_launch_error(&InstallerLaunch::Cancelled));
         assert!(!is_transient_launch_error(&InstallerLaunch::Failed(5)));
         assert!(!is_transient_launch_error(&InstallerLaunch::Failed(2)));
+    }
+
+    // ===== 锁定句柄重验（TOCTOU 防护） =====
+
+    /// 唯一使用真实临时文件的用例：文件名含进程 ID，避免与并行用例冲突；
+    /// 首尾都删文件，不留残留。生产路径禁止 unwrap，此处为测试断言。
+    fn tamper_test_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "traffic-monitor-reuse-test-{}-{}.tmp",
+            std::process::id(),
+            tag
+        ))
+    }
+
+    #[test]
+    fn test_cached_reuse_accepts_matching_locked_content() {
+        let path = tamper_test_path("accept");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"good-installer-payload").unwrap();
+        let expected = {
+            let mut f = open_locked_installer(&path).unwrap();
+            compute_sha256_hex_locked(&mut f).unwrap()
+        };
+        let reused = try_reuse_cached_installer(path.clone(), "9.9.9", &expected);
+        assert!(reused.is_some(), "锁定句柄哈希一致时必须复用");
+        drop(reused);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cached_reuse_rejects_tampered_locked_content() {
+        // 模拟“校验后替换文件内容”：先按好内容算出期望哈希，再用坏内容覆盖文件，
+        // 锁后重验必须拒绝构造（返回 None），否则 TOCTOU 缺口仍在。
+        let path = tamper_test_path("reject");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"good-installer-payload").unwrap();
+        let expected_good = {
+            let mut f = open_locked_installer(&path).unwrap();
+            compute_sha256_hex_locked(&mut f).unwrap()
+        };
+        // 篡改：锁已释放后覆盖为坏内容（等价于无锁窗口内的替换）。
+        std::fs::write(&path, b"tampered-installer-payload").unwrap();
+        let reused = try_reuse_cached_installer(path.clone(), "9.9.9", &expected_good);
+        assert!(reused.is_none(), "锁定句柄哈希不一致时必须拒绝复用");
+        let _ = std::fs::remove_file(&path);
     }
 }
