@@ -45,7 +45,7 @@ use crate::util::{
 };
 
 use crypto::compute_sha256_hex_locked;
-use http::{fetch_to_file, fetch_url};
+use http::{FetchFileError, fetch_to_file, fetch_url};
 use version::{compare_versions, parse_update_metadata};
 
 /// 仓库唯一来源：所有 GitHub 路径与 URL 均从这里派生，更换仓库只需改这一处。
@@ -376,9 +376,11 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 /// 背景：旧流程仅下载失败回落，哈希/创建/锁定失败直接返回；若把本地校验失败也
 /// 回落，持续的本地磁盘故障会为空耗整包流量再失败一次。
 enum FetchFailure {
-    /// 抓取段失败（`fetch_to_file` 的网络/超限/写入/哈希错误），可回落代理。
+    /// 抓取段失败（建连/发送/接收/状态码/查询/读取/超限），可回落代理。
+    /// 写盘/哈希失败由 `http` 归为 `FetchFileError::Local`，经调用方转为本枚举的
+    /// `Local`，不在此变体。
     Download(String),
-    /// 本地失败（创建、流式哈希早验、锁定、锁柄重验），直接返回不再回落。
+    /// 本地失败（创建、流式写盘/哈希、流式哈希早验、锁定、锁柄重验），直接返回不再回落。
     Local(String),
 }
 
@@ -408,7 +410,8 @@ fn try_reuse_cached_installer(
 /// → 流式哈希早验 → 降级只读锁 → 对锁定句柄重算哈希 → 构造持锁体。
 ///
 /// 不变量：最终构造的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），
-/// 不采信流式哈希、不按路径另开文件；失败路径一律删文件，不留半写残留。
+/// 不采信流式哈希、不按路径另开文件；失败路径尽力删文件（删除结果忽略，
+/// 外部占用下可能残留，由下次缓存哈希不匹配触发重下）。
 /// 错误已带中文 `op`（抓取/哈希/写入/锁定），调用方按 `FetchFailure` 决定回落。
 fn fetch_verified_installer(
     temp_path: &std::path::Path,
@@ -446,11 +449,17 @@ fn fetch_verified_installer(
     };
     let streaming_hash = match fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock) {
         Ok(h) => h,
-        Err(e) => {
+        // 错误来源由产生处分类，不匹配文案：Download 回落代理，Local 直接返回。
+        Err(FetchFileError::Download(e)) => {
             // 先释放写锁再删，否则 Windows 下删除被占用文件会失败而残留。
             drop(write_lock);
             let _ = std::fs::remove_file(temp_path);
             return Err(FetchFailure::Download(e));
+        }
+        Err(FetchFileError::Local(e)) => {
+            drop(write_lock);
+            let _ = std::fs::remove_file(temp_path);
+            return Err(FetchFailure::Local(e));
         }
     };
     if streaming_hash.to_uppercase() != expected_hash_hex {

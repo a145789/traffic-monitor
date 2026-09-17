@@ -239,15 +239,22 @@ pub(super) fn fetch_url(
 /// 固定复用 `HTTP_READ_CHUNK_BYTES` 缓冲，全程累计字节数上限为 `max_response_bytes`
 ///（不只信 `Content-Length`，以实际读到为准）；调用方传入的应是已用
 /// `create_new(true)` + `FILE_SHARE_READ` 建好的写锁文件。
-/// 成功返回已下载内容的十六进制哈希（流式哈希）；失败返回带中文 `op` 的错误：
-/// 抓取段沿用 `friendly_error`，哈希段为“计算安装包哈希失败”、写入段为
-/// “写入安装包文件失败”，调用方据此区分网络/磁盘，无需再猜。
+/// 成功返回已下载内容的十六进制哈希（流式哈希）；失败返回结构化错误：
+/// 抓取段（建连/发送/接收/状态码/查询/读取/超限）为 `Download`（可回落代理），
+/// 哈希段与写入段为 `Local`（磁盘/加密本地故障，不回落，避免空耗整包流量）。
+/// 文案均带中文 `op`，调用方按变体映射到回落决策，不要匹配文案猜来源。
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FetchFileError {
+    Download(String),
+    Local(String),
+}
+
 pub(super) fn fetch_to_file(
     host: &str,
     path: &str,
     max_response_bytes: usize,
     file: &mut std::fs::File,
-) -> Result<String, String> {
+) -> Result<String, FetchFileError> {
     use std::io::Write;
 
     let agent = to_wide(APP_TITLE);
@@ -271,10 +278,10 @@ pub(super) fn fetch_to_file(
         )
     };
     if handles.h_session.is_null() {
-        return Err(friendly_error(
+        return Err(FetchFileError::Download(friendly_error(
             "初始化网络库",
             windows::core::Error::from_thread(),
-        ));
+        )));
     }
 
     // SAFETY: handles.h_session 有效；超时值均为正 i32 毫秒数。
@@ -288,10 +295,10 @@ pub(super) fn fetch_to_file(
     handles.h_connect =
         unsafe { WinHttpConnect(handles.h_session, PCWSTR(host_wide.as_ptr()), port, 0) };
     if handles.h_connect.is_null() {
-        return Err(friendly_error(
+        return Err(FetchFileError::Download(friendly_error(
             "建立网络连接",
             windows::core::Error::from_thread(),
-        ));
+        )));
     }
 
     // SAFETY: handles.h_connect 有效；path_wide 为 NUL 终止宽字符串。
@@ -307,22 +314,22 @@ pub(super) fn fetch_to_file(
         )
     };
     if handles.h_request.is_null() {
-        return Err(friendly_error(
+        return Err(FetchFileError::Download(friendly_error(
             "创建网络请求",
             windows::core::Error::from_thread(),
-        ));
+        )));
     }
 
     // SAFETY: handles.h_request 有效；GET 无附加缓冲区。
     unsafe {
         WinHttpSendRequest(handles.h_request, None, Some(std::ptr::null()), 0, 0, 0)
-            .map_err(|e| friendly_error("发送网络请求", e))?;
+            .map_err(|e| FetchFileError::Download(friendly_error("发送网络请求", e)))?;
     }
 
     // SAFETY: handles.h_request 有效；由 API 内部分配响应缓冲。
     unsafe {
         WinHttpReceiveResponse(handles.h_request, std::ptr::null_mut())
-            .map_err(|e| friendly_error("接收网络响应", e))?;
+            .map_err(|e| FetchFileError::Download(friendly_error("接收网络响应", e)))?;
     }
 
     let mut status_code: u32 = 0;
@@ -338,14 +345,17 @@ pub(super) fn fetch_to_file(
             &mut status_code_size,
             std::ptr::null_mut(),
         )
-        .map_err(|e| friendly_error("获取响应状态码", e))?;
+        .map_err(|e| FetchFileError::Download(friendly_error("获取响应状态码", e)))?;
     }
 
     if status_code != HTTP_OK {
-        return Err(format!("HTTP 状态码错误: {status_code}"));
+        return Err(FetchFileError::Download(format!(
+            "HTTP 状态码错误: {status_code}"
+        )));
     }
 
-    let hash = Sha256::new().map_err(|e| format!("计算安装包哈希失败: {e}"))?;
+    let hash =
+        Sha256::new().map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))?;
     let mut buf = vec![0u8; HTTP_READ_CHUNK_BYTES];
     let mut total: usize = 0;
     loop {
@@ -354,7 +364,7 @@ pub(super) fn fetch_to_file(
         // SAFETY: handles.h_request 有效；&mut available 是有效的 u32 输出参数。
         unsafe {
             WinHttpQueryDataAvailable(handles.h_request, &mut available)
-                .map_err(|e| friendly_error("查询响应数据大小", e))?;
+                .map_err(|e| FetchFileError::Download(friendly_error("查询响应数据大小", e)))?;
         }
 
         if available == 0 {
@@ -363,7 +373,9 @@ pub(super) fn fetch_to_file(
 
         let remaining = max_response_bytes.saturating_sub(total);
         if remaining == 0 {
-            return Err(format!("响应数据超过大小上限 ({max_response_bytes} 字节)"));
+            return Err(FetchFileError::Download(format!(
+                "响应数据超过大小上限 ({max_response_bytes} 字节)"
+            )));
         }
         let chunk_len = (available as usize)
             .min(HTTP_READ_CHUNK_BYTES)
@@ -378,7 +390,7 @@ pub(super) fn fetch_to_file(
                 chunk_len as u32,
                 &mut read,
             )
-            .map_err(|e| friendly_error("读取响应数据", e))?;
+            .map_err(|e| FetchFileError::Download(friendly_error("读取响应数据", e)))?;
         }
 
         let read = read as usize;
@@ -386,20 +398,22 @@ pub(super) fn fetch_to_file(
             break;
         }
         if read > chunk_len {
-            return Err("WinHTTP 返回了超过目标缓冲区的读取长度".to_string());
+            return Err(FetchFileError::Download(
+                "WinHTTP 返回了超过目标缓冲区的读取长度".to_string(),
+            ));
         }
         let data = &buf[..read];
         hash.update(data)
-            .map_err(|e| format!("计算安装包哈希失败: {e}"))?;
+            .map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))?;
         file.write_all(data)
-            .map_err(|e| format!("写入安装包文件失败: {e}"))?;
+            .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))?;
         total += read;
     }
 
     file.flush()
-        .map_err(|e| format!("写入安装包文件失败: {e}"))?;
+        .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))?;
     hash.finish()
-        .map_err(|e| format!("计算安装包哈希失败: {e}"))
+        .map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))
 }
 
 #[cfg(test)]
