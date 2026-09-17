@@ -23,6 +23,22 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
+      # 三方一致校验：tag（GITHUB_REF_NAME 去 v 前缀）、Cargo.toml 版本、installer.iss 的 AppVersion
+      # 必须全等，否则说明“元数据宣称新版本、装进去仍是旧程序”，直接失败。
+      - name: Verify version consistency
+        shell: bash
+        env:
+          # 经 env 传入而非 ${{ }} 内插进脚本，避免 tag 特殊字符造成 script-injection。
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          CARGO_VER="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          ISS_VER="$(grep -m1 -E '^AppVersion=' installer.iss | cut -d= -f2 | tr -d '\r' | xargs)"
+          echo "tag=${VERSION} Cargo.toml=${CARGO_VER} installer.iss=${ISS_VER}"
+          if [ "${VERSION}" != "${CARGO_VER}" ] || [ "${VERSION}" != "${ISS_VER}" ]; then
+            echo "Version mismatch: tag=${VERSION} Cargo.toml=${CARGO_VER} installer.iss=${ISS_VER}" >&2
+            exit 1
+          fi
+
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: release

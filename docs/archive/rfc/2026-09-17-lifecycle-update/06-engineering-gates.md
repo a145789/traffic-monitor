@@ -8,7 +8,7 @@ Status: proposed
 
 ## 提案
 
-把三处收敛为“同一提交、同一版本、同一门禁”，生产消费者为发布安装包与 `version.txt` 的版本真实性（更新闭环的信任根）；非生产消费者无（脚本与 CI 无单测，验收靠命令与工作区状态）。具体改动：`package.ts` 在改版本前同保存 `Cargo.lock` 原文，`finally` 中与 `Cargo.toml`、`installer.iss` 一起恢复，并覆盖构建成功、编译失败、打包失败三条路径（已有 `try/finally`，只加保存与恢复两行，不要加 `--locked`，因临时版本与原锁天然不一致）；`release.ts` 在改版本前强制三方一致校验（tag 目标、`Cargo.toml`、`installer.iss` 任一不一致即退出），三条 cargo 命令对齐为 `cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings` 并追加 `cargo fmt -- --check`，结尾改为只推本次目标提交与目标标签（如 `git push origin main vX.Y.Z` 语义，禁止裸 `push --tags`）；`release.yml` 在构建前加一步三方一致校验（tag 去 `v` 前缀等于包版本且等于 `AppVersion`），失败即红。
+把三处收敛为“同一提交、同一版本、同一门禁”，生产消费者为发布安装包与 `version.txt` 的版本真实性（更新闭环的信任根）；非生产消费者无（脚本与 CI 无单测，验收靠命令与工作区状态）。具体改动：`package.ts` 在改版本前同保存 `Cargo.lock` 原文，`finally` 中与 `Cargo.toml`、`installer.iss` 一起恢复，并覆盖构建成功、编译失败、打包失败三条路径（已有 `try/finally`，只加保存与恢复两行，不要加 `--locked`，因临时版本与原锁天然不一致）；`release.ts` 在改版本前强制三方一致校验（tag 目标、`Cargo.toml`、`installer.iss` 任一不一致即退出），三条 cargo 命令对齐为 `cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings` 并追加 `cargo fmt -- --check`，结尾改为只推本次目标提交与目标标签（如 `git push origin main vX.Y.Z` 语义，禁止裸 `push --tags`）；四道门禁必须排在版本写回之前执行（改写 `Cargo.toml` 版本后锁文件即过期，任何 `--locked` 命令必败，门禁只能验证改前基线），改版本之后只跑 `cargo update --workspace` 加一次复核构建；`release.yml` 在构建前加一步三方一致校验（tag 去 `v` 前缀等于包版本且等于 `AppVersion`），失败即红。
 
 ## 明确不在本次范围
 
