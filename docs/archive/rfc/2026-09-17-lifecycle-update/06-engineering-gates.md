@@ -1,6 +1,6 @@
 # Agent Note：工程门禁补齐发布一致性与锁文件恢复
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
