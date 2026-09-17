@@ -1,6 +1,6 @@
 # Agent Note：广播消息统一由看门狗接收再分发
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -8,7 +8,7 @@ Status: proposed
 
 ## 提案
 
-确立一条路由规则并只搬广播：凡 `HWND_BROADCAST` 类顶层广播（本篇先覆盖 `WM_SETTINGCHANGE` 的 `ImmersiveColorSet` 分支）统一由看门狗顶层窗口接收，再调用与主窗口相同的共享业务处理（`update_text_color` 加 `InvalidateRect`），生产消费者为主题文字颜色（`src/renderer.rs:279`）；非生产消费者为 `suspend.rs:287` 下的 `immersive_color_*` 五例（匹配语义不得变）。定向通知（电源、会话）保持注册到当前主窗口、重建时重绑的现状，本篇只补核查不断言改动。具体改动：看门狗过程新增 `WM_SETTINGCHANGE` 分支，复用 `is_immersive_color_set(lparam)` 判定后转发给当前主窗口或直接执行共享处理（与 `01` 的看门狗控制入口复用同一转发原语）；`PBT_APMSUSPEND` 类电源广播与 `WTS_SESSION_*` 的“广播还是定向”逐条在注释中写明依据（一句话即可），避免后人把定向通知误搬到看门狗导致双重处理。
+确立一条路由规则并只搬广播：凡 `HWND_BROADCAST` 类顶层广播（本篇先覆盖 `WM_SETTINGCHANGE` 的 `ImmersiveColorSet` 分支）统一由看门狗顶层窗口接收，再调用与主窗口相同的共享业务处理（`update_text_color` 加 `InvalidateRect`），生产消费者为主题文字颜色（`src/renderer.rs:279`）；非生产消费者为 `suspend.rs:287` 下的 `immersive_color_*` 五例（匹配语义不得变）。定向通知（电源、会话）保持注册到当前主窗口、重建时重绑的现状，本篇只补核查不断言改动。具体改动：看门狗过程新增 `WM_SETTINGCHANGE` 分支，复用 `is_immersive_color_set(lparam)` 判定后直接执行共享处理（与 `01` 的看门狗控制入口一样是看门狗侧直接执行，不引入转发——重建间隙主窗口可能不存在，转发反而多一个失效面）；`PBT_APMSUSPEND` 类电源广播与 `WTS_SESSION_*` 的“广播还是定向”逐条在注释中写明依据（一句话即可），避免后人把定向通知误搬到看门狗导致双重处理。
 
 ## 明确不在本次范围
 
@@ -24,4 +24,4 @@ Status: proposed
 
 ## 风险
 
-残留风险是广播与定向被误判导致双重处理（如 `WM_SETTINGCHANGE` 在主窗口与看门狗各执行一次 `update_text_color`）。缓解是转发设计为“看门狗收到即执行共享处理，主窗口分支保留仅用于未嵌入的短暂启动窗口”，或收敛为单入口调用共享函数；双重执行的后果仅是一次多余重绘，可接受但应在注释写明。证伪依据：若实机出现主题切换后颜色闪烁往返（两次处理打架）或锁屏暂停失效，即判定本篇失败。
+残留风险是广播与定向被误判导致双重处理（如 `WM_SETTINGCHANGE` 在主窗口与看门狗各执行一次 `update_text_color`）。实际语义已核实：只有「启动后、`SetParent` 之前」这段窗口期两者同为顶层，此时一次广播确实各处理一次；嵌入后主窗口是 `WS_CHILD`，只剩看门狗分支可达，因此不是每次必现。缓解是共享处理写成幂等的（重算颜色 + 置脏重绘）并在注释写明这是可接受的代价；若日后有人把定向通知也搬进看门狗，则会出现 `suspend_system`/`sync_monitoring_timers` 目标窗口错位，属功能性错误而非多余重绘。证伪依据：若实机出现主题切换后颜色闪烁往返（两次处理打架）或锁屏暂停失效，即判定本篇失败。

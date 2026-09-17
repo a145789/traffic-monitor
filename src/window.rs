@@ -18,6 +18,11 @@ use crate::config::{
 use crate::util::module_instance;
 
 static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 看门狗窗口句柄（isize）；0 表示尚未创建。
+///
+/// 看门狗是整条生命周期内唯一不重建的顶层窗口，因此它同时是
+/// `--quit` 退出请求、更新交接消息与主题广播的稳定落点（见 `crate::main`）。
+static WATCHDOG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 当前主窗口是否已完成整条嵌入序列（含分层属性）。
 ///
 /// 只有 `embed_in_taskbar` 全链成功才置位；发起任何一次嵌入前先清位，
@@ -119,7 +124,7 @@ pub fn register_watchdog_class() -> Result<(), String> {
 pub fn create_watchdog_window() -> Result<HWND, String> {
     // 空标题的 NUL 结尾切片，与原 w!("") 等价。
     const EMPTY_TITLE: [u16; 1] = [0];
-    create_window(
+    let hwnd = create_window(
         WATCHDOG_CLASS,
         &EMPTY_TITLE,
         0,
@@ -127,7 +132,24 @@ pub fn create_watchdog_window() -> Result<HWND, String> {
         WS_OVERLAPPED,
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "创建看门狗窗口失败",
-    )
+    )?;
+    // 发布句柄供 update 等模块投递控制消息：它们不再快照易失效的主窗口句柄。
+    WATCHDOG_HWND.store(hwnd.0 as isize, Ordering::Release);
+    Ok(hwnd)
+}
+
+/// 当前看门狗窗口句柄；尚未创建（或已销毁）时返回 None。
+///
+/// 调用方用它作为控制消息落点，句柄有效性由内核在投递时裁决：
+/// `PostMessageW` 对已销毁句柄返回错误，调用方据此走兜底路径。
+pub fn watchdog_hwnd() -> Option<HWND> {
+    let raw = WATCHDOG_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    // SAFETY: IsWindow 是纯查询，对任意句柄值安全返回布尔。
+    unsafe { IsWindow(Some(hwnd)) }.as_bool().then_some(hwnd)
 }
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {

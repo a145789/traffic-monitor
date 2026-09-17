@@ -219,7 +219,7 @@ fn handle_menu_command(hwnd: HWND, item_id: u32) {
     match item_id {
         MENU_ID_AUTOSTART => toggle_autostart(),
         MENU_ID_AUTO_UPDATE_TOGGLE => toggle_auto_update(),
-        MENU_ID_CHECK_UPDATE_MANUAL => crate::update::start_manual_check(hwnd),
+        MENU_ID_CHECK_UPDATE_MANUAL => crate::update::start_manual_check(),
         MENU_ID_EXIT => unsafe {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         },
