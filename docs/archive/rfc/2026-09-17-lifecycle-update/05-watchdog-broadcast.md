@@ -1,6 +1,6 @@
 # Agent Note：广播消息统一由看门狗接收再分发
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

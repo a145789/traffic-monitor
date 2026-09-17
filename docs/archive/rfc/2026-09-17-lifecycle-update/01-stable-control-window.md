@@ -1,6 +1,6 @@
 # Agent Note：看门狗成为稳定控制入口，修复退出与更新交接
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
