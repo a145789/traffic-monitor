@@ -1,6 +1,6 @@
 # Agent Note：恢复时重建采样基线，修正首个读数语义
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
