@@ -338,7 +338,7 @@ fn do_update_check(is_manual: bool) -> CheckResult {
         return CheckResult::InstalledReady(verified);
     }
 
-    // 主源失败时回落到代理源；两者都失败时报组合错误。
+    // 主源下载失败才回落代理；校验/锁定等本地失败直接返回，不多下整包。
     // 流式写入全程不经过整包 Vec（见 fetch_verified_installer）。
     match fetch_verified_installer(
         &temp_path,
@@ -348,7 +348,7 @@ fn do_update_check(is_manual: bool) -> CheckResult {
         &latest_version,
     ) {
         Ok(verified) => CheckResult::InstalledReady(verified),
-        Err(e) => {
+        Err(FetchFailure::Download(e)) => {
             let proxy_path = format!("/{GITHUB_REPOSITORY_URL}/{asset_path}");
             match fetch_verified_installer(
                 &temp_path,
@@ -358,10 +358,28 @@ fn do_update_check(is_manual: bool) -> CheckResult {
                 &latest_version,
             ) {
                 Ok(verified) => CheckResult::InstalledReady(verified),
-                Err(pe) => CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})")),
+                Err(FetchFailure::Download(pe)) => {
+                    CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
+                }
+                // 主源下载已失败，代理本地失败：两段都报出，不只报后者。
+                Err(FetchFailure::Local(pe)) => {
+                    CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
+                }
             }
         }
+        Err(FetchFailure::Local(e)) => CheckResult::Error(e),
     }
+}
+
+/// 单源失败的错误归类：只有下载段失败才回落代理。
+///
+/// 背景：旧流程仅下载失败回落，哈希/创建/锁定失败直接返回；若把本地校验失败也
+/// 回落，持续的本地磁盘故障会为空耗整包流量再失败一次。
+enum FetchFailure {
+    /// 抓取段失败（`fetch_to_file` 的网络/超限/写入/哈希错误），可回落代理。
+    Download(String),
+    /// 本地失败（创建、流式哈希早验、锁定、锁柄重验），直接返回不再回落。
+    Local(String),
 }
 
 /// 缓存复用：先加只读共享锁，再对锁定句柄哈希——同一句柄验证与持有。
@@ -391,28 +409,57 @@ fn try_reuse_cached_installer(
 ///
 /// 不变量：最终构造的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），
 /// 不采信流式哈希、不按路径另开文件；失败路径一律删文件，不留半写残留。
-/// 错误已带中文 `op`（抓取/哈希/写入/锁定），调用方直接透传。
+/// 错误已带中文 `op`（抓取/哈希/写入/锁定），调用方按 `FetchFailure` 决定回落。
 fn fetch_verified_installer(
     temp_path: &std::path::Path,
     host: &str,
     url_path: &str,
     expected_hash_hex: &str,
     version: &str,
-) -> Result<VerifiedInstaller, String> {
+) -> Result<VerifiedInstaller, FetchFailure> {
     if let Some(parent) = temp_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(temp_path);
-    let mut write_lock =
-        create_locked_installer(temp_path).map_err(|_| "创建安装包文件失败".to_string())?;
-    let streaming_hash = fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock)?;
+    // 创建争用重试：上一次删除若被杀软实时扫描挡下，数百毫秒后通常自行解除；
+    // 旧流程靠整包下载的数秒自然等待，新流程提前建文件，需显式等一次。
+    // 复用启动重试的等待时长，不新增时间常量。
+    let mut write_lock = match create_locked_installer(temp_path) {
+        Ok(f) => f,
+        Err(e) => {
+            // 仅文件仍存在（上一次删除被瞬时占用挡下）才等一次重试；
+            // 权限、路径等硬失败直接返回，不空等。
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(FetchFailure::Local("创建安装包文件失败".to_string()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                INSTALLER_LAUNCH_RETRY_DELAY_MS,
+            ));
+            let _ = std::fs::remove_file(temp_path);
+            match create_locked_installer(temp_path) {
+                Ok(f) => f,
+                Err(_) => {
+                    return Err(FetchFailure::Local("创建安装包文件失败".to_string()));
+                }
+            }
+        }
+    };
+    let streaming_hash = match fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock) {
+        Ok(h) => h,
+        Err(e) => {
+            // 先释放写锁再删，否则 Windows 下删除被占用文件会失败而残留。
+            drop(write_lock);
+            let _ = std::fs::remove_file(temp_path);
+            return Err(FetchFailure::Download(e));
+        }
+    };
     if streaming_hash.to_uppercase() != expected_hash_hex {
         drop(write_lock);
         let _ = std::fs::remove_file(temp_path);
-        return Err(format!(
+        return Err(FetchFailure::Local(format!(
             "安装包校验失败 (预期: {}, 实际: {})",
             expected_hash_hex, streaming_hash
-        ));
+        )));
     }
     // 降级为只读共享锁：映像加载器以 FILE_SHARE_READ|FILE_SHARE_DELETE 打开，
     // 不容纳并存句柄的写访问权，持写句柄启动必失败 32。先关写再开只读，
@@ -420,7 +467,7 @@ fn fetch_verified_installer(
     drop(write_lock);
     let mut file_lock = open_locked_installer(temp_path).map_err(|_| {
         let _ = std::fs::remove_file(temp_path);
-        "锁定已下载的安装包失败".to_string()
+        FetchFailure::Local("锁定已下载的安装包失败".to_string())
     })?;
     // 对已锁定句柄重算哈希：关写到开读之间的无锁窗口若被篡改，在此现形。
     let verified_hash = match compute_sha256_hex_locked(&mut file_lock) {
@@ -429,16 +476,16 @@ fn fetch_verified_installer(
             // 先释放锁再删，否则 Windows 下删除被占用文件会失败而残留。
             drop(file_lock);
             let _ = std::fs::remove_file(temp_path);
-            return Err(format!("计算安装包哈希失败: {e}"));
+            return Err(FetchFailure::Local(format!("计算安装包哈希失败: {e}")));
         }
     };
     if verified_hash.to_uppercase() != expected_hash_hex {
         drop(file_lock);
         let _ = std::fs::remove_file(temp_path);
-        return Err(format!(
+        return Err(FetchFailure::Local(format!(
             "安装包校验失败 (预期: {}, 实际: {})",
             expected_hash_hex, verified_hash
-        ));
+        )));
     }
     Ok(VerifiedInstaller {
         version: version.to_string(),
