@@ -1,5 +1,5 @@
 # Agent Note：以零速计数派生退避状态，删除 NETWORK_BACKOFF 双份表示
-Status: proposed
+Status: implemented
 
 ## 问题
 

@@ -1,5 +1,5 @@
 # Agent Note：删除主窗口不可达的 WM_COMMAND 分支与启动路径无效果托盘清理
-Status: proposed
+Status: implemented
 
 ## 问题
 
