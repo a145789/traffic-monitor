@@ -61,21 +61,19 @@ pub static NET_SPEED_UP: AtomicU32 = AtomicU32::new(0);
 /// 下行速率（B/s）。读写：Relaxed。
 pub static NET_SPEED_DOWN: AtomicU32 = AtomicU32::new(0);
 
-/// 网速连续为零，进入退避。读写：Acquire / Release（与定时器重建握手）。
-pub static NETWORK_BACKOFF: AtomicBool = AtomicBool::new(false);
-
-/// 连续零速计数。读写：Relaxed（采集线程计数）/ Release（主线程恢复路径清零）。
+/// 连续零速计数；退避状态由其派生（`>= BACKOFF_ZERO_THRESHOLD` 即退避）。
+/// 读写：Relaxed（采集计数）/ Release（主线程恢复路径清零），均为同一 UI 线程
+/// 内的定时器读写（见模块头约定）。
 pub static CONSECUTIVE_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// 复位网络退避：清零连续零速计数并退出退避，恢复快速采样。
+/// 复位网络退避：清零连续零速计数，恢复快速采样。
 ///
-/// 归属说明：退避的置位与自增属主在 `collector::network`，但 suspend 反向调用
-/// collector 会新增依赖边，这里作为两个原子量的家是零新边的中立归属（与
+/// 归属说明：计数的自增属主在 `collector::network`，但 suspend 反向调用
+/// collector 会新增依赖边，这里作为计数器的家是零新边的中立归属（与
 /// `SuspendReasons` 把位协议封装在状态属主处的既有做法一致）。
-/// 两个 store 须在 `sync_monitoring_timers` 读取 `NETWORK_BACKOFF` 之前完成；
+/// 清零须在 `sync_monitoring_timers` 读取派生退避谓词之前完成；
 /// 先后顺序与既有各调用方写法语义等价。
 pub fn reset_network_backoff() {
-    NETWORK_BACKOFF.store(false, Ordering::Release);
     CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Release);
 }
 

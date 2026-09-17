@@ -17,7 +17,7 @@ use crate::config::{
     BACKOFF_ZERO_THRESHOLD, BLACKLIST_REFRESH_SECS, WM_USER_NETWORK_DISCONNECTED,
     WM_USER_NETWORK_RECONNECTED,
 };
-use crate::state::{CONSECUTIVE_ZERO_COUNT, NET_SPEED_DOWN, NET_SPEED_UP, NETWORK_BACKOFF};
+use crate::state::{CONSECUTIVE_ZERO_COUNT, NET_SPEED_DOWN, NET_SPEED_UP};
 
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
@@ -62,6 +62,9 @@ impl Drop for MibTable {
 
 /// 采样一次全网卡流量并更新速率状态；断网/恢复消息投递给调用方提供的
 /// 当前主窗口（UI 线程 WM_TIMER tick 携带的 hwnd，不存在陈旧句柄 tick）。
+///
+/// 仅由 UI 线程调用（与 `bind_display_and_timers` 同约束）：计数自增/清零与
+/// 退避边沿判定全在同一线程内完成，故可用 Relaxed 派生退避谓词。
 pub fn collect_network(hwnd: HWND) {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     // SAFETY: 成功时 OS 分配表，由 MibTable Drop → FreeMibTable 释放。
@@ -106,14 +109,12 @@ pub fn collect_network(hwnd: HWND) {
 
             if best_speed_down == 0 && best_speed_up == 0 && current_data.is_empty() {
                 let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= BACKOFF_ZERO_THRESHOLD && !NETWORK_BACKOFF.load(Ordering::Acquire) {
-                    NETWORK_BACKOFF.store(true, Ordering::Release);
+                if count == BACKOFF_ZERO_THRESHOLD {
                     post_to_main(hwnd, WM_USER_NETWORK_DISCONNECTED);
                 }
             } else {
-                CONSECUTIVE_ZERO_COUNT.store(0, Ordering::Relaxed);
-                if NETWORK_BACKOFF.load(Ordering::Acquire) {
-                    NETWORK_BACKOFF.store(false, Ordering::Release);
+                let previous = CONSECUTIVE_ZERO_COUNT.swap(0, Ordering::Relaxed);
+                if previous >= BACKOFF_ZERO_THRESHOLD {
                     post_to_main(hwnd, WM_USER_NETWORK_RECONNECTED);
                 }
             }

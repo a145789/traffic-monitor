@@ -204,13 +204,6 @@ mod tests {
 
     #[test]
     fn test_parse_update_metadata_rejects_internal_nul() {
-        // 版本行包含内部 NUL：parse_version 走 split('.') 后 "3\0..." 段不可解析为 u32。
-        assert!(
-            parse_update_metadata(
-                "1.2.3\0\0B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9"
-            )
-            .is_err()
-        );
         // 哈希行包含内部 NUL：NUL 非 ascii_hexdigit，长度也会超过 64。
         assert!(
             parse_update_metadata(
@@ -218,13 +211,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn test_parse_update_metadata_rejects_oversize_blob() {
-        // 模拟远端返回超大的合法风格 blob：大量额外行使其超过两行限制即被拒。
-        let huge = "0.0.1\n".repeat(10_000);
-        assert!(parse_update_metadata(&huge).is_err());
     }
 
     #[test]

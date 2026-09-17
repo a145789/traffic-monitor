@@ -27,9 +27,9 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
     DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow, FindWindowW, IsWindow, KillTimer,
-    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetTimer, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_TIMER, WM_WTSSESSION_CHANGE,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetTimer, WM_CLOSE, WM_CONTEXTMENU,
+    WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
+    WM_WTSSESSION_CHANGE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -183,7 +183,6 @@ fn main() {
         Ok(r) => renderer::set_renderer(r),
         Err(e) => {
             show_error(&format!("初始化渲染器失败: {e}"));
-            remove_tray_icon();
             return;
         }
     }
@@ -503,12 +502,6 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             unsafe {
                 PostQuitMessage(0);
             }
-            LRESULT(0)
-        }
-
-        WM_COMMAND => {
-            let menu_id = (wparam.0 as u32) & LOWORD_MASK;
-            tray::handle_menu_command(hwnd, menu_id);
             LRESULT(0)
         }
 
