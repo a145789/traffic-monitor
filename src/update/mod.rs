@@ -20,7 +20,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GetLastError,
-    HWND, LPARAM, WPARAM,
+    LPARAM, WPARAM,
 };
 use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
 use windows::Win32::UI::Shell::{
@@ -136,7 +136,7 @@ fn create_locked_installer(path: &std::path::Path) -> std::io::Result<std::fs::F
         .open(path)
 }
 
-pub fn start_auto_check(hwnd: HWND) {
+pub fn start_auto_check() {
     if !ENABLE_AUTO_UPDATE.load(Ordering::Relaxed) {
         return;
     }
@@ -155,30 +155,32 @@ pub fn start_auto_check(hwnd: HWND) {
         }
     }
 
-    spawn_update_worker(hwnd, false);
+    spawn_update_worker(false);
 }
 
-pub fn start_manual_check(hwnd: HWND) {
+/// 手动检查（托盘菜单）。
+///
+/// 不接受 HWND：更新交接消息的落点是看门狗窗口（见 `post_update_action_to_watchdog`），
+/// 它全生命周期不重建；主窗口句柄会在 Explorer 重启时失效，快照它必然丢消息。
+pub fn start_manual_check() {
     // 更新相关提示必须全部由短生命周期子进程显示，避免 MessageBox/IME DLL
     // 因重复点击进入常驻主进程；已有检查运行时直接忽略本次点击。
     if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return;
     }
 
-    spawn_update_worker(hwnd, true);
+    spawn_update_worker(true);
 }
 
 /// spawn 更新工作线程；spawn 失败时复位进行中标志。
 ///
 /// 仅负责线程创建与失败复位；自动检查的两道前置门（开关、冷却）保留在
 /// `start_auto_check` 内，占坑与门序不因本函数改变。
-fn spawn_update_worker(hwnd: HWND, is_manual: bool) {
-    let hwnd_raw: isize = hwnd.0 as isize;
-
+fn spawn_update_worker(is_manual: bool) {
     if std::thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(move || {
-            update_check_worker(hwnd_raw, is_manual);
+            update_check_worker(is_manual);
         })
         .is_err()
     {
@@ -186,8 +188,8 @@ fn spawn_update_worker(hwnd: HWND, is_manual: bool) {
     }
 }
 
-fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
-    let outcome = run_check_subprocess(is_manual, hwnd_raw);
+fn update_check_worker(is_manual: bool) {
+    let outcome = run_check_subprocess(is_manual);
 
     if !is_manual {
         let mut last = LAST_CHECK_TIME.lock().unwrap();
@@ -204,14 +206,25 @@ fn update_check_worker(hwnd_raw: isize, is_manual: bool) {
         }
     }
 
-    // EXIT_MAIN 在子进程读取阶段就已即时转发（见 run_check_subprocess），
-    // 主进程即将退出，不再重置进行中标志。
-    if outcome.exit_signalled {
+    // 只有「读到 EXIT_MAIN」且「成功通知 UI」同时成立，主进程才真的要退出。
+    if !reset_update_progress_after_check(&outcome) {
         return;
     }
-
-    UPDATE_IN_PROGRESS.store(false, Ordering::Release);
     compact_and_trim();
+}
+
+/// worker 收尾判定：返回 true 表示本次检查已结束、调用方还需压缩内存。
+///
+/// EXIT_MAIN 已成功送达时返回 false——主进程随即退出，此时复位进行中标志反而
+/// 与退出竞态。其余情况（含「读到 EXIT_MAIN 但转发失败」）都必须复位标志：
+/// 主进程仍在运行，不复位会让后续一切自动/手动检查被 `swap(true)` 永久挡掉，
+/// 直到用户重启进程。
+fn reset_update_progress_after_check(outcome: &SubprocessOutcome) -> bool {
+    if outcome.exit_signalled && outcome.exit_forwarded {
+        return false;
+    }
+    UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    true
 }
 
 /// 把启动期自动检查推迟一个冷却周期（relaunch 场景调用）。
@@ -249,8 +262,11 @@ enum UpdateAction {
 
 struct SubprocessOutcome {
     is_error: bool,
-    /// 已在 stdout 中读到 EXIT_MAIN 并即时转发给主窗口，worker 无需再做任何事。
+    /// 已在 stdout 中读到 EXIT_MAIN（协议层事实，不代表通知已送达）。
     exit_signalled: bool,
+    /// EXIT_MAIN 已成功投递给看门狗（UI 侧接到通知）。转发失败时主进程不会退出，
+    /// worker 必须收尾复位进行中标志，否则后续检查被永久挡掉。
+    exit_forwarded: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -525,16 +541,17 @@ fn relaunch_main_app() {
 /// 主进程调用：re-exec 自身 `--check-update` 子进程，逐行解析其 stdout 协议。
 ///
 /// winhttp/bcrypt、MessageBox/IME 和 ShellExecute 相关 DLL 只会进入子进程；
-/// 主进程只解析 `DONE/EXIT_MAIN` 最终动作。读到 `EXIT_MAIN` 时立即转发给主
-/// 窗口而不等子进程退出——此时安装器尚未启动，主进程必须先行退出释放 exe
-/// 映像，子进程才会继续执行提权安装。
+/// 主进程只解析 `DONE/EXIT_MAIN` 最终动作。读到 `EXIT_MAIN` 时立即转发给看门狗
+/// （再由它落到主窗口）而不等子进程退出——此时安装器尚未启动，主进程必须先行
+/// 退出释放 exe 映像，子进程才会继续执行提权安装。
 ///
 /// 此处使用 `spawn()` + 手动按行读取，而非 `output()`，避免后者为并发读取
 /// stderr 创建一个使用默认 2MB 栈预留的隐藏线程。
-fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
+fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     let failed = || SubprocessOutcome {
         is_error: true,
         exit_signalled: false,
+        exit_forwarded: false,
     };
     let exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -559,15 +576,12 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
         Err(_) => return failed(),
     };
 
-    let (parsed_action, exit_signalled, read_failed) = match child.stdout.take() {
+    let (parsed_action, exit_signalled, read_failed, exit_forwarded) = match child.stdout.take() {
         Some(stdout) => {
             let mut reader = BufReader::new(stdout);
-            scan_subprocess_protocol(&mut reader, || {
-                let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-                post_update_action(hwnd);
-            })
+            scan_subprocess_protocol(&mut reader, post_update_action_to_watchdog)
         }
-        None => (None, false, true),
+        None => (None, false, true, false),
     };
 
     let exit_status = match child.wait() {
@@ -576,6 +590,7 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
             return SubprocessOutcome {
                 is_error: true,
                 exit_signalled,
+                exit_forwarded,
             };
         }
     };
@@ -583,22 +598,25 @@ fn run_check_subprocess(is_manual: bool, hwnd_raw: isize) -> SubprocessOutcome {
     SubprocessOutcome {
         is_error: read_failed || parsed_action.is_none() || !exit_status.success(),
         exit_signalled,
+        exit_forwarded,
     }
 }
 
-/// 逐行扫描子进程 stdout 协议，返回 (首个有效动作, 是否已转发 EXIT_MAIN, 读取是否失败)。
+/// 逐行扫描子进程 stdout 协议，返回
+/// `(首个有效动作, 是否读到 EXIT_MAIN, 读取是否失败, 转发是否送达)`。
 ///
 /// 不变量（由本模块 tests 以 Cursor 喂协议行钉死）：读到 `EXIT_MAIN` 即调用
 /// `on_exit_main` 转发且仅转发一次（exit_signalled 守卫），转发发生在扫描期间、
-/// 早于 `child.wait()`；调用方无补发路径，转发失败由子进程超时照常启动安装器
-/// + 安装器内 taskkill 兜底。
+/// 早于 `child.wait()`；调用方无补发路径。转发返回值独立于「是否读到」上报，
+/// 使「消息没送出去」不再被当成「主进程即将退出」。
 fn scan_subprocess_protocol(
     reader: &mut impl BufRead,
-    mut on_exit_main: impl FnMut(),
-) -> (Option<UpdateAction>, bool, bool) {
+    mut on_exit_main: impl FnMut() -> bool,
+) -> (Option<UpdateAction>, bool, bool, bool) {
     let mut parsed_action: Option<UpdateAction> = None;
     let mut exit_signalled = false;
     let mut read_failed = false;
+    let mut exit_forwarded = false;
 
     let mut line = String::new();
     loop {
@@ -614,7 +632,7 @@ fn scan_subprocess_protocol(
                         exit_signalled = true;
                         // 收到即转发，不等子进程退出：主进程须抢在安装器拷贝前
                         // 退净并让出 exe 映像句柄。
-                        on_exit_main();
+                        exit_forwarded = on_exit_main();
                     }
                 }
             }
@@ -625,7 +643,7 @@ fn scan_subprocess_protocol(
         }
     }
 
-    (parsed_action, exit_signalled, read_failed)
+    (parsed_action, exit_signalled, read_failed, exit_forwarded)
 }
 
 fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
@@ -636,24 +654,31 @@ fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
     }
 }
 
-/// 通知主窗口「主进程退出并清理托盘」。单动作协议，消息无载荷。
-fn post_update_action(hwnd: HWND) {
-    // SAFETY:
-    // hwnd 来自主线程创建的窗口句柄，并且仅在主进程仍持有该窗口期间由工作线程使用。
-    // PostMessageW 只向目标线程队列复制整数消息参数，不会跨线程解引用 Rust 内存；
-    // 若窗口已销毁，API 会返回错误，调用本身不会访问无效内存。
-    unsafe {
-        let _ = PostMessageW(Some(hwnd), WM_USER_UPDATE_ACTION, WPARAM(0), LPARAM(0));
-    }
+/// 通知 UI 侧「主进程退出并清理托盘」。单动作协议，消息无载荷。
+///
+/// 投递目标是看门狗窗口——全生命周期不重建的顶层窗口——由它按当前主窗口是否
+/// 有效转发或直接执行同一语义。返回是否成功投递：看门狗已消失时 `PostMessageW`
+/// 返回错误，调用方据此知道通知未送达，而不是把「消息丢了」当成「主进程即将退出」。
+fn post_update_action_to_watchdog() -> bool {
+    let Some(hwnd) = crate::window::watchdog_hwnd() else {
+        return false;
+    };
+    // SAFETY: hwnd 已由 watchdog_hwnd 用 IsWindow 校验存活；PostMessageW 只向目标
+    // 线程队列复制整数消息参数，不跨线程解引用 Rust 内存。
+    unsafe { PostMessageW(Some(hwnd), WM_USER_UPDATE_ACTION, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
+/// 执行更新交接的退出语义：复位进行中标志、清理托盘并结束消息循环。
+///
+/// 两个调用方都在 UI 线程上：主窗口过程处理 `WM_USER_UPDATE_ACTION`，以及看门狗
+/// 在重建间隙（主窗口不存在或句柄已失效）时代为直接执行。
 pub fn handle_update_action() {
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
 
     remove_tray_icon();
     // SAFETY:
-    // 此函数仅由主窗口过程处理 WM_USER_UPDATE_ACTION 时调用，因此当前线程就是
-    // UI 消息循环所属线程；PostQuitMessage 会向当前线程队列投递 WM_QUIT。
+    // 两个调用方都运行在 UI 消息循环所属线程上；PostQuitMessage 会向当前线程
+    // 队列投递 WM_QUIT。
     unsafe {
         PostQuitMessage(0);
     }
@@ -808,9 +833,20 @@ mod tests {
     fn scan(data: &[u8]) -> (Option<UpdateAction>, bool, bool, usize) {
         let mut reader = std::io::Cursor::new(data);
         let mut forwards = 0usize;
-        let (parsed, exit_signalled, read_failed) =
-            scan_subprocess_protocol(&mut reader, || forwards += 1);
+        let (parsed, exit_signalled, read_failed, _forwarded) =
+            scan_subprocess_protocol(&mut reader, || {
+                forwards += 1;
+                true
+            });
         (parsed, exit_signalled, read_failed, forwards)
+    }
+
+    /// 用内存队列驱动协议扫描，模拟「转发目标已失效」：回调返回 false，等价于
+    /// 看门狗窗口已销毁时 `PostMessageW` 失败。
+    fn scan_with_dead_target(data: &[u8]) -> (bool, bool) {
+        let mut reader = std::io::Cursor::new(data);
+        let (_, exit_signalled, _, forwarded) = scan_subprocess_protocol(&mut reader, || false);
+        (exit_signalled, forwarded)
     }
 
     #[test]
@@ -877,6 +913,70 @@ mod tests {
         assert_eq!(parsed, Some(UpdateAction::Done));
         assert!(exit_signalled);
         assert_eq!(forwards, 1);
+    }
+
+    // ===== 转发送达与进行中标志复位 =====
+
+    #[test]
+    fn test_scan_reports_successful_forward() {
+        // 送达成功必须独立上报：调用方据此区分「主进程即将退出」与「消息丢了」。
+        let mut reader = std::io::Cursor::new(b"EXIT_MAIN\n".as_slice());
+        let (_, exit_signalled, _, forwarded) = scan_subprocess_protocol(&mut reader, || true);
+        assert!(exit_signalled);
+        assert!(forwarded);
+    }
+
+    #[test]
+    fn test_scan_dead_target_still_signals_but_not_forwarded() {
+        // 目标窗口已失效（模拟 Explorer 重建后旧句柄）：协议层仍读到 EXIT_MAIN，
+        // 但必须上报未送达——否则 worker 会误以为主进程要退出而跳过复位。
+        let (exit_signalled, forwarded) = scan_with_dead_target(b"EXIT_MAIN\n");
+        assert!(exit_signalled);
+        assert!(!forwarded);
+    }
+
+    #[test]
+    fn test_dead_target_resets_update_in_progress() {
+        // 核心不变量：EXIT_MAIN 已读到但通知未送达时，主进程仍在运行，
+        // 必须复位进行中标志，否则后续所有自动/手动检查被 swap(true) 永久挡掉。
+        UPDATE_IN_PROGRESS.store(true, Ordering::Release);
+        let outcome = SubprocessOutcome {
+            is_error: false,
+            exit_signalled: true,
+            exit_forwarded: false,
+        };
+        assert!(reset_update_progress_after_check(&outcome), "仍需收尾");
+        assert!(!UPDATE_IN_PROGRESS.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_delivered_exit_keeps_update_in_progress_until_quit() {
+        // 送达成功时主进程随即退出，worker 不介入标志（避免与退出竞态）。
+        UPDATE_IN_PROGRESS.store(true, Ordering::Release);
+        let outcome = SubprocessOutcome {
+            is_error: false,
+            exit_signalled: true,
+            exit_forwarded: true,
+        };
+        assert!(!reset_update_progress_after_check(&outcome));
+        assert!(UPDATE_IN_PROGRESS.load(Ordering::Acquire));
+
+        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn test_normal_check_always_resets_update_in_progress() {
+        // 常规结束（DONE / 读取失败）也必须复位，与转发路径无关。
+        for (parsed_ok, read_failed) in [(true, false), (false, true)] {
+            UPDATE_IN_PROGRESS.store(true, Ordering::Release);
+            let outcome = SubprocessOutcome {
+                is_error: read_failed || !parsed_ok,
+                exit_signalled: false,
+                exit_forwarded: false,
+            };
+            assert!(reset_update_progress_after_check(&outcome));
+            assert!(!UPDATE_IN_PROGRESS.load(Ordering::Acquire));
+        }
     }
 
     // ===== is_transient_launch_error =====

@@ -36,17 +36,28 @@ pub const LAYOUT_COL_WIDTH: i32 = 76;
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
 pub const WM_USER_NETWORK_RECONNECTED: u32 = WM_USER + 4;
 pub const WM_USER_UPDATE_ACTION: u32 = WM_USER + 5;
+/// 请求主进程退出（`--quit` 的对外入口，投递给看门狗窗口）。
+/// 主窗口嵌入任务栏后是跨进程子窗口，`FindWindowW` 检索不到它；看门狗是唯一
+/// 全生命周期不重建的顶层窗口，退出请求必须以它为落点。
+pub const WM_USER_QUIT_REQUEST: u32 = WM_USER + 6;
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 
+// 定时器 ID 只在其所属窗口内唯一：看门狗与主窗口各自独立计时，互不遮蔽。
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 pub const TIMER_ID_FULLSCREEN: usize = 3;
 pub const TIMER_ID_AUTO_UPDATE: usize = 4;
+/// 主窗口重建失败后的重试定时器，挂在看门狗窗口上（见 `arm_rebuild_retry`）。
+pub const TIMER_ID_REBUILD_RETRY: usize = 5;
 pub const TIMER_ID_INIT_TRIM: usize = 99;
 
 pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
 pub const TIMER_INTERVAL_NETWORK_BACKOFF: u32 = 15000;
 pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
+/// 主窗口重建重试的首次间隔与上限（毫秒）：每次失败后翻倍至上限。
+/// `TaskbarCreated` 每次任务栏创建只广播一次，重建失败后不重试等于永久失去主窗口。
+pub const TIMER_INTERVAL_REBUILD_RETRY_MIN: u32 = 1000;
+pub const TIMER_INTERVAL_REBUILD_RETRY_MAX: u32 = 60000;
 pub const TIMER_INTERVAL_INIT_TRIM: u32 = 10000;
 pub const CPU_MEM_INTERVAL: u32 = 5000;
 pub const TIMER_COALESCING_TOLERANCE_MS: u32 = 100;

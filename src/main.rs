@@ -11,7 +11,7 @@ mod update;
 mod util;
 mod window;
 
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
 };
@@ -36,8 +36,10 @@ use windows::core::{PCWSTR, w};
 use crate::collector::{collect_cpu, collect_memory, collect_network};
 use crate::config::{
     LOWORD_MASK, RELAUNCHED_BY_UPDATE_ARG, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_INTERVAL_INIT_TRIM,
-    WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, WM_USER_UPDATE_ACTION,
+    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_ID_REBUILD_RETRY,
+    TIMER_INTERVAL_INIT_TRIM, TIMER_INTERVAL_REBUILD_RETRY_MAX, TIMER_INTERVAL_REBUILD_RETRY_MIN,
+    WATCHDOG_CLASS, WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED,
+    WM_USER_QUIT_REQUEST, WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
 use crate::state::{ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, reset_network_backoff};
@@ -63,10 +65,26 @@ static CURRENT_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 已注册会话通知的窗口句柄（isize）；0 表示当前无注册。重建路径据此在销毁
 /// 旧窗口前配对注销，避免每次 Explorer 重启留下悬空注册。
 static SESSION_NOTIFY_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 退出请求是否已受理。`--quit` 可因超时重试或多次调用重复到达，
+/// 退出序列（托盘清理 + `PostQuitMessage`）只应执行一次。
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// 主窗口重建重试的当前间隔（毫秒）；0 表示不在重试序列中。
+    /// 仅 UI 线程（看门狗过程与重建路径）读写。
+    static REBUILD_RETRY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `--quit` 入口：把退出请求交给现存实例的看门狗窗口。
+///
+/// 必须查 `WATCHDOG_CLASS` 而不是 `WINDOW_CLASS`：主窗口嵌入任务栏后是
+/// `WS_CHILD` 跨进程子窗口，而 `FindWindowW` 只检索顶层窗口，正常嵌入状态下
+/// 查主窗口第一次必然 miss、随后的“消失轮询”也会立刻误判为已退出。看门狗是
+/// 唯一全生命周期不重建的顶层窗口，既是可被检索到的锚点，也负责在重建间隙
+/// （主窗口不存在时）自行完成退出序列。
 fn quit_existing_instance() {
-    // WINDOW_CLASS 常量已含尾 NUL。
-    let class_name: Vec<u16> = crate::config::WINDOW_CLASS.encode_utf16().collect();
+    // WATCHDOG_CLASS 常量已含尾 NUL。
+    let class_name: Vec<u16> = WATCHDOG_CLASS.encode_utf16().collect();
     let class_pcw = PCWSTR(class_name.as_ptr());
     // SAFETY: class_name 以 NUL 结尾，查询不存在的窗口时安全返回错误。
     let hwnd = unsafe { FindWindowW(class_pcw, PCWSTR(std::ptr::null())) };
@@ -75,8 +93,10 @@ fn quit_existing_instance() {
         && !h.is_invalid()
     {
         unsafe {
-            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(h), WM_USER_QUIT_REQUEST, WPARAM(0), LPARAM(0));
         }
+        // 轮询看门狗窗口消失即等价于进程退出：看门狗随进程结束而销毁，
+        // 中途被替换的可能性不存在（它不参与重建）。
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let exist = unsafe { FindWindowW(class_pcw, PCWSTR(std::ptr::null())) };
@@ -200,7 +220,7 @@ fn main() {
     if args.iter().any(|a| a == RELAUNCHED_BY_UPDATE_ARG) {
         defer_initial_auto_check();
     }
-    start_auto_check(hwnd);
+    start_auto_check();
 
     // 一次性定时器：到时后 trim 初始化冷页；ID 99 不与监测定时器冲突。
     unsafe {
@@ -321,7 +341,7 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
 /// 禁止把该处理挂回主窗口过程。所有绑定在旧 hwnd 上的资源
 /// （电源/会话通知、托盘、定时器）必须逐一重绑到新 hwnd；
 /// 网络采样由 WM_TIMER tick 携带的 hwnd 直接投递，无需重绑。
-fn rebuild_main_window() {
+fn rebuild_main_window(watchdog: HWND) {
     invalidate_taskbar_cache();
 
     // 会话通知必须在旧窗口销毁前配对注销：WTS 契约要求注销先于窗口销毁，
@@ -342,10 +362,17 @@ fn rebuild_main_window() {
     let hwnd = match create_main_window() {
         Ok(h) => h,
         Err(e) => {
-            show_error(&format!("Explorer 重启后重建主窗口失败: {e}"));
+            // 重建失败不能就此收手：CURRENT_MAIN_HWND 已归零、托盘与定时器全无，
+            // 而 TaskbarCreated 不会有第二轮广播。转为看门狗上的退避重试直到成功；
+            // 只有失败序列的首次提示用户，后续重试静默（否则退化成弹窗风暴）。
+            if REBUILD_RETRY_INTERVAL_MS.with(|c| c.get()) == 0 {
+                show_error(&format!("Explorer 重启后重建主窗口失败: {e}"));
+            }
+            arm_rebuild_retry(watchdog);
             return;
         }
     };
+    disarm_rebuild_retry(watchdog);
     CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
 
     // 旧电源通知绑定在已销毁的窗口上，先注销再对新窗口重新注册。
@@ -372,6 +399,115 @@ fn rebuild_main_window() {
     }
 }
 
+/// 当前有效的主窗口句柄；无主窗口（重建间隙）或句柄已失效时返回 None。
+///
+/// 所有跨消息/跨线程的控制动作都必须经此校验后使用句柄：Explorer 重建会替换
+/// 主窗口，任何快照下来的旧句柄都可能指向已销毁的窗口，向它投递消息会静默丢失。
+fn live_main_hwnd() -> Option<HWND> {
+    let raw = CURRENT_MAIN_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    // SAFETY: IsWindow 是纯查询，对陈旧句柄安全返回布尔，不解引用任何用户内存。
+    unsafe { IsWindow(Some(hwnd)) }.as_bool().then_some(hwnd)
+}
+
+/// 退出请求的幂等门：`flag` 由 false 翻到 true 的那一次才是真正的执行者。
+fn claim_exit_request(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
+/// 主窗口重建失败后的退避重试：间隔从 `TIMER_INTERVAL_REBUILD_RETRY_MIN` 翻倍
+/// 至 `TIMER_INTERVAL_REBUILD_RETRY_MAX`，直到重建成功。
+///
+/// `SetTimer` 复用同一 ID 会重设倒计时，因此连续失败无需先 `KillTimer`。
+fn arm_rebuild_retry(watchdog: HWND) {
+    let next = match REBUILD_RETRY_INTERVAL_MS.with(|c| c.get()) {
+        0 => TIMER_INTERVAL_REBUILD_RETRY_MIN,
+        current => (current * 2).min(TIMER_INTERVAL_REBUILD_RETRY_MAX),
+    };
+    REBUILD_RETRY_INTERVAL_MS.with(|c| c.set(next));
+    // SAFETY: watchdog 是看门狗窗口句柄，与调用方同属 UI 线程；不使用回调函数。
+    unsafe {
+        let _ = SetTimer(Some(watchdog), TIMER_ID_REBUILD_RETRY, next, None);
+    }
+}
+
+/// 结束重建重试：复位退避档位并移除定时器。
+fn disarm_rebuild_retry(watchdog: HWND) {
+    REBUILD_RETRY_INTERVAL_MS.with(|c| c.set(0));
+    // KillTimer 对不存在的定时器只返回错误，不会破坏窗口状态。
+    unsafe {
+        KillTimer(Some(watchdog), TIMER_ID_REBUILD_RETRY).ok();
+    }
+}
+
+/// 看门狗自行完成退出序列（主窗口不存在或已失效时的兜底路径）。
+///
+/// 托盘清理与 `PostQuitMessage` 都是线程作用域动作，不依赖主窗口存在。
+fn finish_exit_from_watchdog(watchdog: HWND) {
+    // 退出在即，重建重试已无意义：留着只会在 WM_QUIT 被处理前再造一个孤儿窗口。
+    disarm_rebuild_retry(watchdog);
+    remove_tray_icon();
+    // SAFETY: 看门狗过程运行在 UI 消息循环所属线程上，PostQuitMessage 向该线程
+    // 队列投递 WM_QUIT。
+    unsafe {
+        PostQuitMessage(0);
+    }
+}
+
+/// 处理退出请求：优先转发给当前主窗口（复用其 WM_CLOSE 处理），
+/// 主窗口缺失或转发失败时由看门狗自行收尾。
+fn route_exit_request(watchdog: HWND) {
+    if !claim_exit_request(&EXIT_REQUESTED) {
+        return;
+    }
+    let forwarded = live_main_hwnd().is_some_and(|main| {
+        // SAFETY: main 已由 IsWindow 校验存活；PostMessageW 只复制消息参数。
+        unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
+    });
+    if !forwarded {
+        finish_exit_from_watchdog(watchdog);
+    }
+}
+
+/// 处理更新交接动作：优先转发给当前主窗口，主窗口缺失或转发失败时由看门狗直接
+/// 执行同一语义（[`crate::update::handle_update_action`]）。
+///
+/// 旧实现在 spawn 时快照主窗口句柄并把 EXIT_MAIN 投给它且忽略失败：检查、下载或
+/// 确认弹窗期间若发生 Explorer 重建，消息发往已销毁的窗口并静默丢失，
+/// `UPDATE_IN_PROGRESS` 此后无人复位，所有检查被挡到进程重启。
+fn dispatch_update_action() {
+    let forwarded = live_main_hwnd().is_some_and(|main| {
+        // SAFETY: main 已由 IsWindow 校验存活；PostMessageW 只复制消息参数。
+        unsafe { PostMessageW(Some(main), WM_USER_UPDATE_ACTION, WPARAM(0), LPARAM(0)).is_ok() }
+    });
+    if !forwarded {
+        crate::update::handle_update_action();
+    }
+}
+
+/// 主题（浅色/深色）变更的共享处理：重算文字颜色并整幅重绘。
+///
+/// 两个窗口过程共用：主窗口分支只在启动后、嵌入任务栏之前的短暂顶层窗口期可达
+/// （`SetParent` 之后它是 `WS_CHILD`，收不到 `HWND_BROADCAST` 顶层广播），
+/// 看门狗分支是嵌入后的常驻路径。两者互斥——同一时刻只有一个窗口是顶层——
+/// 因此不存在双重处理来回打架。
+fn apply_theme_change(hwnd: HWND) {
+    renderer::with_renderer(|r| r.update_text_color());
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// 看门狗收到主题广播后把重绘落到当前主窗口；重建间隙无主窗口则无事可做。
+fn apply_theme_change_to_main() {
+    if let Some(hwnd) = live_main_hwnd() {
+        apply_theme_change(hwnd);
+    }
+}
+
 pub extern "system" fn watchdog_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -380,10 +516,47 @@ pub extern "system" fn watchdog_wnd_proc(
 ) -> LRESULT {
     let tcm = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
     if tcm != 0 && msg == tcm {
-        rebuild_main_window();
+        rebuild_main_window(hwnd);
         return LRESULT(0);
     }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+
+    match msg {
+        // 退出请求（--quit 按 WATCHDOG_CLASS 检索到本窗口后投递）：主窗口嵌入
+        // 任务栏后检索不到，重建间隙更是完全不存在。
+        WM_USER_QUIT_REQUEST => {
+            route_exit_request(hwnd);
+            LRESULT(0)
+        }
+
+        // 更新交接（子进程读到 EXIT_MAIN 后投递）：转发给当前主窗口或由看门狗兜底。
+        WM_USER_UPDATE_ACTION => {
+            dispatch_update_action();
+            LRESULT(0)
+        }
+
+        // 主窗口重建失败后的退避重试。
+        WM_TIMER if wparam.0 == TIMER_ID_REBUILD_RETRY => {
+            rebuild_main_window(hwnd);
+            LRESULT(0)
+        }
+
+        // 主题变更。WM_SETTINGCHANGE 走 HWND_BROADCAST 顶层广播，嵌入后的主窗口是
+        // WS_CHILD 收不到，必须由常驻顶层窗口接收；这里直接执行共享处理而不转发，
+        // 因为重建间隙主窗口可能不存在。电源与锁屏通知是定向消息，不经此路由。
+        WM_SETTINGCHANGE => {
+            // SAFETY: OS 保证 lparam 指向 NUL 结尾宽字符串（或 null）。
+            if unsafe { is_immersive_color_set(lparam) } {
+                apply_theme_change_to_main();
+            }
+            LRESULT(0)
+        }
+
+        // 看门狗没有 UI 也不参与重建，任何 WM_CLOSE 都只能是误发；让它被销毁
+        // 等于永久失去 TaskbarCreated 接收者与退出/更新入口。
+        WM_CLOSE => LRESULT(0),
+
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
 }
 
 fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
@@ -430,7 +603,7 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_AUTO_UPDATE if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) => {
-            start_auto_check(hwnd);
+            start_auto_check();
         }
         _ => {}
     }
@@ -462,7 +635,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_USER_NETWORK_RECONNECTED => {
             reset_network_backoff();
             let _ = sync_monitoring_timers(hwnd);
-            start_auto_check(hwnd);
+            start_auto_check();
             LRESULT(0)
         }
 
@@ -472,12 +645,11 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         WM_SETTINGCHANGE => {
+            // 只在启动后、嵌入任务栏之前的顶层窗口期可达；嵌入后由看门狗接收
+            // 顶层广播再落到本窗口（见 watchdog_wnd_proc）。
             // SAFETY: OS 保证 lparam 指向 NUL 结尾宽字符串（或 null）。
             if unsafe { is_immersive_color_set(lparam) } {
-                renderer::with_renderer(|r| r.update_text_color());
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+                apply_theme_change(hwnd);
             }
             LRESULT(0)
         }
@@ -493,8 +665,12 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
+        // 电源设置通知是定向消息：RegisterPowerSettingNotification 绑定的目标是
+        // 当前主窗口 HWND，嵌入为子窗口后仍直达，故处理器必须留在主窗口侧。
         WM_POWERBROADCAST => handle_power_broadcast(hwnd, wparam, lparam),
 
+        // 同理，锁屏/解锁由 WTSRegisterSessionNotification 定向到主窗口，且其
+        // 暂停/恢复要带当前 hwnd 重建定时器，搬到看门狗会让目标窗口错位。
         WM_WTSSESSION_CHANGE => handle_session_change(hwnd, wparam),
 
         WM_CLOSE => {
@@ -514,5 +690,36 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 看门狗控制入口的语义测试：只覆盖纯判定与句柄校验，不创建真实窗口。
+
+    use super::{CURRENT_MAIN_HWND, claim_exit_request, live_main_hwnd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn exit_request_gate_accepts_only_first_request() {
+        // --quit 可能因轮询/重试重复投递：只有第一次请求执行退出序列，
+        // 后续请求必须被幂等门吞掉（不重复清理托盘、不重复 PostQuitMessage）。
+        let gate = AtomicBool::new(false);
+        assert!(claim_exit_request(&gate), "首次请求应执行退出序列");
+        assert!(!claim_exit_request(&gate), "重复请求应被吞掉");
+        assert!(!claim_exit_request(&gate), "第三次仍应被吞掉");
+        assert!(gate.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stale_main_hwnd_is_rejected() {
+        // 模拟 Explorer 重建后残留的旧句柄：IsWindow 必须否决它，使退出与更新动作
+        // 落到看门狗兜底路径，而不是投给已销毁的窗口后静默丢失。
+        CURRENT_MAIN_HWND.store(0x0BAD_F00D, Ordering::Release);
+        assert!(live_main_hwnd().is_none());
+
+        // 重建间隙（CURRENT_MAIN_HWND=0）同样没有可转发的目标。
+        CURRENT_MAIN_HWND.store(0, Ordering::Release);
+        assert!(live_main_hwnd().is_none());
     }
 }
