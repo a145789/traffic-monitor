@@ -215,16 +215,24 @@ fn update_check_worker(is_manual: bool) {
 
 /// worker 收尾判定：返回 true 表示本次检查已结束、调用方还需压缩内存。
 ///
-/// EXIT_MAIN 已成功送达时返回 false——主进程随即退出，此时复位进行中标志反而
-/// 与退出竞态。其余情况（含「读到 EXIT_MAIN 但转发失败」）都必须复位标志：
-/// 主进程仍在运行，不复位会让后续一切自动/手动检查被 `swap(true)` 永久挡掉，
-/// 直到用户重启进程。
+/// 判定本身抽成纯函数（[`should_reset_update_progress`]）以便单测；
+/// 本函数只负责把结论落到全局标志上。
 fn reset_update_progress_after_check(outcome: &SubprocessOutcome) -> bool {
-    if outcome.exit_signalled && outcome.exit_forwarded {
+    if !should_reset_update_progress(outcome.exit_signalled, outcome.exit_forwarded) {
         return false;
     }
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
     true
+}
+
+/// 本次检查结束后是否必须复位进行中标志。
+///
+/// 只有「读到 EXIT_MAIN」且「通知已送达 UI」同时成立才免复位：此时主进程随即退出，
+/// 复位反而与退出竞态。其余情况（含「读到 EXIT_MAIN 但通知未送达」）都必须复位：
+/// 主进程仍在运行，不复位会让后续一切自动/手动检查被 `swap(true)` 永久挡掉，
+/// 直到用户重启进程。
+fn should_reset_update_progress(exit_signalled: bool, exit_forwarded: bool) -> bool {
+    !(exit_signalled && exit_forwarded)
 }
 
 /// 把启动期自动检查推迟一个冷却周期（relaunch 场景调用）。
@@ -656,9 +664,10 @@ fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
 
 /// 通知 UI 侧「主进程退出并清理托盘」。单动作协议，消息无载荷。
 ///
-/// 投递目标是看门狗窗口——全生命周期不重建的顶层窗口——由它按当前主窗口是否
-/// 有效转发或直接执行同一语义。返回是否成功投递：看门狗已消失时 `PostMessageW`
-/// 返回错误，调用方据此知道通知未送达，而不是把「消息丢了」当成「主进程即将退出」。
+/// 投递目标是看门狗窗口——全生命周期不重建的顶层窗口——由它直接执行收尾语义，
+/// 不再经主窗口转发（转发成功只代表消息入队，无法确认旧主窗口真的执行了）。
+/// 返回是否成功投递：看门狗已消失时 `PostMessageW` 返回错误，调用方据此知道通知
+/// 未送达，而不是把「消息丢了」当成「主进程即将退出」。
 fn post_update_action_to_watchdog() -> bool {
     let Some(hwnd) = crate::window::watchdog_hwnd() else {
         return false;
@@ -670,8 +679,8 @@ fn post_update_action_to_watchdog() -> bool {
 
 /// 执行更新交接的退出语义：复位进行中标志、清理托盘并结束消息循环。
 ///
-/// 两个调用方都在 UI 线程上：主窗口过程处理 `WM_USER_UPDATE_ACTION`，以及看门狗
-/// 在重建间隙（主窗口不存在或句柄已失效）时代为直接执行。
+/// 仅由看门狗过程处理 `WM_USER_UPDATE_ACTION` 时调用；看门狗与主窗口同属 UI 消息
+/// 循环线程，因此线程前提（`PostQuitMessage` 面向当前线程）成立。
 pub fn handle_update_action() {
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
 
@@ -936,9 +945,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dead_target_resets_update_in_progress() {
-        // 核心不变量：EXIT_MAIN 已读到但通知未送达时，主进程仍在运行，
-        // 必须复位进行中标志，否则后续所有自动/手动检查被 swap(true) 永久挡掉。
+    fn test_should_reset_update_progress_matrix() {
+        // 唯一免复位的情形：EXIT_MAIN 已读到且通知已送达（主进程即将退出）。
+        assert!(!should_reset_update_progress(true, true));
+        // 读到但未送达：主进程仍在运行，必须复位——否则检查被永久挡掉。
+        assert!(should_reset_update_progress(true, false));
+        // 常规结束（DONE）与只读到无效行同样必须复位。
+        assert!(should_reset_update_progress(false, false));
+    }
+
+    #[test]
+    fn test_reset_update_progress_clears_global_flag() {
+        // 唯一触碰全局标志的用例：cargo test 默认并行执行，多个用例读写同一全局
+        // 原子量会相互覆盖产生假红，故全局断言只保留这一处（其余覆盖由上面的
+        // 纯函数矩阵承担）。
         UPDATE_IN_PROGRESS.store(true, Ordering::Release);
         let outcome = SubprocessOutcome {
             is_error: false,
@@ -947,36 +967,6 @@ mod tests {
         };
         assert!(reset_update_progress_after_check(&outcome), "仍需收尾");
         assert!(!UPDATE_IN_PROGRESS.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn test_delivered_exit_keeps_update_in_progress_until_quit() {
-        // 送达成功时主进程随即退出，worker 不介入标志（避免与退出竞态）。
-        UPDATE_IN_PROGRESS.store(true, Ordering::Release);
-        let outcome = SubprocessOutcome {
-            is_error: false,
-            exit_signalled: true,
-            exit_forwarded: true,
-        };
-        assert!(!reset_update_progress_after_check(&outcome));
-        assert!(UPDATE_IN_PROGRESS.load(Ordering::Acquire));
-
-        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-    }
-
-    #[test]
-    fn test_normal_check_always_resets_update_in_progress() {
-        // 常规结束（DONE / 读取失败）也必须复位，与转发路径无关。
-        for (parsed_ok, read_failed) in [(true, false), (false, true)] {
-            UPDATE_IN_PROGRESS.store(true, Ordering::Release);
-            let outcome = SubprocessOutcome {
-                is_error: read_failed || !parsed_ok,
-                exit_signalled: false,
-                exit_forwarded: false,
-            };
-            assert!(reset_update_progress_after_check(&outcome));
-            assert!(!UPDATE_IN_PROGRESS.load(Ordering::Acquire));
-        }
     }
 
     // ===== is_transient_launch_error =====

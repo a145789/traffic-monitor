@@ -443,57 +443,47 @@ fn disarm_rebuild_retry(watchdog: HWND) {
     }
 }
 
-/// 看门狗自行完成退出序列（主窗口不存在或已失效时的兜底路径）。
+/// 退出序列：清理托盘并结束消息循环。
 ///
-/// 托盘清理与 `PostQuitMessage` 都是线程作用域动作，不依赖主窗口存在。
-fn finish_exit_from_watchdog(watchdog: HWND) {
-    // 退出在即，重建重试已无意义：留着只会在 WM_QUIT 被处理前再造一个孤儿窗口。
-    disarm_rebuild_retry(watchdog);
+/// 主窗口过程的 `WM_CLOSE`（托盘菜单「退出」）与看门狗的退出请求共用这一份实现，
+/// 避免退出语义在两处漂移。
+fn begin_exit() {
     remove_tray_icon();
-    // SAFETY: 看门狗过程运行在 UI 消息循环所属线程上，PostQuitMessage 向该线程
-    // 队列投递 WM_QUIT。
+    // SAFETY: 两个调用方（主窗口过程、看门狗过程）都运行在 UI 消息循环所属线程上，
+    // PostQuitMessage 向该线程队列投递 WM_QUIT。
     unsafe {
         PostQuitMessage(0);
     }
 }
 
-/// 处理退出请求：优先转发给当前主窗口（复用其 WM_CLOSE 处理），
-/// 主窗口缺失或转发失败时由看门狗自行收尾。
+/// 看门狗完成退出序列：先撤销重建重试，再执行退出序列。
+///
+/// 退出在即，重建重试已无意义：留着只会在 WM_QUIT 被处理前再造一个孤儿窗口。
+fn finish_exit_from_watchdog(watchdog: HWND) {
+    disarm_rebuild_retry(watchdog);
+    begin_exit();
+}
+
+/// 处理退出请求（`--quit` 投递，可能重复到达）。
+///
+/// 看门狗**直接执行**退出序列而不转发给主窗口：转发只能确认「消息已入队」，无法
+/// 确认主窗口真的执行了——Explorer 崩溃会由 OS 级联销毁主窗口，队列里那条消息随之
+/// 消失。直接执行让幂等门恰好对应「退出序列已执行」这一不可逆事实，主窗口是否存在
+/// 都不影响退出，也就不存在「已置位却没退成、后续请求又被吞掉」的失效窗口。
 fn route_exit_request(watchdog: HWND) {
     if !claim_exit_request(&EXIT_REQUESTED) {
         return;
     }
-    let forwarded = live_main_hwnd().is_some_and(|main| {
-        // SAFETY: main 已由 IsWindow 校验存活；PostMessageW 只复制消息参数。
-        unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
-    });
-    if !forwarded {
-        finish_exit_from_watchdog(watchdog);
-    }
-}
-
-/// 处理更新交接动作：优先转发给当前主窗口，主窗口缺失或转发失败时由看门狗直接
-/// 执行同一语义（[`crate::update::handle_update_action`]）。
-///
-/// 旧实现在 spawn 时快照主窗口句柄并把 EXIT_MAIN 投给它且忽略失败：检查、下载或
-/// 确认弹窗期间若发生 Explorer 重建，消息发往已销毁的窗口并静默丢失，
-/// `UPDATE_IN_PROGRESS` 此后无人复位，所有检查被挡到进程重启。
-fn dispatch_update_action() {
-    let forwarded = live_main_hwnd().is_some_and(|main| {
-        // SAFETY: main 已由 IsWindow 校验存活；PostMessageW 只复制消息参数。
-        unsafe { PostMessageW(Some(main), WM_USER_UPDATE_ACTION, WPARAM(0), LPARAM(0)).is_ok() }
-    });
-    if !forwarded {
-        crate::update::handle_update_action();
-    }
+    finish_exit_from_watchdog(watchdog);
 }
 
 /// 主题（浅色/深色）变更的共享处理：重算文字颜色并整幅重绘。
 ///
-/// 两个窗口过程共用：主窗口分支只在启动后、嵌入任务栏之前的短暂顶层窗口期可达
+/// 两个窗口过程共用：主窗口分支只在启动后、嵌入任务栏之前的窗口期可达
 /// （`SetParent` 之后它是 `WS_CHILD`，收不到 `HWND_BROADCAST` 顶层广播），
-/// 看门狗分支是嵌入后的常驻路径。两者互斥——同一时刻只有一个窗口是顶层——
-/// 因此不存在双重处理来回打架。
+/// 看门狗分支是嵌入后的常驻路径。启动后到嵌入前的短暂窗口期两者同为顶层，
+/// 一次广播会各处理一次——两次处理都是幂等的（重算颜色 + 置脏重绘），
+/// 代价只是一次多余重绘，因此不需要为去重引入新状态。
 fn apply_theme_change(hwnd: HWND) {
     renderer::with_renderer(|r| r.update_text_color());
     unsafe {
@@ -528,9 +518,14 @@ pub extern "system" fn watchdog_wnd_proc(
             LRESULT(0)
         }
 
-        // 更新交接（子进程读到 EXIT_MAIN 后投递）：转发给当前主窗口或由看门狗兜底。
+        // 更新交接（子进程读到 EXIT_MAIN 后投递）：看门狗直接执行收尾语义。
+        //
+        // 不转发给主窗口：转发成功只代表消息已入队，检查/下载/确认弹窗期间若发生
+        // Explorer 重建，消息会随旧主窗口一起消失，UPDATE_IN_PROGRESS 无人复位，
+        // 后续所有检查被挡到进程重启。看门狗与主窗口同属 UI 消息循环线程，
+        // handle_update_action 的线程前提不变。
         WM_USER_UPDATE_ACTION => {
-            dispatch_update_action();
+            crate::update::handle_update_action();
             LRESULT(0)
         }
 
@@ -639,11 +634,6 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
 
-        WM_USER_UPDATE_ACTION => {
-            crate::update::handle_update_action();
-            LRESULT(0)
-        }
-
         WM_SETTINGCHANGE => {
             // 只在启动后、嵌入任务栏之前的顶层窗口期可达；嵌入后由看门狗接收
             // 顶层广播再落到本窗口（见 watchdog_wnd_proc）。
@@ -674,10 +664,7 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_WTSSESSION_CHANGE => handle_session_change(hwnd, wparam),
 
         WM_CLOSE => {
-            remove_tray_icon();
-            unsafe {
-                PostQuitMessage(0);
-            }
+            begin_exit();
             LRESULT(0)
         }
 
