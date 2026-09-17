@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
+use crate::collector::{reset_cpu_baseline, reset_network_baseline};
 use crate::config::{
     BACKOFF_ZERO_THRESHOLD, CPU_MEM_INTERVAL, TIMER_COALESCING_TOLERANCE_MS, TIMER_ID_AUTO_UPDATE,
     TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_NETWORK, TIMER_INTERVAL_AUTO_UPDATE,
@@ -23,7 +24,7 @@ use crate::config::{
 };
 use crate::state::{
     CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION,
-    SUSPEND_REASON_SYSTEM, SUSPEND_REASONS, reset_network_backoff,
+    SUSPEND_REASON_SYSTEM, SUSPEND_REASONS, SuspendReasons, reset_network_backoff,
 };
 use crate::util::trim_working_set;
 use crate::window::get_taskbar_hwnd;
@@ -50,11 +51,26 @@ pub fn suspend_system(hwnd: HWND, reason: u32) {
 }
 
 pub fn resume_system(hwnd: HWND, reason: u32) {
+    let was_suspended = SUSPEND_REASONS.is_suspended();
     SUSPEND_REASONS.resume(reason);
+    if should_rebuild_baseline(was_suspended, &SUSPEND_REASONS) {
+        reset_network_baseline();
+        reset_cpu_baseline();
+    }
     // 恢复即复位网络退避：唤醒/解锁后立即回到快速采样节奏。
     reset_network_backoff();
     let _ = sync_monitoring_timers(hwnd);
     force_repaint(hwnd);
+}
+
+/// 是否构成"从暂停态回到运行态"的边沿。
+///
+/// 基线重建必须挂在这条边沿上而非每次 `resume` 调用上：交错
+/// suspend(SYSTEM)+suspend(SESSION) 后逐个 resume，只有清掉最后一个
+/// 原因位的那次才真正恢复采集；已在运行态时的重复 `resume`（was=false）
+/// 不得重建，否则基线被反复清空、恢复后长期显示零速。
+fn should_rebuild_baseline(was_suspended: bool, reasons: &SuspendReasons) -> bool {
+    was_suspended && !reasons.is_suspended()
 }
 
 /// WM_POWERBROADCAST 处理：系统休眠/唤醒、显示器开关。
@@ -207,6 +223,10 @@ pub fn check_fullscreen(hwnd: HWND) {
         let was = MONITOR_FULLSCREEN.load(Ordering::Acquire);
         if was {
             MONITOR_FULLSCREEN.store(false, Ordering::Release);
+            // 全屏退出边沿：停采期间差分基线已陈旧，重建后首个周期只建基线；
+            // 只动基线不动退避与 timer_plan 集合（见 resume_system 同理）。
+            reset_network_baseline();
+            reset_cpu_baseline();
             let _ = sync_monitoring_timers(hwnd);
             force_repaint(hwnd);
         }
@@ -252,6 +272,12 @@ pub fn check_fullscreen(hwnd: HWND) {
     MONITOR_FULLSCREEN.store(should_suspend, Ordering::Release);
 
     if should_suspend != was {
+        if !should_suspend {
+            // 全屏退出边沿：与 resume_system 同理重建差分基线，避免把全屏
+            // 期间的累计流量/CPU 摊成恢复瞬间的虚假速率；退避状态保持不动。
+            reset_network_baseline();
+            reset_cpu_baseline();
+        }
         let _ = sync_monitoring_timers(hwnd);
         if !should_suspend {
             force_repaint(hwnd);
@@ -332,6 +358,37 @@ mod tests {
         // SAFETY: longer 在栈上，指针在调用期间有效。
         let result = unsafe { is_immersive_color_set(LPARAM(longer.as_ptr() as isize)) };
         assert!(!result);
+    }
+
+    // ===== 恢复边沿与基线重建 =====
+
+    #[test]
+    fn test_baseline_rebuild_only_on_last_resume_edge() {
+        // 交错 suspend(SYSTEM)+suspend(SESSION) 后逐个 resume：
+        // 基线重建只允许发生在清掉最后一个原因位的那次恢复调用上。
+        let state = SuspendReasons::new();
+        state.suspend(SUSPEND_REASON_SYSTEM);
+        state.suspend(SUSPEND_REASON_SESSION);
+
+        let was = state.is_suspended();
+        state.resume(SUSPEND_REASON_SYSTEM);
+        assert!(
+            !should_rebuild_baseline(was, &state),
+            "SESSION 仍暂停，中途 resume 不得触发基线重建"
+        );
+
+        let was = state.is_suspended();
+        state.resume(SUSPEND_REASON_SESSION);
+        assert!(
+            should_rebuild_baseline(was, &state),
+            "清掉最后一个原因位才构成恢复边沿"
+        );
+
+        // 位集语义不变：已在运行态时的重复 resume 不得再次构成边沿，
+        // 否则基线被反复清空、恢复后长期显示零速（见本函数文档）。
+        let was = state.is_suspended();
+        state.resume(SUSPEND_REASON_SESSION);
+        assert!(!should_rebuild_baseline(was, &state));
     }
 
     // ===== timer_plan =====

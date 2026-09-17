@@ -8,5 +8,5 @@ mod cpu_mem;
 mod network;
 mod rate;
 
-pub use cpu_mem::{collect_cpu, collect_memory};
-pub use network::collect_network;
+pub use cpu_mem::{collect_cpu, collect_memory, reset_cpu_baseline};
+pub use network::{collect_network, reset_network_baseline};

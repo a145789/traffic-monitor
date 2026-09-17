@@ -60,6 +60,15 @@ impl Drop for MibTable {
     }
 }
 
+pub fn reset_network_baseline() {
+    INTERFACE_HISTORY.with(|hist| hist.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn sampling_history_len() -> usize {
+    INTERFACE_HISTORY.with(|hist| hist.borrow().len())
+}
+
 /// 采样一次全网卡流量并更新速率状态；断网/恢复消息投递给调用方提供的
 /// 当前主窗口（UI 线程 WM_TIMER tick 携带的 hwnd，不存在陈旧句柄 tick）。
 ///
@@ -380,6 +389,13 @@ mod tests {
     }
 
     // ===== 黑名单缓存刷新语义 =====
+
+    #[test]
+    fn test_reset_network_baseline_clears_history() {
+        // 恢复路径语义：清历史后下一次采样不得再对旧基线做差分。
+        reset_network_baseline();
+        assert_eq!(sampling_history_len(), 0);
+    }
 
     #[test]
     fn test_blacklist_needs_refresh_when_empty_or_stale() {

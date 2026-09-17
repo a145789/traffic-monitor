@@ -10,6 +10,10 @@ static PREV_KERNEL_TIME: AtomicU64 = AtomicU64::new(0);
 static PREV_USER_TIME: AtomicU64 = AtomicU64::new(0);
 static CPU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+pub fn reset_cpu_baseline() {
+    CPU_INITIALIZED.store(false, Ordering::Release);
+}
+
 /// 采样 `GetSystemTimes`，更新 `CPU_USAGE`。
 ///
 /// 由 `TIMER_ID_CPU_MEM` 调用；首轮仅建立基线，不产生有效差分。
