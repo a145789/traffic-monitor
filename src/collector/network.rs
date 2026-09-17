@@ -60,6 +60,15 @@ impl Drop for MibTable {
     }
 }
 
+pub fn reset_network_baseline() {
+    INTERFACE_HISTORY.with(|hist| hist.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn sampling_history_len() -> usize {
+    INTERFACE_HISTORY.with(|hist| hist.borrow().len())
+}
+
 /// 采样一次全网卡流量并更新速率状态；断网/恢复消息投递给调用方提供的
 /// 当前主窗口（UI 线程 WM_TIMER tick 携带的 hwnd，不存在陈旧句柄 tick）。
 ///
@@ -380,6 +389,47 @@ mod tests {
     }
 
     // ===== 黑名单缓存刷新语义 =====
+
+    #[test]
+    fn test_reset_network_baseline_clears_history() {
+        // 非空前置：先写入暂停前的旧基线，否则空历史断言恒成立、
+        // reset 写成空函数也能通过，抓不住生产重置失效的回归。
+        INTERFACE_HISTORY.with(|hist| {
+            hist.borrow_mut().insert(100, (10000, 5000, Instant::now()));
+        });
+        assert_ne!(sampling_history_len(), 0);
+
+        reset_network_baseline();
+        assert_eq!(sampling_history_len(), 0);
+    }
+
+    #[test]
+    fn test_baseline_reset_first_sample_rebaselines_second_sample_diffs() {
+        // 贯通语义：真历史 → 真重置入口 → 首样本只建基线零速 → 次样本正常差分。
+        let t0 = Instant::now();
+        INTERFACE_HISTORY.with(|hist| {
+            hist.borrow_mut().insert(100, (10000, 5000, t0));
+        });
+        reset_network_baseline();
+
+        // 锁屏 1 小时期间的累计流量（+150GB）不得参与差分。
+        let t_resume = t0 + std::time::Duration::from_secs(3600);
+        let mut current = HashMap::new();
+        current.insert(100, (160_000_000_000u64, 35_000_000_000u64));
+        let (down, up) = INTERFACE_HISTORY
+            .with(|hist| select_winner_interface(&current, &mut hist.borrow_mut(), t_resume));
+        assert_eq!((down, up), (0, 0));
+
+        // 次样本：1s 后小增量应正常差分，而非继续零速。
+        let t_next = t_resume + std::time::Duration::from_secs(1);
+        let mut resumed = HashMap::new();
+        resumed.insert(100, (160_000_001_000u64, 35_000_000_500u64));
+        let (down_next, up_next) = INTERFACE_HISTORY
+            .with(|hist| select_winner_interface(&resumed, &mut hist.borrow_mut(), t_next));
+        assert_eq!((down_next, up_next), (1000, 500));
+
+        reset_network_baseline();
+    }
 
     #[test]
     fn test_blacklist_needs_refresh_when_empty_or_stale() {
