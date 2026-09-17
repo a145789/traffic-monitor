@@ -5,6 +5,8 @@ const tag = process.argv[2] || "";
 
 const cargoToml = readFileSync("Cargo.toml", "utf-8");
 const issFile = readFileSync("installer.iss", "utf-8");
+// dev 打包改版本后构建会同步改写 Cargo.lock 中的根包版本，提前保存以便恢复，避免时间戳版本脏改被误提交。
+const cargoLock = existsSync("Cargo.lock") ? readFileSync("Cargo.lock", "utf-8") : null;
 
 const versionMatch = cargoToml.match(/^version\s*=\s*"(.+)"/m);
 if (!versionMatch) {
@@ -64,5 +66,9 @@ try {
     console.log(`Restoring version: ${baseVersion}`);
     writeFileSync("Cargo.toml", cargoToml);
     writeFileSync("installer.iss", issFile);
+    // 构建成功/失败都走这里，把 Cargo 同步改写的根包版本一并还原。
+    if (cargoLock !== null) {
+      writeFileSync("Cargo.lock", cargoLock);
+    }
   }
 }
