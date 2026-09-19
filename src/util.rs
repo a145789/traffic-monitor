@@ -42,6 +42,20 @@ pub fn os_to_wide(s: &std::ffi::OsStr) -> Vec<u16> {
     v
 }
 
+/// DPI 缩放：全项目唯一的 `base * dpi / 96` 舍入实现。
+///
+/// 窗口矩形（`window::calc_widget_rect`）与位图/字体尺寸
+/// （`renderer::Renderer::update_dpi`）必须共享同一舍入策略，否则任一处改动
+/// 舍入即出现「窗口与位图差一像素」的错位。调用方直接传 `GetDpiForWindow`
+/// 返回的 `u32`，无需自行计算 `scale`。
+///
+/// `Layout::new` 刻意不调用本函数：它从已舍入的实际宽度反推比例
+/// （`width / DISPLAY_WIDTH`），若经整数 DPI 中转会因二次舍入在部分 DPI 下
+/// 差一像素（96–384 范围实测 77 处），故保持宽度推导以逐像素不变。
+pub fn dpi_scaled(base: i32, dpi: u32) -> i32 {
+    ((base as f64) * (dpi as f64) / 96.0).round() as i32
+}
+
 /// 当前进程模块句柄（HINSTANCE），用于注册窗口类、加载内置资源。
 pub fn module_instance() -> Result<windows::Win32::Foundation::HINSTANCE, String> {
     // SAFETY: GetModuleHandleW(None) 查询当前进程模块，无指针参数。
@@ -264,5 +278,27 @@ mod tests {
             vec![0x41u16, 0xD800u16, 0x42u16, 0]
         );
         assert_ne!(to_wide(&raw.to_string_lossy()), os_to_wide(raw.as_os_str()));
+    }
+
+    #[test]
+    fn test_dpi_scaled_matches_forward_formula() {
+        // 96 DPI 下恒等；150%（144）与 200%（192）逐点对账正向公式。
+        for (base, dpi, expected) in [
+            (170, 96, 170),
+            (32, 96, 32),
+            (-3, 96, -3),
+            (13, 96, 13),
+            (170, 144, 255),
+            (32, 144, 48),
+            (-3, 144, -5),
+            (13, 144, 20),
+            (170, 192, 340),
+            (32, 192, 64),
+            (76, 120, 95),
+        ] {
+            assert_eq!(dpi_scaled(base, dpi), expected, "base={base} dpi={dpi}");
+            let direct = ((base as f64) * (dpi as f64) / 96.0).round() as i32;
+            assert_eq!(dpi_scaled(base, dpi), direct);
+        }
     }
 }

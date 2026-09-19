@@ -15,7 +15,7 @@ use windows::core::{PCWSTR, w};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WATCHDOG_CLASS, WINDOW_CLASS, WINDOW_TITLE,
 };
-use crate::util::module_instance;
+use crate::util::{dpi_scaled, module_instance};
 
 static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 看门狗窗口句柄（isize）；0 表示尚未创建。
@@ -188,10 +188,9 @@ fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     }
 
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-    let scale = dpi as f64 / 96.0;
-    let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
-    let display_height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
-    let gap = (GAP as f64 * scale).round() as i32;
+    let display_width = dpi_scaled(DISPLAY_WIDTH, dpi);
+    let display_height = dpi_scaled(DISPLAY_HEIGHT, dpi);
+    let gap = dpi_scaled(GAP, dpi);
 
     let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
     let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
