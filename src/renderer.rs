@@ -559,9 +559,10 @@ fn create_font(size: i32) -> HFONT {
         ..Default::default()
     };
     let font_name = to_wide("Segoe UI");
-    let copy_len = font_name.len().min(lf.lfFaceName.len());
+    let copy_len = (font_name.len() + 1).min(lf.lfFaceName.len()) - 1;
     lf.lfFaceName[..copy_len].copy_from_slice(&font_name[..copy_len]);
-    // SAFETY: lfFaceName 含尾 NUL；返回的 HFONT 由调用方独占释放。
+    lf.lfFaceName[copy_len] = 0;
+    // SAFETY: lfFaceName 经上式截断后必含尾 NUL；返回的 HFONT 由调用方独占释放。
     unsafe { CreateFontIndirectW(&lf) }
 }
 

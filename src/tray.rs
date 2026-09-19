@@ -56,8 +56,9 @@ pub fn create_tray_icon(hwnd: HWND) {
     nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
 
     let tip = to_wide(APP_TITLE);
-    let copy_len = tip.len().min(nid.szTip.len());
+    let copy_len = (tip.len() + 1).min(nid.szTip.len()) - 1;
     nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
+    nid.szTip[copy_len] = 0;
 
     // SAFETY: nid 完整初始化，同步调用期间存活。
     unsafe {
