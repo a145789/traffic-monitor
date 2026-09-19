@@ -1,6 +1,6 @@
 # Agent Note：启动参数与更新路径无损化及协议结构体收敛
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
