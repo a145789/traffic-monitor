@@ -624,8 +624,13 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 renderer::invalidate_if_values_changed(hwnd);
             }
         }
-        TIMER_ID_AUTO_UPDATE if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) => {
-            start_auto_check();
+        TIMER_ID_AUTO_UPDATE => {
+            // 条件先命名：arm 体若只剩单个 if 会触发 collapsible_match，
+            // 与兄弟 arm 同保持函数体内 if（无 match guard）。
+            let active = !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire);
+            if active {
+                start_auto_check();
+            }
         }
         _ => {}
     }
