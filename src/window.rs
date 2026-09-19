@@ -5,17 +5,17 @@ use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT, SetLastErro
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetParent,
     GetWindowLongPtrW, GetWindowRect, HWND_TOP, IsWindow, LWA_COLORKEY, RegisterClassExW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
-    SetParent, SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW,
-    WNDPROC, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
-    WS_VISIBLE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WATCHDOG_CLASS, WINDOW_CLASS, WINDOW_TITLE,
 };
-use crate::util::{AtomicHwnd, dpi_scaled, module_instance};
+use crate::util::{AtomicHwnd, diag, dpi_scaled, module_instance};
 
 static TASKBAR_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 看门狗窗口句柄；`None` 表示尚未创建。
@@ -51,31 +51,33 @@ fn register_class(class_name: &str, proc: WNDPROC, err: &str) -> Result<(), Stri
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create_window(
-    class_name: &str,
-    title: &[u16],
+/// 窗口创建参数：类名 / 标题 / 尺寸 / 样式。错误文案不再由调用方传来，
+/// 由 `create_window` 按类名统一生成（调用方不再既给上下文又交文案控制权）。
+struct WindowSpec<'a> {
+    class_name: &'a str,
+    title: &'a [u16],
     width: i32,
     height: i32,
     style: WINDOW_STYLE,
     ex_style: WINDOW_EX_STYLE,
-    err: &str,
-) -> Result<HWND, String> {
+}
+
+fn create_window(spec: &WindowSpec) -> Result<HWND, String> {
     // 类名常量已含尾 NUL，title 由调用方保证含尾 NUL；指针仅在本次创建调用期间使用。
-    let class_wide: Vec<u16> = class_name.encode_utf16().collect();
+    let class_wide: Vec<u16> = spec.class_name.encode_utf16().collect();
     let hinstance = module_instance()?;
 
     // SAFETY: 宽字符串缓冲区在 CreateWindowExW 返回前存活；title 含尾 NUL。
     let hwnd = unsafe {
         CreateWindowExW(
-            ex_style,
+            spec.ex_style,
             PCWSTR(class_wide.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            style,
+            PCWSTR(spec.title.as_ptr()),
+            spec.style,
             0,
             0,
-            width,
-            height,
+            spec.width,
+            spec.height,
             None,
             None,
             Some(hinstance),
@@ -83,7 +85,13 @@ fn create_window(
         )
     };
 
-    hwnd.map_err(|e| format!("{err}: {e:?}"))
+    // 类名常量含尾 NUL，trim 后再嵌入文案。
+    hwnd.map_err(|e| {
+        format!(
+            "创建{}窗口失败: {e:?}",
+            spec.class_name.trim_end_matches('\0')
+        )
+    })
 }
 
 pub fn register_window_class() -> Result<(), String> {
@@ -93,15 +101,14 @@ pub fn register_window_class() -> Result<(), String> {
 pub fn create_main_window() -> Result<HWND, String> {
     // WINDOW_TITLE 常量已含尾 NUL。
     let window_name: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
-    let hwnd = create_window(
-        WINDOW_CLASS,
-        &window_name,
-        DISPLAY_WIDTH,
-        DISPLAY_HEIGHT,
-        WS_POPUP | WS_VISIBLE,
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        "创建窗口失败",
-    )?;
+    let hwnd = create_window(&WindowSpec {
+        class_name: WINDOW_CLASS,
+        title: &window_name,
+        width: DISPLAY_WIDTH,
+        height: DISPLAY_HEIGHT,
+        style: WS_POPUP | WS_VISIBLE,
+        ex_style: WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+    })?;
     // 新窗口尚未嵌入；清位让随后嵌入失败时由 reembed_if_lost 继续兜底。
     EMBEDDED.store(false, Ordering::Release);
     Ok(hwnd)
@@ -124,15 +131,14 @@ pub fn register_watchdog_class() -> Result<(), String> {
 pub fn create_watchdog_window() -> Result<HWND, String> {
     // 空标题的 NUL 结尾切片，与原 w!("") 等价。
     const EMPTY_TITLE: [u16; 1] = [0];
-    let hwnd = create_window(
-        WATCHDOG_CLASS,
-        &EMPTY_TITLE,
-        0,
-        0,
-        WS_OVERLAPPED,
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        "创建看门狗窗口失败",
-    )?;
+    let hwnd = create_window(&WindowSpec {
+        class_name: WATCHDOG_CLASS,
+        title: &EMPTY_TITLE,
+        width: 0,
+        height: 0,
+        style: WS_OVERLAPPED,
+        ex_style: WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+    })?;
     // 发布句柄供 update 等模块投递控制消息：它们不再快照易失效的主窗口句柄。
     WATCHDOG_HWND.store(hwnd);
     Ok(hwnd)
@@ -262,6 +268,29 @@ pub fn embed_in_taskbar(hwnd: HWND) -> Result<(), String> {
     Ok(())
 }
 
+/// 把已嵌入窗口的物理尺寸重置为指定位图尺寸（DPI 资源重建失败的回滚入口）。
+///
+/// 只在已嵌入时生效；位置分量不动（SWP_NOMOVE），跨屏后的合身位置与尺寸
+/// 由下个成功的 DPI 更新周期自愈。保证 BitBlt 源（位图）与目标（窗口）
+/// 尺寸一致，避免边缘露出色键底色。
+pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
+    if !EMBEDDED.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: hwnd 为当前主窗口；SWP_NOMOVE 保留现位置，仅改尺寸。
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOZORDER,
+        );
+    }
+}
+
 /// 嵌入自愈守卫，挂在常驻的全屏检测定时器上（每 2s）。
 ///
 /// `TaskbarCreated` 每次任务栏创建只广播一次：重建那一刻嵌入失败后不会再有第二轮
@@ -273,7 +302,13 @@ pub fn reembed_if_lost(hwnd: HWND) -> bool {
     if EMBEDDED.load(Ordering::Acquire) && parent_is_current_taskbar(hwnd) {
         return false;
     }
-    embed_in_taskbar(hwnd).is_ok()
+    match embed_in_taskbar(hwnd) {
+        Ok(()) => true,
+        Err(e) => {
+            diag!("周期重嵌入任务栏失败: {e}");
+            false
+        }
+    }
 }
 
 /// 窗口父级是否仍是当前任务栏。explorer 崩溃（非干净退出）时任务栏句柄失效而子

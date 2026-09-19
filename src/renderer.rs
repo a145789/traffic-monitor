@@ -14,7 +14,10 @@ use crate::config::{
     LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN, REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
-use crate::util::{dpi_scaled, push_wide, reg_read_dword, to_wide};
+use crate::util::{diag, dpi_scaled, push_wide, reg_read_dword, to_wide};
+
+/// 上行箭头「↑」的 NUL 结尾 UTF-16 常量；下行箭头仍走 `Self::wide` 复用 `buf`。
+const ARROW_UP: [u16; 2] = [0x2191, 0];
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
@@ -71,6 +74,7 @@ pub struct Renderer {
     width: i32,
     height: i32,
     arrow_width: i32,
+    layout: Layout,
     buf: Vec<u16>,
 }
 
@@ -272,6 +276,7 @@ impl Renderer {
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
             arrow_width,
+            layout: Layout::new(DISPLAY_WIDTH, DISPLAY_HEIGHT),
             buf: Vec::with_capacity(32),
         })
     }
@@ -305,19 +310,20 @@ impl Renderer {
         if bytes_per_sec < 1024 {
             write_u32(buf, bytes_per_sec);
             buf.extend(" B/s".encode_utf16());
-        } else if bytes_per_sec < 1024 * 1024 {
-            // 整数定点：乘 10 后加半除数四舍五入，得到十分位精度值。
-            let x = ((bytes_per_sec as u64 * 10 + 512) / 1024) as u32;
-            write_u32(buf, x / 10);
-            buf.push(b'.' as u16);
-            buf.push((b'0' + (x % 10) as u8) as u16);
-            buf.extend(" KB/s".encode_utf16());
         } else {
-            let x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
+            // 先算 KB 十分位定点值；满 1024.0 KB/s（x >= 10240，十分位即 1.0 MB/s）
+            // 落入 MB 分支按 MB 重新舍入，避免两条分支各自重复格式化。
+            let mut x = ((bytes_per_sec as u64 * 10 + 512) / 1024) as u32;
+            let unit: &str = if x >= 10240 {
+                x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
+                " MB/s"
+            } else {
+                " KB/s"
+            };
             write_u32(buf, x / 10);
             buf.push(b'.' as u16);
             buf.push((b'0' + (x % 10) as u8) as u16);
-            buf.extend(" MB/s".encode_utf16());
+            buf.extend(unit.encode_utf16());
         }
         buf.push(0);
         buf
@@ -333,7 +339,7 @@ impl Renderer {
 
         let values = DisplayValues::load();
 
-        let layout = Layout::new(self.width, self.height);
+        let layout = self.layout;
         let arrow_right = layout.speed_left + self.arrow_width;
 
         // 填充画布背景为透明色键，并设置文字颜色。
@@ -353,8 +359,8 @@ impl Renderer {
             right: arrow_right,
             bottom: layout.half_height,
         };
-        let up_arrow = Self::wide(&mut self.buf, "\u{2191}");
-        draw_text(self.hdc_mem, up_arrow, &mut rc_up_arrow, DT_LEFT);
+        let mut up_arrow = ARROW_UP;
+        draw_text(self.hdc_mem, &mut up_arrow, &mut rc_up_arrow, DT_LEFT);
 
         let mut rc_up_val = RECT {
             left: arrow_right,
@@ -424,7 +430,10 @@ impl Renderer {
         }
     }
 
-    pub fn update_dpi(&mut self, hwnd: HWND) {
+    /// 按窗口当前 DPI 重建位图/字体并缓存新布局。返回 false 表示任一资源创建
+    /// 失败、维持旧尺寸不变（调用方须把窗口回滚到 [`bitmap_size`]，否则
+    /// 「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、露出色键底色）。
+    pub fn update_dpi(&mut self, hwnd: HWND) -> bool {
         // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用
         // GetDpiForWindow 是纯查询 API，无跨进程非法访问问题。
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
@@ -434,7 +443,8 @@ impl Renderer {
 
         // 1. 取得临时屏幕 DC。
         let Some(screen_dc) = ScreenDcGuard::acquire() else {
-            return;
+            diag!("DPI 更新失败: 无法获取屏幕 DC");
+            return false;
         };
 
         // 2. 创建新尺寸的兼容位图（必须用屏幕 DC）。失败时保持旧尺寸与旧位图。
@@ -442,7 +452,8 @@ impl Renderer {
         let Some(new_bitmap) =
             OwnedGdi::new(unsafe { CreateCompatibleBitmap(screen_dc.hdc, width, height) })
         else {
-            return;
+            diag!("DPI 更新失败: 无法创建 {width}x{height} 兼容位图");
+            return false;
         };
 
         // 位图创建后不再需要屏幕 DC，提前释放。
@@ -450,7 +461,8 @@ impl Renderer {
 
         // 3. 创建新尺寸的字体。失败时由守卫自动释放位图。
         let Some(new_font) = OwnedGdi::new(create_font(font_size)) else {
-            return;
+            diag!("DPI 更新失败: 无法创建字号 {font_size} 字体");
+            return false;
         };
 
         // 4. 新资源均已就绪：原子替换并向后清理旧对象，确保 BitBlt 源/目标尺寸一致。
@@ -471,6 +483,7 @@ impl Renderer {
 
         self.width = width;
         self.height = height;
+        self.layout = Layout::new(width, height);
 
         // SAFETY: self.hdc_mem 有效。
         unsafe {
@@ -478,6 +491,13 @@ impl Renderer {
         }
 
         self.arrow_width = measure_arrow_width(self.hdc_mem);
+        true
+    }
+
+    /// 当前位图尺寸（物理像素）。DPI 资源重建失败时窗口须回滚到该尺寸，
+    /// 保证 BitBlt 源（位图）与目标（窗口）一致。
+    pub fn bitmap_size(&self) -> (i32, i32) {
+        (self.width, self.height)
     }
 }
 
@@ -505,7 +525,9 @@ impl Drop for Renderer {
 ///
 /// `width` 必须取已舍入的实际宽度（`dpi_scaled(DISPLAY_WIDTH, dpi)` 的输出），
 /// 禁止经整数 DPI 中转二次舍入（96–384 实测 77 处差一像素）；改任一侧舍入
-/// 策略都要重新全范围对账。
+/// 策略都要重新全范围对账。纯值类型：随 DPI 更新整体重算并缓存（`Renderer::layout`），
+/// 渲染热路径零分配纪律不变。
+#[derive(Clone, Copy)]
 struct Layout {
     speed_left: i32,
     speed_right: i32,
@@ -617,9 +639,13 @@ mod tests {
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024)),
             "1.0 KB/s"
         );
+        // KB→MB 由 KB 十分位闸门裁决：x >= 10240（即显示值将达 1024.0 KB/s）
+        // 落入 MB 分支重新舍入。1048575 B/s 的 KB 定点值恰为 10240，
+        // 是最后一条落入 MB 分支的输入——钉死该边界，改回「先判字节数」
+        // 或移动闸门阈值即红。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 1)),
-            "1024.0 KB/s"
+            "1.0 MB/s"
         );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024)),

@@ -223,6 +223,40 @@ pub fn configure_background_process() {
     set_low_memory_priority();
 }
 
+/// 静默失败点的诊断埋点。
+///
+/// 仅用于今天完全静默的 `let _ =` 失败路径（托盘、定时器、嵌入、投递）：
+/// debug 构建经 `OutputDebugStringW` 输出（DebugView / Visual Studio 输出窗口
+/// 可见），release 构建宏体展开为空、零成本。不替代错误处理，不引入
+/// tracing/log 依赖（GUI 子系统进程无控制台，`eprintln!` 不可用）。
+///
+/// 埋点纪律：只加在「失败后无任何感知通道」的调用点；有弹框或返回值
+/// 的路径不需要。
+#[cfg(debug_assertions)]
+macro_rules! diag {
+    ($($arg:tt)*) => {{
+        let msg = ::std::format!("traffic-monitor: {}", ::std::format_args!($($arg)*));
+        let wide: Vec<u16> = msg.encode_utf16().chain(::std::iter::once(0)).collect();
+        // SAFETY: wide 以 NUL 结尾，且仅在本次同步调用期间存活。
+        // allow(unused_unsafe)：部分调用点本身位于 unsafe 块内，嵌套 unsafe 会触发告警。
+        #[allow(unused_unsafe)]
+        unsafe {
+            ::windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(
+                ::windows::core::PCWSTR(wide.as_ptr()),
+            );
+        }
+    }};
+}
+
+/// release 版本：整体空展开，但保留 `format_args!` 的形式校验（含参数是否
+/// 在作用域内），避免 debug/release 之间的格式串漂移与 unused 变量告警。
+#[cfg(not(debug_assertions))]
+macro_rules! diag {
+    ($($arg:tt)*) => {{ if false { let _ = ::std::format_args!($($arg)*); } }};
+}
+
+pub(crate) use diag;
+
 pub fn reg_read_dword(subkey: &str, value_name: &str) -> Option<u32> {
     CURRENT_USER
         .open(subkey)

@@ -1,18 +1,28 @@
 //! CPU 与内存使用率采集。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::state::{CPU_USAGE, MEM_USAGE};
 
-static PREV_IDLE_TIME: AtomicU64 = AtomicU64::new(0);
-static PREV_KERNEL_TIME: AtomicU64 = AtomicU64::new(0);
-static PREV_USER_TIME: AtomicU64 = AtomicU64::new(0);
-static CPU_INITIALIZED: AtomicBool = AtomicBool::new(false);
+// 上次 CPU 采样基线。`None` 即无基线：数据结构本身表达「基线存在与否」，
+// 不另设初始化标志。仅 UI 线程读写（`TIMER_ID_CPU_MEM` tick 与
+// `reset_cpu_baseline`，后者也来自同一消息循环），`Cell` 已足够。
+thread_local! {
+    static CPU_BASELINE: Cell<Option<CpuTimes>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct CpuTimes {
+    idle: u64,
+    kernel: u64,
+    user: u64,
+}
 
 pub fn reset_cpu_baseline() {
-    CPU_INITIALIZED.store(false, Ordering::Release);
+    CPU_BASELINE.with(|baseline| baseline.set(None));
 }
 
 /// `FILETIME`（高低 32 位）拼为 100ns 滴答计数的 `u64`。
@@ -47,30 +57,36 @@ pub fn collect_cpu() {
     let kernel_time = filetime_to_u64(kernel_time);
     let user_time = filetime_to_u64(user_time);
 
-    if !CPU_INITIALIZED.load(Ordering::Acquire) {
-        PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);
-        PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
-        PREV_USER_TIME.store(user_time, Ordering::Relaxed);
-        CPU_INITIALIZED.store(true, Ordering::Release);
-        return;
-    }
+    CPU_BASELINE.with(|baseline| {
+        // 首轮（或基线被重置后）只采样建基线：无历史即无有效差分。
+        let Some(prev) = baseline.get() else {
+            baseline.set(Some(CpuTimes {
+                idle: idle_time,
+                kernel: kernel_time,
+                user: user_time,
+            }));
+            return;
+        };
 
-    let idle_diff = idle_time.saturating_sub(PREV_IDLE_TIME.load(Ordering::Relaxed));
-    let kernel_diff = kernel_time.saturating_sub(PREV_KERNEL_TIME.load(Ordering::Relaxed));
-    let user_diff = user_time.saturating_sub(PREV_USER_TIME.load(Ordering::Relaxed));
+        let idle_diff = idle_time.saturating_sub(prev.idle);
+        let kernel_diff = kernel_time.saturating_sub(prev.kernel);
+        let user_diff = user_time.saturating_sub(prev.user);
 
-    PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);
-    PREV_KERNEL_TIME.store(kernel_time, Ordering::Relaxed);
-    PREV_USER_TIME.store(user_time, Ordering::Relaxed);
+        baseline.set(Some(CpuTimes {
+            idle: idle_time,
+            kernel: kernel_time,
+            user: user_time,
+        }));
 
-    // GetSystemTimes 的 kernel 时间包含 idle，total = kernel + user 为全部时钟滴答。
-    let total = kernel_diff + user_diff;
-    if total == 0 {
-        return;
-    }
+        // GetSystemTimes 的 kernel 时间包含 idle，total = kernel + user 为全部时钟滴答。
+        let total = kernel_diff + user_diff;
+        if total == 0 {
+            return;
+        }
 
-    let usage = ((total - idle_diff) * 100 / total).min(100) as u32;
-    CPU_USAGE.store(usage, Ordering::Relaxed);
+        let usage = ((total - idle_diff) * 100 / total).min(100) as u32;
+        CPU_USAGE.store(usage, Ordering::Relaxed);
+    });
 }
 
 pub fn collect_memory() {
