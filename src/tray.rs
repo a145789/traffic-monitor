@@ -72,9 +72,11 @@ pub fn create_tray_icon(hwnd: HWND) -> bool {
     }
 
     // v4 语义是右键菜单（WM_CONTEXTMENU 经 lParam 低字分发）所必需；
-    // 失败时回调退回 v0（右键发 WM_RBUTTONUP，菜单静默失灵），重试一次。
+    // SETVERSION 失败时回调停留在 v0（右键发 WM_RBUTTONUP，菜单静默失灵）。
+    // 此处仅对瞬态失败同版本重试一次；旧 shell 不支持 V4 时仍会失败，
+    // 由 diag 留痕，不做版本降级（降级需连带处理 WM_RBUTTONUP，超出本轮范围）。
     if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) }.as_bool() {
-        diag!("托盘图标 NIM_SETVERSION 失败，尝试一次 v0 兼容重试");
+        diag!("托盘图标 NIM_SETVERSION 失败，重试一次");
         let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
     }
 

@@ -367,12 +367,24 @@ fn unregister_session_notification() {
 /// 启动与 Explorer 重建共用的资源绑定尾段：托盘图标 → 渲染参数 → 窗口失效
 /// → 监测定时器。两条生命周期路径保持唯一实现，失败文案由各自调用方报告。
 fn bind_display_and_timers(hwnd: HWND) -> bool {
-    create_tray_icon(hwnd);
+    // 托盘为 best-effort：失败不阻断监测主功能，由 diag 留痕。
+    if !create_tray_icon(hwnd) {
+        diag!("绑定显示与定时器: 托盘图标创建失败，本会话无图标");
+    }
 
+    let mut dpi_ok = true;
     renderer::with_renderer(|r| {
-        r.update_dpi(hwnd);
+        dpi_ok = r.update_dpi(hwnd);
         r.update_text_color();
     });
+    if !dpi_ok {
+        // 与 WM_DPICHANGED 失败分支对称：渲染器维持旧尺寸，把窗口回滚到同一尺寸，
+        // 否则「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、露出色键底色。
+        renderer::with_renderer(|r| {
+            let (width, height) = r.bitmap_size();
+            resize_embedded_window(hwnd, width, height);
+        });
+    }
 
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
