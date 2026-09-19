@@ -1,4 +1,6 @@
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
+use windows::Win32::System::Power::HPOWERNOTIFY;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
     PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
@@ -40,6 +42,102 @@ pub fn os_to_wide(s: &std::ffi::OsStr) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_wide().collect();
     v.push(0);
     v
+}
+
+/// DPI 缩放：全项目唯一的 `base * dpi / 96` 舍入实现。
+///
+/// 窗口矩形（`window::calc_widget_rect`）与位图/字体尺寸
+/// （`renderer::Renderer::update_dpi`）必须共享同一舍入策略，否则任一处改动
+/// 舍入即出现「窗口与位图差一像素」的错位。调用方直接传 `GetDpiForWindow`
+/// 返回的 `u32`，无需自行计算 `scale`。
+///
+/// `Layout::new` 刻意不调用本函数：它从已舍入的实际宽度反推比例
+/// （`width / DISPLAY_WIDTH`），若经整数 DPI 中转会因二次舍入在部分 DPI 下
+/// 差一像素（96–384 范围实测 77 处），故保持宽度推导以逐像素不变。
+pub fn dpi_scaled(base: i32, dpi: u32) -> i32 {
+    ((base as f64) * (dpi as f64) / 96.0).round() as i32
+}
+
+/// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处。
+///
+/// - `store`（Release）：发布新句柄。
+/// - `load`（Acquire）：只读查询，0 映射为 `None`；不做 `IsWindow` 校验，
+///   有效性由调用方按需查询。
+/// - `take`（AcqRel `swap(0)`）：取走语义，重建/注销路径专用；
+///   查询路径误用会清零丢句柄，类型层面与 `load` 区分。
+/// - `clear`（Release）：无条件归零（缓存失效）。
+pub struct AtomicHwnd(std::sync::atomic::AtomicIsize);
+
+impl AtomicHwnd {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicIsize::new(0))
+    }
+
+    pub fn store(&self, hwnd: HWND) {
+        self.0
+            .store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn load(&self) -> Option<HWND> {
+        let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(HWND(raw as *mut std::ffi::c_void))
+        }
+    }
+
+    pub fn take(&self) -> Option<HWND> {
+        let raw = self.0.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if raw == 0 {
+            None
+        } else {
+            Some(HWND(raw as *mut std::ffi::c_void))
+        }
+    }
+
+    pub fn clear(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn store_raw(&self, raw: isize) {
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `HPOWERNOTIFY` 的原子存储：与 [`AtomicHwnd`] 同构单列。
+///
+/// 内值为 `isize`，无需指针转换；内存序契约与 `AtomicHwnd` 一致
+/// （`store`/`clear` 用 Release，`load` 用 Acquire，`take` 用 AcqRel）。
+pub struct AtomicPowerNotify(std::sync::atomic::AtomicIsize);
+
+impl AtomicPowerNotify {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicIsize::new(0))
+    }
+
+    pub fn store(&self, handle: HPOWERNOTIFY) {
+        self.0.store(handle.0, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn load(&self) -> Option<HPOWERNOTIFY> {
+        let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(HPOWERNOTIFY(raw))
+        }
+    }
+
+    pub fn take(&self) -> Option<HPOWERNOTIFY> {
+        let raw = self.0.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if raw == 0 {
+            None
+        } else {
+            Some(HPOWERNOTIFY(raw))
+        }
+    }
 }
 
 /// 当前进程模块句柄（HINSTANCE），用于注册窗口类、加载内置资源。
@@ -264,5 +362,41 @@ mod tests {
             vec![0x41u16, 0xD800u16, 0x42u16, 0]
         );
         assert_ne!(to_wide(&raw.to_string_lossy()), os_to_wide(raw.as_os_str()));
+    }
+
+    #[test]
+    fn test_dpi_scaled_matches_forward_formula() {
+        // 96 DPI 下恒等；150%（144）与 200%（192）逐点对账收敛前的调用点写法
+        //（base * (dpi/96)，与合并后的 (base*dpi)/96 乘除顺序不同）。
+        for (base, dpi, expected) in [
+            (170, 96, 170),
+            (32, 96, 32),
+            (-3, 96, -3),
+            (13, 96, 13),
+            (170, 144, 255),
+            (32, 144, 48),
+            (-3, 144, -5),
+            (13, 144, 20),
+            (170, 192, 340),
+            (32, 192, 64),
+            (76, 120, 95),
+        ] {
+            assert_eq!(dpi_scaled(base, dpi), expected, "base={base} dpi={dpi}");
+            let legacy = (base as f64 * (dpi as f64 / 96.0)).round() as i32;
+            assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
+        }
+    }
+
+    #[test]
+    fn test_dpi_scaled_matches_legacy_across_dpi_range() {
+        // 新旧公式只是浮点乘除顺序不同，等价是实测结论而非恒等式：
+        // 四个实际调用点常量在 96–384 全范围逐点相等，改舍入即红。
+        use crate::config::{DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE, GAP};
+        for base in [DISPLAY_WIDTH, DISPLAY_HEIGHT, GAP, FONT_BASE_SIZE] {
+            for dpi in 96..=384u32 {
+                let legacy = (base as f64 * (dpi as f64 / 96.0)).round() as i32;
+                assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
+            }
+        }
     }
 }

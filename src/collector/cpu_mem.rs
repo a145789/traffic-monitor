@@ -1,6 +1,7 @@
 //! CPU 与内存使用率采集。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::state::{CPU_USAGE, MEM_USAGE};
@@ -14,21 +15,26 @@ pub fn reset_cpu_baseline() {
     CPU_INITIALIZED.store(false, Ordering::Release);
 }
 
+/// `FILETIME`（高低 32 位）拼为 100ns 滴答计数的 `u64`。
+fn filetime_to_u64(ft: FILETIME) -> u64 {
+    (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+}
+
 /// 采样 `GetSystemTimes`，更新 `CPU_USAGE`。
 ///
 /// 由 `TIMER_ID_CPU_MEM` 调用；首轮仅建立基线，不产生有效差分。
 /// API 调用失败或本周期差分为 0 时保持上次展示值不变。
 pub fn collect_cpu() {
-    let mut idle_time = 0u64;
-    let mut kernel_time = 0u64;
-    let mut user_time = 0u64;
+    let mut idle_time = FILETIME::default();
+    let mut kernel_time = FILETIME::default();
+    let mut user_time = FILETIME::default();
 
-    // SAFETY: 传入的指针均指向当前栈帧的有效可变 u64；API 仅在调用期间写入。
+    // SAFETY: 传入的指针均指向当前栈帧的有效 FILETIME；API 仅在调用期间写入。
     let ok = unsafe {
         windows::Win32::System::Threading::GetSystemTimes(
-            Some(&mut idle_time as *mut u64 as *mut _),
-            Some(&mut kernel_time as *mut u64 as *mut _),
-            Some(&mut user_time as *mut u64 as *mut _),
+            Some(std::ptr::addr_of_mut!(idle_time)),
+            Some(std::ptr::addr_of_mut!(kernel_time)),
+            Some(std::ptr::addr_of_mut!(user_time)),
         )
         .is_ok()
     };
@@ -36,6 +42,10 @@ pub fn collect_cpu() {
     if !ok {
         return;
     }
+
+    let idle_time = filetime_to_u64(idle_time);
+    let kernel_time = filetime_to_u64(kernel_time);
+    let user_time = filetime_to_u64(user_time);
 
     if !CPU_INITIALIZED.load(Ordering::Acquire) {
         PREV_IDLE_TIME.store(idle_time, Ordering::Relaxed);

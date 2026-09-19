@@ -80,6 +80,11 @@ pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 pub const INSTALLER_LAUNCH_MAX_ATTEMPTS: u32 = 3;
 pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
 
+/// 版本文件抓取失败后的重试等待（毫秒）：防抖一次，避免抖动空转。
+pub const UPDATE_FETCH_RETRY_DELAY_MS: u64 = 500;
+/// 更新工作线程栈大小（字节）。
+pub const UPDATE_WORKER_STACK_BYTES: usize = 64 * 1024;
+
 /// 子进程发出 EXIT_MAIN 后等待主进程退出（单实例互斥量消失）的总超时与轮询间隔。
 /// 超时后照常启动安装器，由安装器内 taskkill 兜底强杀。
 pub const MAIN_EXIT_WAIT_TIMEOUT_MS: u64 = 5000;

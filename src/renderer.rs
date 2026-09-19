@@ -14,7 +14,7 @@ use crate::config::{
     LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN, REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
-use crate::util::{push_wide, reg_read_dword, to_wide};
+use crate::util::{dpi_scaled, push_wide, reg_read_dword, to_wide};
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
@@ -428,10 +428,9 @@ impl Renderer {
         // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用
         // GetDpiForWindow 是纯查询 API，无跨进程非法访问问题。
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-        let scale = dpi as f64 / 96.0;
-        let width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
-        let height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
-        let font_size = (FONT_BASE_SIZE as f64 * scale).round() as i32;
+        let width = dpi_scaled(DISPLAY_WIDTH, dpi);
+        let height = dpi_scaled(DISPLAY_HEIGHT, dpi);
+        let font_size = dpi_scaled(FONT_BASE_SIZE, dpi);
 
         // 1. 取得临时屏幕 DC。
         let Some(screen_dc) = ScreenDcGuard::acquire() else {
@@ -503,6 +502,10 @@ impl Drop for Renderer {
 }
 
 /// 双列布局（物理像素），随窗口宽度按 96-DPI 基准缩放。
+///
+/// `width` 必须取已舍入的实际宽度（`dpi_scaled(DISPLAY_WIDTH, dpi)` 的输出），
+/// 禁止经整数 DPI 中转二次舍入（96–384 实测 77 处差一像素）；改任一侧舍入
+/// 策略都要重新全范围对账。
 struct Layout {
     speed_left: i32,
     speed_right: i32,
@@ -560,9 +563,10 @@ fn create_font(size: i32) -> HFONT {
         ..Default::default()
     };
     let font_name = to_wide("Segoe UI");
-    let copy_len = font_name.len().min(lf.lfFaceName.len());
+    let copy_len = (font_name.len() + 1).min(lf.lfFaceName.len()) - 1;
     lf.lfFaceName[..copy_len].copy_from_slice(&font_name[..copy_len]);
-    // SAFETY: lfFaceName 含尾 NUL；返回的 HFONT 由调用方独占释放。
+    lf.lfFaceName[copy_len] = 0;
+    // SAFETY: lfFaceName 经上式截断后必含尾 NUL；返回的 HFONT 由调用方独占释放。
     unsafe { CreateFontIndirectW(&lf) }
 }
 

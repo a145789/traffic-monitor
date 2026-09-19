@@ -11,13 +11,13 @@ mod update;
 mod util;
 mod window;
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Power::{
-    HPOWERNOTIFY, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+    RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
 };
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
@@ -52,19 +52,21 @@ use crate::update::{
     defer_initial_auto_check, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
     subprocess_main,
 };
-use crate::util::{set_low_memory_priority, show_error, trim_working_set};
+use crate::util::{
+    AtomicHwnd, AtomicPowerNotify, set_low_memory_priority, show_error, trim_working_set,
+};
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
     reembed_if_lost, register_watchdog_class, register_window_class, update_taskbar_position,
 };
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
-static POWER_NOTIFY_HANDLE: AtomicIsize = AtomicIsize::new(0);
-/// 当前主窗口句柄（isize）。Explorer 重启重建后更新；0 表示暂无主窗口。
-static CURRENT_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-/// 已注册会话通知的窗口句柄（isize）；0 表示当前无注册。重建路径据此在销毁
+static POWER_NOTIFY_HANDLE: AtomicPowerNotify = AtomicPowerNotify::new();
+/// 当前主窗口句柄。Explorer 重启重建后更新；`None` 表示暂无主窗口。
+static CURRENT_MAIN_HWND: AtomicHwnd = AtomicHwnd::new();
+/// 已注册会话通知的窗口句柄；`None` 表示当前无注册。重建路径据此在销毁
 /// 旧窗口前配对注销，避免每次 Explorer 重启留下悬空注册。
-static SESSION_NOTIFY_HWND: AtomicIsize = AtomicIsize::new(0);
+static SESSION_NOTIFY_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 退出请求是否已受理。`--quit` 可因超时重试或多次调用重复到达，
 /// 退出序列（托盘清理 + `PostQuitMessage`）只应执行一次。
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -216,7 +218,7 @@ fn main() {
             return;
         }
     };
-    CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
+    CURRENT_MAIN_HWND.store(hwnd);
 
     register_power_notify(hwnd);
 
@@ -288,10 +290,10 @@ fn main() {
     // 会话通知经状态位取当前注册句柄，重建路径已注销过的旧注册不会重复发。
     unregister_session_notification();
 
-    let power_handle = POWER_NOTIFY_HANDLE.load(Ordering::Acquire);
-    if power_handle != 0 {
+    let power_handle = POWER_NOTIFY_HANDLE.load();
+    if let Some(handle) = power_handle {
         unsafe {
-            let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(power_handle));
+            let _ = UnregisterPowerSettingNotification(handle);
         }
     }
 
@@ -313,7 +315,7 @@ fn register_power_notify(hwnd: HWND) {
     };
     match power_notify {
         Ok(handle) => {
-            POWER_NOTIFY_HANDLE.store(handle.0, Ordering::Release);
+            POWER_NOTIFY_HANDLE.store(handle);
         }
         Err(e) => {
             show_error(&format!("注册电源设置通知失败: {e:?}"));
@@ -326,7 +328,7 @@ fn register_power_notify(hwnd: HWND) {
 fn register_session_notification(hwnd: HWND) {
     match unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
         // 只有注册成功才记位：失败时无配对可注销，记位会让状态位谎报存在注册。
-        Ok(()) => SESSION_NOTIFY_HWND.store(hwnd.0 as isize, Ordering::Release),
+        Ok(()) => SESSION_NOTIFY_HWND.store(hwnd),
         Err(e) => show_error(&format!("注册会话通知失败: {e:?}")),
     }
 }
@@ -341,10 +343,9 @@ fn register_session_notification(hwnd: HWND) {
 /// 仅由 UI 线程调用（启动失败早退路径与 `rebuild_main_window`），
 /// 与同一线程上的注册调用之间无并发写者。
 fn unregister_session_notification() {
-    let registered = SESSION_NOTIFY_HWND.swap(0, Ordering::AcqRel);
-    if registered != 0 {
+    if let Some(registered) = SESSION_NOTIFY_HWND.take() {
         unsafe {
-            let _ = WTSUnRegisterSessionNotification(HWND(registered as *mut std::ffi::c_void));
+            let _ = WTSUnRegisterSessionNotification(registered);
         }
     }
 }
@@ -380,9 +381,8 @@ fn rebuild_main_window(watchdog: HWND) {
     // 销毁后句柄失效，届时已无法补做。
     unregister_session_notification();
 
-    let old = CURRENT_MAIN_HWND.swap(0, Ordering::AcqRel);
-    if old != 0 {
-        let old_hwnd = HWND(old as *mut std::ffi::c_void);
+    let old = CURRENT_MAIN_HWND.take();
+    if let Some(old_hwnd) = old {
         // SAFETY: 主窗口与看门狗同在 UI 线程创建；IsWindow 过滤陈旧句柄后销毁安全。
         if unsafe { IsWindow(Some(old_hwnd)) }.as_bool() {
             unsafe {
@@ -405,14 +405,13 @@ fn rebuild_main_window(watchdog: HWND) {
         }
     };
     disarm_rebuild_retry(watchdog);
-    CURRENT_MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
+    CURRENT_MAIN_HWND.store(hwnd);
 
     // 旧电源通知绑定在已销毁的窗口上，先注销再对新窗口重新注册。
     // 会话通知的旧注册已在函数开头（销毁前）注销，此处只补新窗口的注册。
-    let prev_power = POWER_NOTIFY_HANDLE.swap(0, Ordering::AcqRel);
-    if prev_power != 0 {
+    if let Some(prev_power) = POWER_NOTIFY_HANDLE.take() {
         unsafe {
-            let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(prev_power));
+            let _ = UnregisterPowerSettingNotification(prev_power);
         }
     }
     register_power_notify(hwnd);
@@ -436,11 +435,7 @@ fn rebuild_main_window(watchdog: HWND) {
 /// 所有跨消息/跨线程的控制动作都必须经此校验后使用句柄：Explorer 重建会替换
 /// 主窗口，任何快照下来的旧句柄都可能指向已销毁的窗口，向它投递消息会静默丢失。
 fn live_main_hwnd() -> Option<HWND> {
-    let raw = CURRENT_MAIN_HWND.load(Ordering::Acquire);
-    if raw == 0 {
-        return None;
-    }
-    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    let hwnd = CURRENT_MAIN_HWND.load()?;
     // SAFETY: IsWindow 是纯查询，对陈旧句柄安全返回布尔，不解引用任何用户内存。
     unsafe { IsWindow(Some(hwnd)) }.as_bool().then_some(hwnd)
 }
@@ -629,8 +624,13 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 renderer::invalidate_if_values_changed(hwnd);
             }
         }
-        TIMER_ID_AUTO_UPDATE if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) => {
-            start_auto_check();
+        TIMER_ID_AUTO_UPDATE => {
+            // 条件先命名：arm 体若只剩单个 if 会触发 collapsible_match，
+            // 与兄弟 arm 同保持函数体内 if（无 match guard）。
+            let active = !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire);
+            if active {
+                start_auto_check();
+            }
         }
         _ => {}
     }
@@ -790,11 +790,11 @@ mod tests {
     fn stale_main_hwnd_is_rejected() {
         // 模拟 Explorer 重建后残留的旧句柄：IsWindow 必须否决它，使退出与更新动作
         // 落到看门狗兜底路径，而不是投给已销毁的窗口后静默丢失。
-        CURRENT_MAIN_HWND.store(0x0BAD_F00D, Ordering::Release);
+        CURRENT_MAIN_HWND.store_raw(0x0BAD_F00D);
         assert!(live_main_hwnd().is_none());
 
-        // 重建间隙（CURRENT_MAIN_HWND=0）同样没有可转发的目标。
-        CURRENT_MAIN_HWND.store(0, Ordering::Release);
+        // 重建间隙（CURRENT_MAIN_HWND 为空）同样没有可转发的目标。
+        CURRENT_MAIN_HWND.clear();
         assert!(live_main_hwnd().is_none());
     }
 }

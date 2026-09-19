@@ -1,6 +1,6 @@
 //! 窗口创建与任务栏嵌入：窗口类注册、主窗口创建、任务栏查找、嵌入与位置更新。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT, SetLastError, WIN32_ERROR};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetParent,
@@ -15,14 +15,14 @@ use windows::core::{PCWSTR, w};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WATCHDOG_CLASS, WINDOW_CLASS, WINDOW_TITLE,
 };
-use crate::util::module_instance;
+use crate::util::{AtomicHwnd, dpi_scaled, module_instance};
 
-static TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
-/// 看门狗窗口句柄（isize）；0 表示尚未创建。
+static TASKBAR_HWND: AtomicHwnd = AtomicHwnd::new();
+/// 看门狗窗口句柄；`None` 表示尚未创建。
 ///
 /// 看门狗是整条生命周期内唯一不重建的顶层窗口，因此它同时是
 /// `--quit` 退出请求、更新交接消息与主题广播的稳定落点（见 `crate::main`）。
-static WATCHDOG_HWND: AtomicIsize = AtomicIsize::new(0);
+static WATCHDOG_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 当前主窗口是否已完成整条嵌入序列（含分层属性）。
 ///
 /// 只有 `embed_in_taskbar` 全链成功才置位；发起任何一次嵌入前先清位，
@@ -134,7 +134,7 @@ pub fn create_watchdog_window() -> Result<HWND, String> {
         "创建看门狗窗口失败",
     )?;
     // 发布句柄供 update 等模块投递控制消息：它们不再快照易失效的主窗口句柄。
-    WATCHDOG_HWND.store(hwnd.0 as isize, Ordering::Release);
+    WATCHDOG_HWND.store(hwnd);
     Ok(hwnd)
 }
 
@@ -143,35 +143,29 @@ pub fn create_watchdog_window() -> Result<HWND, String> {
 /// 调用方用它作为控制消息落点，句柄有效性由内核在投递时裁决：
 /// `PostMessageW` 对已销毁句柄返回错误，调用方据此走兜底路径。
 pub fn watchdog_hwnd() -> Option<HWND> {
-    let raw = WATCHDOG_HWND.load(Ordering::Acquire);
-    if raw == 0 {
-        return None;
-    }
-    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    let hwnd = WATCHDOG_HWND.load()?;
     // SAFETY: IsWindow 是纯查询，对任意句柄值安全返回布尔。
     unsafe { IsWindow(Some(hwnd)) }.as_bool().then_some(hwnd)
 }
 
 pub fn get_taskbar_hwnd() -> Option<HWND> {
-    let cached = TASKBAR_HWND.load(Ordering::Acquire);
-    if cached != 0 {
-        let hwnd = HWND(cached as *mut std::ffi::c_void);
+    if let Some(hwnd) = TASKBAR_HWND.load() {
         if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Some(hwnd);
         }
-        TASKBAR_HWND.store(0, Ordering::Release);
+        TASKBAR_HWND.clear();
     }
     // SAFETY: 静态类名 "Shell_TrayWnd"；FindWindowW 仅查询句柄。
     let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), w!("")).ok() };
     if let Some(h) = hwnd {
-        TASKBAR_HWND.store(h.0 as isize, Ordering::Release);
+        TASKBAR_HWND.store(h);
     }
     hwnd
 }
 
 /// 重置任务栏句柄缓存（由 `TaskbarCreated` 消息触发）。
 pub fn invalidate_taskbar_cache() {
-    TASKBAR_HWND.store(0, Ordering::Release);
+    TASKBAR_HWND.clear();
 }
 
 /// 计算小组件在任务栏上的目标矩形 (x, y, w, h)；仅 window.rs 内部消费。
@@ -188,10 +182,9 @@ fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     }
 
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-    let scale = dpi as f64 / 96.0;
-    let display_width = (DISPLAY_WIDTH as f64 * scale).round() as i32;
-    let display_height = (DISPLAY_HEIGHT as f64 * scale).round() as i32;
-    let gap = (GAP as f64 * scale).round() as i32;
+    let display_width = dpi_scaled(DISPLAY_WIDTH, dpi);
+    let display_height = dpi_scaled(DISPLAY_HEIGHT, dpi);
+    let gap = dpi_scaled(GAP, dpi);
 
     let display_x = rc_tray.left - rc_taskbar.left - gap - display_width;
     let display_y = (rc_taskbar.bottom - rc_taskbar.top - display_height) / 2;
