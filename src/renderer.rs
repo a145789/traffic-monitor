@@ -502,6 +502,10 @@ impl Drop for Renderer {
 }
 
 /// 双列布局（物理像素），随窗口宽度按 96-DPI 基准缩放。
+///
+/// `width` 必须取已舍入的实际宽度（`dpi_scaled(DISPLAY_WIDTH, dpi)` 的输出），
+/// 禁止经整数 DPI 中转二次舍入（96–384 实测 77 处差一像素）；改任一侧舍入
+/// 策略都要重新全范围对账。
 struct Layout {
     speed_left: i32,
     speed_right: i32,

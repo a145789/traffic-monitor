@@ -58,7 +58,7 @@ pub fn dpi_scaled(base: i32, dpi: u32) -> i32 {
     ((base as f64) * (dpi as f64) / 96.0).round() as i32
 }
 
-/// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处.
+/// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处。
 ///
 /// - `store`（Release）：发布新句柄。
 /// - `load`（Acquire）：只读查询，0 映射为 `None`；不做 `IsWindow` 校验，
@@ -106,7 +106,7 @@ impl AtomicHwnd {
     }
 }
 
-/// `HPOWERNOTIFY` 的原子存储：与 [`AtomicHwnd`] 同构单列.
+/// `HPOWERNOTIFY` 的原子存储：与 [`AtomicHwnd`] 同构单列。
 ///
 /// 内值为 `isize`，无需指针转换；内存序契约与 `AtomicHwnd` 一致
 /// （`store`/`clear` 用 Release，`load` 用 Acquire，`take` 用 AcqRel）。
@@ -366,7 +366,8 @@ mod tests {
 
     #[test]
     fn test_dpi_scaled_matches_forward_formula() {
-        // 96 DPI 下恒等；150%（144）与 200%（192）逐点对账正向公式。
+        // 96 DPI 下恒等；150%（144）与 200%（192）逐点对账收敛前的调用点写法
+        //（base * (dpi/96)，与合并后的 (base*dpi)/96 乘除顺序不同）。
         for (base, dpi, expected) in [
             (170, 96, 170),
             (32, 96, 32),
@@ -381,8 +382,21 @@ mod tests {
             (76, 120, 95),
         ] {
             assert_eq!(dpi_scaled(base, dpi), expected, "base={base} dpi={dpi}");
-            let direct = ((base as f64) * (dpi as f64) / 96.0).round() as i32;
-            assert_eq!(dpi_scaled(base, dpi), direct);
+            let legacy = (base as f64 * (dpi as f64 / 96.0)).round() as i32;
+            assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
+        }
+    }
+
+    #[test]
+    fn test_dpi_scaled_matches_legacy_across_dpi_range() {
+        // 新旧公式只是浮点乘除顺序不同，等价是实测结论而非恒等式：
+        // 四个实际调用点常量在 96–384 全范围逐点相等，改舍入即红。
+        use crate::config::{DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE, GAP};
+        for base in [DISPLAY_WIDTH, DISPLAY_HEIGHT, GAP, FONT_BASE_SIZE] {
+            for dpi in 96..=384u32 {
+                let legacy = (base as f64 * (dpi as f64 / 96.0)).round() as i32;
+                assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
+            }
         }
     }
 }
