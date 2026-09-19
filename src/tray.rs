@@ -21,16 +21,20 @@ use crate::config::{
 };
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
-use crate::util::{module_instance, reg_read_string, reg_remove_value, reg_write_string, to_wide};
+use crate::util::{
+    diag, module_instance, reg_read_string, reg_remove_value, reg_write_string, to_wide,
+};
 
 thread_local! {
     static TRAY_DATA: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) };
 }
 
-pub fn create_tray_icon(hwnd: HWND) {
-    let hinstance = match module_instance() {
-        Ok(h) => h,
-        Err(_) => return,
+/// 创建托盘图标。返回 false 表示图标不存在（调用方据此知道状态机里没有图标，
+/// 如 `NIM_ADD` 失败时不得把 `nid` 存进 `TRAY_DATA` 让移除/重建路径误判）。
+pub fn create_tray_icon(hwnd: HWND) -> bool {
+    let Ok(hinstance) = module_instance() else {
+        diag!("创建托盘图标失败: 无法获取模块实例");
+        return false;
     };
 
     // 1 as *const u16 对应 MAKEINTRESOURCEW(1)，资源 ID 1（assets/icon.ico）。
@@ -61,13 +65,25 @@ pub fn create_tray_icon(hwnd: HWND) {
     nid.szTip[copy_len] = 0;
 
     // SAFETY: nid 完整初始化，同步调用期间存活。
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-        let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
+    if !added {
+        diag!("创建托盘图标失败: Shell_NotifyIconW(NIM_ADD) 未成功");
+        return false;
     }
+
+    // v4 语义是右键菜单（WM_CONTEXTMENU 经 lParam 低字分发）所必需；
+    // SETVERSION 失败时回调停留在 v0（右键发 WM_RBUTTONUP，菜单静默失灵）。
+    // 此处仅对瞬态失败同版本重试一次；旧 shell 不支持 V4 时仍会失败，
+    // 由 diag 留痕，不做版本降级（降级需连带处理 WM_RBUTTONUP，超出本轮范围）。
+    if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) }.as_bool() {
+        diag!("托盘图标 NIM_SETVERSION 失败，重试一次");
+        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
+    }
+
     TRAY_DATA.with(|t| {
         *t.borrow_mut() = Some(nid);
     });
+    true
 }
 
 pub fn remove_tray_icon() {

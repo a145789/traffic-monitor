@@ -18,6 +18,7 @@ use crate::config::{
     WM_USER_NETWORK_RECONNECTED,
 };
 use crate::state::{CONSECUTIVE_ZERO_COUNT, NET_SPEED_DOWN, NET_SPEED_UP};
+use crate::util::diag;
 
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
@@ -135,7 +136,9 @@ pub fn collect_network(hwnd: HWND) {
 fn post_to_main(hwnd: HWND, msg: u32) {
     // SAFETY: PostMessageW 只投递消息，线程安全；窗口已销毁时返回错误。
     unsafe {
-        let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
+        if PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)).is_err() {
+            diag!("投递网络状态消息({msg}) 到主窗口失败");
+        }
     }
 }
 

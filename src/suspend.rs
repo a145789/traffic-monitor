@@ -26,7 +26,7 @@ use crate::state::{
     CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION,
     SUSPEND_REASON_SYSTEM, SUSPEND_REASONS, SuspendReasons, reset_network_backoff,
 };
-use crate::util::trim_working_set;
+use crate::util::{diag, trim_working_set};
 use crate::window::get_taskbar_hwnd;
 
 pub fn is_suspended() -> bool {
@@ -197,6 +197,16 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         let _ = set_coalescable_timer(hwnd, TIMER_ID_AUTO_UPDATE, TIMER_INTERVAL_AUTO_UPDATE);
     }
 
+    if !fullscreen_ok {
+        diag!("同步监测定时器失败: 全屏检测定时器({TIMER_ID_FULLSCREEN}) 未创建");
+    }
+    if !network_ok {
+        diag!("同步监测定时器失败: 网络采样定时器({TIMER_ID_NETWORK}) 未创建");
+    }
+    if !cpu_mem_ok {
+        diag!("同步监测定时器失败: CPU/内存采样定时器({TIMER_ID_CPU_MEM}) 未创建");
+    }
+
     fullscreen_ok && network_ok && cpu_mem_ok
 }
 
@@ -213,6 +223,26 @@ fn set_coalescable_timer(hwnd: HWND, timer_id: usize, interval: u32) -> bool {
     }
 }
 
+/// 全屏状态跃迁后的统一收尾，两个判定分支共用。边沿未变直接返回；
+/// 离开全屏（was=true → now=false）时重建差分基线：停采期间基线已陈旧，
+/// 不重建会把累计流量/CPU 摊成恢复瞬间的虚假速率（只动基线，不动退避与
+/// 定时器计划集合，与 `resume_system` 同理）；随后同步监测定时器，
+/// 离开时强制重绘（挂起期间分层窗口表面可能被系统丢弃，须整幅自愈）。
+fn on_fullscreen_edge(hwnd: HWND, was: bool, now: bool) {
+    if was == now {
+        return;
+    }
+    MONITOR_FULLSCREEN.store(now, Ordering::Release);
+    if !now {
+        reset_network_baseline();
+        reset_cpu_baseline();
+    }
+    let _ = sync_monitoring_timers(hwnd);
+    if !now {
+        force_repaint(hwnd);
+    }
+}
+
 pub fn check_fullscreen(hwnd: HWND) {
     let foreground = unsafe { GetForegroundWindow() };
     let is_invalid = foreground.is_invalid();
@@ -220,16 +250,7 @@ pub fn check_fullscreen(hwnd: HWND) {
         unsafe { GetDesktopWindow() == foreground || GetShellWindow() == foreground };
 
     if is_invalid || is_desktop_or_shell || foreground == hwnd {
-        let was = MONITOR_FULLSCREEN.load(Ordering::Acquire);
-        if was {
-            MONITOR_FULLSCREEN.store(false, Ordering::Release);
-            // 全屏退出边沿：停采期间差分基线已陈旧，重建后首个周期只建基线；
-            // 只动基线不动退避与 timer_plan 集合（见 resume_system 同理）。
-            reset_network_baseline();
-            reset_cpu_baseline();
-            let _ = sync_monitoring_timers(hwnd);
-            force_repaint(hwnd);
-        }
+        on_fullscreen_edge(hwnd, MONITOR_FULLSCREEN.load(Ordering::Acquire), false);
         return;
     }
 
@@ -269,20 +290,7 @@ pub fn check_fullscreen(hwnd: HWND) {
 
     let was = MONITOR_FULLSCREEN.load(Ordering::Acquire);
     let should_suspend = is_full && same_monitor;
-    MONITOR_FULLSCREEN.store(should_suspend, Ordering::Release);
-
-    if should_suspend != was {
-        if !should_suspend {
-            // 全屏退出边沿：与 resume_system 同理重建差分基线，避免把全屏
-            // 期间的累计流量/CPU 摊成恢复瞬间的虚假速率；退避状态保持不动。
-            reset_network_baseline();
-            reset_cpu_baseline();
-        }
-        let _ = sync_monitoring_timers(hwnd);
-        if !should_suspend {
-            force_repaint(hwnd);
-        }
-    }
+    on_fullscreen_edge(hwnd, was, should_suspend);
 }
 
 /// # Safety

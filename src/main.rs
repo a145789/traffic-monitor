@@ -26,10 +26,10 @@ use windows::Win32::System::SystemServices::GUID_MONITOR_POWER_ON;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow, FindWindowW, IsWindow, KillTimer,
-    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetTimer, WM_CLOSE, WM_CONTEXTMENU,
-    WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
-    WM_WTSSESSION_CHANGE,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetMessageW, IsWindow, KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
+    SetTimer, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT,
+    WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -53,11 +53,12 @@ use crate::update::{
     subprocess_main,
 };
 use crate::util::{
-    AtomicHwnd, AtomicPowerNotify, set_low_memory_priority, show_error, trim_working_set,
+    AtomicHwnd, AtomicPowerNotify, diag, set_low_memory_priority, show_error, trim_working_set,
 };
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
-    reembed_if_lost, register_watchdog_class, register_window_class, update_taskbar_position,
+    reembed_if_lost, register_watchdog_class, register_window_class, resize_embedded_window,
+    update_taskbar_position,
 };
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
@@ -142,6 +143,30 @@ fn quit_existing_instance() {
     }
 }
 
+/// 创建单例互斥量。已存在实例（重复启动）静默返回 None；创建本身失败弹框后
+/// 返回 None。两种情况 `main()` 都直接退出，与提取前的早退路径一一对应。
+fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
+    // MUTEX_NAME 常量已含尾 NUL。
+    let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
+    // SAFETY: mutex_name 以 NUL 结尾；句柄由 MutexGuard 关闭。
+    let mutex_handle = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) };
+
+    match mutex_handle {
+        Ok(handle) => {
+            // SAFETY: 紧接 CreateMutexW 读取 last-error，避免被中间调用覆盖。
+            let last_error = unsafe { GetLastError() };
+            if last_error == ERROR_ALREADY_EXISTS {
+                return None;
+            }
+            Some(crate::ffi_guard::MutexGuard(handle))
+        }
+        Err(_) => {
+            show_error("创建单例互斥量失败");
+            None
+        }
+    }
+}
+
 fn main() {
     let cli = parse_cli_args(std::env::args_os().skip(1));
     if cli.quit {
@@ -154,25 +179,11 @@ fn main() {
         std::process::exit(subprocess_main(cli.manual));
     }
 
-    // MUTEX_NAME 常量已含尾 NUL。
-    let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
-    // SAFETY: mutex_name 以 NUL 结尾；句柄由 MutexGuard 关闭。
-    let mutex_handle = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) };
-
-    let _mutex_guard = match mutex_handle {
-        Ok(handle) => {
-            // SAFETY: 紧接 CreateMutexW 读取 last-error，避免被中间调用覆盖。
-            let last_error = unsafe { GetLastError() };
-            let guard = crate::ffi_guard::MutexGuard(handle);
-            if last_error == ERROR_ALREADY_EXISTS {
-                return;
-            }
-            guard
-        }
-        Err(_) => {
-            show_error("创建单例互斥量失败");
-            return;
-        }
+    // guard 必须活到消息循环结束：它是单例互斥量的存活证明，提前 drop 会让
+    // 第二个实例通过 CreateMutexW 拦截。绑定留在 main 栈帧上。
+    let _mutex_guard = match init_single_instance() {
+        Some(guard) => guard,
+        None => return,
     };
 
     // 主进程常驻期间保持低内存优先级：内存紧张时 OS 优先回收本进程页面，
@@ -266,25 +277,7 @@ fn main() {
         );
     }
 
-    let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-
-    // GetMessageW：>0 有消息；0 收到 WM_QUIT；-1 致命错误须退出。
-    unsafe {
-        loop {
-            match windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0).0 {
-                0 => break,
-                -1 => {
-                    let last = GetLastError();
-                    show_error(&format!("消息循环 GetMessageW 致命错误: 0x{:08X}", last.0));
-                    break;
-                }
-                _ => {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
-                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
-                }
-            }
-        }
-    }
+    run_message_loop();
 
     // 注销须针对当前主窗口：Explorer 重启重建后原局部 hwnd 已陈旧。
     // 会话通知经状态位取当前注册句柄，重建路径已注销过的旧注册不会重复发。
@@ -298,6 +291,27 @@ fn main() {
     }
 
     renderer::take_renderer();
+}
+
+/// 主消息循环。`GetMessageW`：>0 有消息；0 收到 WM_QUIT；-1 致命错误须退出。
+fn run_message_loop() {
+    let mut msg = MSG::default();
+    unsafe {
+        loop {
+            match GetMessageW(&mut msg, None, 0, 0).0 {
+                0 => break,
+                -1 => {
+                    let last = GetLastError();
+                    show_error(&format!("消息循环 GetMessageW 致命错误: 0x{:08X}", last.0));
+                    break;
+                }
+                _ => {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+    }
 }
 
 // --- 看门狗窗口与 Explorer 重启恢复 ---
@@ -353,12 +367,24 @@ fn unregister_session_notification() {
 /// 启动与 Explorer 重建共用的资源绑定尾段：托盘图标 → 渲染参数 → 窗口失效
 /// → 监测定时器。两条生命周期路径保持唯一实现，失败文案由各自调用方报告。
 fn bind_display_and_timers(hwnd: HWND) -> bool {
-    create_tray_icon(hwnd);
+    // 托盘为 best-effort：失败不阻断监测主功能，由 diag 留痕。
+    if !create_tray_icon(hwnd) {
+        diag!("绑定显示与定时器: 托盘图标创建失败，本会话无图标");
+    }
 
+    let mut dpi_ok = true;
     renderer::with_renderer(|r| {
-        r.update_dpi(hwnd);
+        dpi_ok = r.update_dpi(hwnd);
         r.update_text_color();
     });
+    if !dpi_ok {
+        // 与 WM_DPICHANGED 失败分支对称：渲染器维持旧尺寸，把窗口回滚到同一尺寸，
+        // 否则「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、露出色键底色。
+        renderer::with_renderer(|r| {
+            let (width, height) = r.bitmap_size();
+            resize_embedded_window(hwnd, width, height);
+        });
+    }
 
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -457,7 +483,9 @@ fn arm_rebuild_retry(watchdog: HWND) {
     REBUILD_RETRY_INTERVAL_MS.with(|c| c.set(next));
     // SAFETY: watchdog 是看门狗窗口句柄，与调用方同属 UI 线程；不使用回调函数。
     unsafe {
-        let _ = SetTimer(Some(watchdog), TIMER_ID_REBUILD_RETRY, next, None);
+        if SetTimer(Some(watchdog), TIMER_ID_REBUILD_RETRY, next, None) == 0 {
+            diag!("重建重试定时器({TIMER_ID_REBUILD_RETRY}) 创建失败");
+        }
     }
 }
 
@@ -677,10 +705,21 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
 
         WM_DPICHANGED => {
-            renderer::with_renderer(|r| r.update_dpi(hwnd));
-            // 失败不弹框：DPI 变更本身就是重排，改由 reembed_if_lost 在下一 tick 补做，
-            // 避免跨屏拖动时连环弹窗。
-            let _ = embed_in_taskbar(hwnd);
+            let mut dpi_updated = false;
+            renderer::with_renderer(|r| dpi_updated = r.update_dpi(hwnd));
+            if dpi_updated {
+                // 失败不弹框：DPI 变更本身就是重排，改由 reembed_if_lost 在下一 tick 补做，
+                // 避免跨屏拖动时连环弹窗。
+                let _ = embed_in_taskbar(hwnd);
+            } else {
+                // 位图/字体创建失败：渲染器维持旧尺寸，须把窗口回滚到同一尺寸，
+                // 否则「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、
+                // 边缘露出色键底色；跨屏后的合身位置由下个成功周期自愈。
+                renderer::with_renderer(|r| {
+                    let (width, height) = r.bitmap_size();
+                    resize_embedded_window(hwnd, width, height);
+                });
+            }
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
