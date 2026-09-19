@@ -22,7 +22,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GetLastError,
     LPARAM, WPARAM,
 };
-use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, MUTEX_ALL_ACCESS, OpenMutexW};
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
 };
@@ -35,7 +35,8 @@ use crate::config::{
     AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, INSTALLER_CACHE_MAX_AGE_SECS,
     INSTALLER_LAUNCH_MAX_ATTEMPTS, INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES,
     MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS, REG_PATH_APP, RELAUNCHED_BY_UPDATE_ARG,
-    VERSION, VERSION_METADATA_MAX_BYTES, WM_USER_UPDATE_ACTION,
+    UPDATE_FETCH_RETRY_DELAY_MS, UPDATE_WORKER_STACK_BYTES, VERSION, VERSION_METADATA_MAX_BYTES,
+    WM_USER_UPDATE_ACTION,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
@@ -180,7 +181,7 @@ pub fn start_manual_check() {
 /// `start_auto_check` 内，占坑与门序不因本函数改变。
 fn spawn_update_worker(is_manual: bool) {
     if std::thread::Builder::new()
-        .stack_size(64 * 1024)
+        .stack_size(UPDATE_WORKER_STACK_BYTES)
         .spawn(move || {
             update_check_worker(is_manual);
         })
@@ -289,8 +290,10 @@ enum InstallerLaunch {
 fn do_update_check(is_manual: bool) -> CheckResult {
     let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     if response.is_err() {
-        // 失败时增加 1 次重试，并等待 500ms 防止抖动
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // 失败时增加 1 次重试，并等待片刻防止抖动
+        std::thread::sleep(std::time::Duration::from_millis(
+            UPDATE_FETCH_RETRY_DELAY_MS,
+        ));
         response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     }
 
@@ -657,8 +660,6 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
         Err(_) => return failed(),
     };
 
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
     let mut command = std::process::Command::new(exe);
     command.arg("--check-update");
     if is_manual {
@@ -666,7 +667,7 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     }
 
     let mut child = match command
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW.0)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
