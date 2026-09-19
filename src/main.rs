@@ -75,6 +75,39 @@ thread_local! {
     static REBUILD_RETRY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// 启动参数一次性解析结果：`--quit` / `--check-update` / `--manual` / 更新拉起标记。
+///
+/// 单一事实来源：`main()` 只扫描一次 `args_os`。优先级由 `main()` 开头的
+/// 检查顺序钉死（`--quit` 先于 `--check-update`），不再散落于多次线性扫描中。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CliArgs {
+    quit: bool,
+    check_update: bool,
+    manual: bool,
+    relaunched_by_update: bool,
+}
+
+/// 一次遍历解析启动参数。`args_os` 不要求参数为合法 Unicode，
+/// 含非 UTF-8/非 UTF-16 可表示字符的无关参数只会被忽略，不再 panic。
+/// 比较为精确匹配：`--quit=1` 这类缀接形式判否，与旧 `==` 语义一致。
+fn parse_cli_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliArgs {
+    use std::ffi::OsStr;
+    let mut cli = CliArgs::default();
+    for arg in args {
+        let s = arg.as_os_str();
+        if s == OsStr::new("--quit") {
+            cli.quit = true;
+        } else if s == OsStr::new("--check-update") {
+            cli.check_update = true;
+        } else if s == OsStr::new("--manual") {
+            cli.manual = true;
+        } else if s == OsStr::new(RELAUNCHED_BY_UPDATE_ARG) {
+            cli.relaunched_by_update = true;
+        }
+    }
+    cli
+}
+
 /// `--quit` 入口：把退出请求交给现存实例的看门狗窗口。
 ///
 /// 必须查 `WATCHDOG_CLASS` 而不是 `WINDOW_CLASS`：主窗口嵌入任务栏后是
@@ -108,16 +141,15 @@ fn quit_existing_instance() {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--quit") {
+    let cli = parse_cli_args(std::env::args_os().skip(1));
+    if cli.quit {
         quit_existing_instance();
         return;
     }
 
     // 必须在单例 Mutex 之前拦截 --check-update，否则子进程会被当作重复实例退出。
-    if args.iter().any(|a| a == "--check-update") {
-        let is_manual = args.iter().any(|a| a == "--manual");
-        std::process::exit(subprocess_main(is_manual));
+    if cli.check_update {
+        std::process::exit(subprocess_main(cli.manual));
     }
 
     // MUTEX_NAME 常量已含尾 NUL。
@@ -217,7 +249,7 @@ fn main() {
     init_cleanup_temp();
     // 更新流程 relaunch 拉起的进程：刚发生过 UAC 取消或安装器启动失败，
     // 推迟首个自动检查周期，避免立刻再弹同一版本的更新确认框。
-    if args.iter().any(|a| a == RELAUNCHED_BY_UPDATE_ARG) {
+    if cli.relaunched_by_update {
         defer_initial_auto_check();
     }
     start_auto_check();
@@ -684,7 +716,63 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 mod tests {
     //! 看门狗控制入口的语义测试：只覆盖纯判定与句柄校验，不创建真实窗口。
 
-    use super::{CURRENT_MAIN_HWND, claim_exit_request, live_main_hwnd};
+    use super::{CURRENT_MAIN_HWND, claim_exit_request, live_main_hwnd, parse_cli_args};
+
+    #[test]
+    fn quit_coexists_with_check_update_and_wins() {
+        // 组合语义：两者共存时解析结果两标记同为真，而 main() 先检查 quit，
+        // 故该组合走退出分支而非子进程分支（优先级由代码顺序钉死）。
+        let cli = parse_cli_args(
+            ["--quit", "--check-update", "--manual"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert!(cli.quit, "--quit 应被识别");
+        assert!(cli.check_update, "--check-update 应被识别");
+        assert!(cli.manual, "--manual 应被识别");
+        assert!(!cli.relaunched_by_update);
+    }
+
+    #[test]
+    fn cli_args_require_exact_match() {
+        // 缀接形式与旧 `==` 语义一致判否：精确匹配才算数。
+        let cli = parse_cli_args(
+            [
+                "--quit=1",
+                "--check-update=1",
+                "--manual=1",
+                "--relaunched-by-update=1",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            cli,
+            super::CliArgs {
+                quit: false,
+                check_update: false,
+                manual: false,
+                relaunched_by_update: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_args_parses_each_flag_and_ignores_unknown() {
+        use std::os::windows::ffi::OsStringExt;
+        // 逐个标记：单个参数应只点亮对应位。
+        let cli = parse_cli_args([std::ffi::OsString::from("--quit")]);
+        assert!(cli.quit && !cli.check_update && !cli.manual && !cli.relaunched_by_update);
+        // 未知参数与非 Unicode 参数只被忽略，不 panic。
+        let cli = parse_cli_args(
+            ["--unknown", crate::config::RELAUNCHED_BY_UPDATE_ARG]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .chain(std::iter::once(std::ffi::OsString::from_wide(&[0xD800u16]))),
+        );
+        assert!(!cli.quit && !cli.check_update && !cli.manual && cli.relaunched_by_update);
+    }
+
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
