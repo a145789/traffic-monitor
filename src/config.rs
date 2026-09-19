@@ -69,7 +69,7 @@ pub const BLACKLIST_REFRESH_SECS: u64 = 30;
 pub const VERSION_METADATA_MAX_BYTES: usize = 4 * 1024;
 pub const INSTALLER_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub const HTTP_READ_CHUNK_BYTES: usize = 64 * 1024;
-/// WinHTTP 四段超时（毫秒）：建连/发送/接收统一值，两抓取路径共用。
+/// WinHTTP 四段超时（毫秒）：名称解析 / 连接 / 发送 / 接收统一取此值，两抓取路径共用。
 pub const HTTP_TIMEOUT_MS: i32 = 15000;
 
 /// 自动检查更新的正常冷却与失败后短冷却（秒）。

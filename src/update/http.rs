@@ -63,6 +63,7 @@ fn friendly_error(op: &str, err: windows::core::Error) -> String {
 
 /// 已验证 200 的 GET 响应：建连到验状态码全序列唯一实现于 `open`，
 /// 上限约束与分块读取唯一实现于 `for_each_chunk`，两抓取函数只提供消费闭包。
+/// `for_each_chunk` 按值收 `self`：响应流是单向抽干的一次性消费，编译期禁止二次读取。
 struct HttpGet {
     handles: WinHttpHandles,
 }
@@ -98,14 +99,16 @@ impl HttpGet {
         }
 
         // SAFETY: h_session 有效；超时值均为正 i32 毫秒数。
+        // 超时设置失败直接早退：全仓唯一一次设置，静默继续会退回 WinHTTP 默认超时。
         unsafe {
-            let _ = WinHttpSetTimeouts(
+            WinHttpSetTimeouts(
                 handles.h_session,
                 HTTP_TIMEOUT_MS,
                 HTTP_TIMEOUT_MS,
                 HTTP_TIMEOUT_MS,
                 HTTP_TIMEOUT_MS,
-            );
+            )
+            .map_err(|e| FetchFileError::Download(friendly_error("设置网络超时", e)))?;
         }
 
         let port = INTERNET_DEFAULT_HTTPS_PORT;
@@ -175,9 +178,9 @@ impl HttpGet {
     }
 
     fn for_each_chunk(
-        &self,
+        self,
         max_response_bytes: usize,
-        on_chunk: &mut impl FnMut(&[u8]) -> Result<(), FetchFileError>,
+        mut on_chunk: impl FnMut(&[u8]) -> Result<(), FetchFileError>,
     ) -> Result<(), FetchFileError> {
         // 复用固定缓冲：每轮只取用前 chunk_len 字节，避免随包大小线性分配。
         let mut buf = vec![0u8; HTTP_READ_CHUNK_BYTES];
@@ -240,16 +243,18 @@ pub(super) fn fetch_url(
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     let map_err = |e: FetchFileError| match e {
+        // 本路径无本地故障来源（收集闭包只做 Vec 写入），此臂仅为穷尽匹配；
+        // 若将来在此引入 Local，必须同步改 fetch_url 的返回类型或调用方分支。
         FetchFileError::Download(msg) | FetchFileError::Local(msg) => msg,
     };
     let conn = HttpGet::open(host, path).map_err(map_err)?;
     let mut response = Vec::new();
     {
-        let mut collect = |data: &[u8]| -> Result<(), FetchFileError> {
+        let collect = |data: &[u8]| -> Result<(), FetchFileError> {
             response.extend_from_slice(data);
             Ok(())
         };
-        conn.for_each_chunk(max_response_bytes, &mut collect)
+        conn.for_each_chunk(max_response_bytes, collect)
             .map_err(map_err)?;
     }
 
@@ -283,14 +288,14 @@ pub(super) fn fetch_to_file(
     let hash =
         Sha256::new().map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))?;
     {
-        let mut consume = |data: &[u8]| -> Result<(), FetchFileError> {
+        let consume = |data: &[u8]| -> Result<(), FetchFileError> {
             hash.update(data)
                 .map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))?;
             file.write_all(data)
                 .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))?;
             Ok(())
         };
-        conn.for_each_chunk(max_response_bytes, &mut consume)?;
+        conn.for_each_chunk(max_response_bytes, consume)?;
     }
 
     file.flush()
