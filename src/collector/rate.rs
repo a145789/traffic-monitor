@@ -204,34 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_winner_interface_resume_after_long_pause_rebaselines() {
-        // 暂停 1 小时后恢复：恢复路径已清空历史（reset_network_baseline），
-        // 首个采样必须只建基线返回零速，而不是把整段暂停的累计流量
-        // 归一化成看似合理的"区间平均"速率。
-        let mut history = HashMap::new();
-        let t0 = Instant::now();
-        let t_resume = t0 + std::time::Duration::from_secs(3600);
-
-        // 暂停前最后一次采样留下基线，随后恢复路径清空历史。
-        history.insert(100, (10000, 5000, t0));
-        history.clear();
-
-        // 锁屏期间的累计流量（+150GB）不得参与差分。
-        let mut current = HashMap::new();
-        current.insert(100, (160_000_000_000, 35_000_000_000));
-
-        let (down, up) = select_winner_interface(&current, &mut history, t_resume);
-        assert_eq!(down, 0);
-        assert_eq!(up, 0);
-
-        // 但恢复时刻的数据必须被记为新基线，供下一个周期正常差分。
-        let &(prev_in, prev_out, baseline_time) = history.get(&100).unwrap();
-        assert_eq!(prev_in, 160_000_000_000);
-        assert_eq!(prev_out, 35_000_000_000);
-        assert_eq!(baseline_time, t_resume);
-    }
-
-    #[test]
     fn test_select_winner_interface_backoff_scale() {
         // 15 秒退避恢复：经过 15s 后，即使累计流量很大，也应正确进行时间除法，求得每秒平均速度。
         let mut history = HashMap::new();

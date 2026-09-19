@@ -899,15 +899,15 @@ mod tests {
     // ===== parse_update_action =====
 
     #[test]
-    fn test_parse_done_action() {
+    fn test_parse_update_actions() {
         assert_eq!(parse_update_action(b"DONE"), Some(UpdateAction::Done));
         assert_eq!(parse_update_action(b"  DONE\r\n"), Some(UpdateAction::Done));
-    }
-
-    #[test]
-    fn test_parse_exit_main_action() {
         assert_eq!(
             parse_update_action(b"EXIT_MAIN"),
+            Some(UpdateAction::ExitMain)
+        );
+        assert_eq!(
+            parse_update_action(b"  EXIT_MAIN\r\n"),
             Some(UpdateAction::ExitMain)
         );
     }
@@ -927,16 +927,16 @@ mod tests {
 
     // ===== scan_subprocess_protocol =====
 
-    /// 用内存缓冲驱动协议扫描，并记录转发回调次数。
-    fn scan(data: &[u8]) -> (Option<UpdateAction>, bool, bool, usize) {
+    /// 用内存缓冲驱动协议扫描，并记录转发回调次数与送达结果。
+    fn scan(data: &[u8]) -> (Option<UpdateAction>, bool, bool, usize, bool) {
         let mut reader = std::io::Cursor::new(data);
         let mut forwards = 0usize;
-        let (parsed, exit_signalled, read_failed, _forwarded) =
+        let (parsed, exit_signalled, read_failed, forwarded) =
             scan_subprocess_protocol(&mut reader, || {
                 forwards += 1;
                 true
             });
-        (parsed, exit_signalled, read_failed, forwards)
+        (parsed, exit_signalled, read_failed, forwards, forwarded)
     }
 
     /// 用内存队列驱动协议扫描，模拟「转发目标已失效」：回调返回 false，等价于
@@ -949,24 +949,27 @@ mod tests {
 
     #[test]
     fn test_scan_exit_main_forwards_exactly_once() {
-        let (parsed, exit_signalled, read_failed, forwards) = scan(b"EXIT_MAIN\n");
+        // forwards（回调次数）与 forwarded（送达结果）是两个独立观测通道：
+        // 前者证明"只转发一次"，后者证明"转发成功被正确上报"，互不可推导。
+        let (parsed, exit_signalled, read_failed, forwards, forwarded) = scan(b"EXIT_MAIN\n");
         assert_eq!(parsed, Some(UpdateAction::ExitMain));
         assert!(exit_signalled);
         assert!(!read_failed);
         assert_eq!(forwards, 1);
+        assert!(forwarded);
     }
 
     #[test]
     fn test_scan_duplicate_exit_main_forward_only_once() {
         // 钉死不变量：无论子进程输出多少行 EXIT_MAIN，转发恰好一次。
-        let (_, exit_signalled, _, forwards) = scan(b"EXIT_MAIN\nEXIT_MAIN\nEXIT_MAIN\n");
+        let (_, exit_signalled, _, forwards, _) = scan(b"EXIT_MAIN\nEXIT_MAIN\nEXIT_MAIN\n");
         assert!(exit_signalled);
         assert_eq!(forwards, 1);
     }
 
     #[test]
     fn test_scan_done_does_not_forward() {
-        let (parsed, exit_signalled, read_failed, forwards) = scan(b"DONE\n");
+        let (parsed, exit_signalled, read_failed, forwards, _) = scan(b"DONE\n");
         assert_eq!(parsed, Some(UpdateAction::Done));
         assert!(!exit_signalled);
         assert!(!read_failed);
@@ -978,7 +981,7 @@ mod tests {
         // 无效行必须只被跳过，不得阻断其后的有效动作：EXIT_MAIN 故意放在无效行之后。
         // 旧输入（无效行之后无有效动作）对任何实现都成立，本用例才能真正区分
         // 「跳过无效行」与「遇无效行即停止读取」两种实现。
-        let (parsed, exit_signalled, read_failed, forwards) =
+        let (parsed, exit_signalled, read_failed, forwards, _) =
             scan(b"NO_UPDATE\nEXIT_MAIN|extra\nEXIT_MAIN\n");
         assert_eq!(parsed, Some(UpdateAction::ExitMain));
         assert!(exit_signalled);
@@ -988,7 +991,7 @@ mod tests {
 
     #[test]
     fn test_scan_empty_stream() {
-        let (parsed, exit_signalled, read_failed, forwards) = scan(b"");
+        let (parsed, exit_signalled, read_failed, forwards, _) = scan(b"");
         assert_eq!(parsed, None);
         assert!(!exit_signalled);
         assert!(!read_failed);
@@ -997,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_scan_invalid_utf8_marks_read_failed() {
-        let (parsed, exit_signalled, read_failed, forwards) = scan(&[0xFF, 0xFE, b'\n']);
+        let (parsed, exit_signalled, read_failed, forwards, _) = scan(&[0xFF, 0xFE, b'\n']);
         assert_eq!(parsed, None);
         assert!(!exit_signalled);
         assert!(read_failed);
@@ -1007,22 +1010,13 @@ mod tests {
     #[test]
     fn test_scan_memo_keeps_first_action_but_still_forwards() {
         // memo 记录首个有效动作（is_error 判定只消费 is_none）；转发与 memo 无关。
-        let (parsed, exit_signalled, _, forwards) = scan(b"DONE\nEXIT_MAIN\n");
+        let (parsed, exit_signalled, _, forwards, _) = scan(b"DONE\nEXIT_MAIN\n");
         assert_eq!(parsed, Some(UpdateAction::Done));
         assert!(exit_signalled);
         assert_eq!(forwards, 1);
     }
 
     // ===== 转发送达与进行中标志复位 =====
-
-    #[test]
-    fn test_scan_reports_successful_forward() {
-        // 送达成功必须独立上报：调用方据此区分「主进程即将退出」与「消息丢了」。
-        let mut reader = std::io::Cursor::new(b"EXIT_MAIN\n".as_slice());
-        let (_, exit_signalled, _, forwarded) = scan_subprocess_protocol(&mut reader, || true);
-        assert!(exit_signalled);
-        assert!(forwarded);
-    }
 
     #[test]
     fn test_scan_dead_target_still_signals_but_not_forwarded() {

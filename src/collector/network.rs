@@ -338,54 +338,44 @@ mod tests {
     // ===== is_virtual_friendly_name =====
 
     #[test]
-    fn test_virtual_name_hyperv() {
-        assert!(is_virtual_friendly_name("Hyper-V Virtual Ethernet Adapter"));
-    }
+    fn test_virtual_friendly_name_matrix() {
+        // 每个样本只命中其标注的关键字：若删掉任一 contains 判据，对应样本即变红。
+        // 旧 hyperv/vmware 样本双命中 "virtual"，旧 vbox 样本实际被 "virtual" 命中，
+        // 此处全部换成单命中样本（见 C1/C2）。唯一例外是 isatap ⊃ tap 的子串蕴含
+        //（任何含 "isatap" 的名字必然含 "tap"），该行无法单命中，特此说明。
+        let virtual_cases = [
+            ("Virtual Ethernet Device", "virtual"),
+            ("VBoxNetLwf", "vbox"),
+            ("VMware VMNet Bridge", "vmware"),
+            ("Hyper-V Network Adapter", "hyper-v"),
+            ("vEthernet (WSL)", "wsl"),
+            ("TAP-Windows Adapter V9", "tap"),
+            ("VPN Client Adapter", "vpn"),
+            ("Microsoft Loopback Adapter", "loopback"),
+            ("Teredo Tunneling Pseudo-Interface", "teredo"),
+            ("Microsoft ISATAP Adapter", "isatap"),
+            ("Microsoft 6to4 Adapter", "6to4"),
+            ("PPP Adapter", "ppp"),
+            ("KVM Net Adapter", "kvm"),
+            ("Xen Network Interface", "xen"),
+            // 大小写不敏感。
+            ("VBOX Network Adapter", "vbox"),
+        ];
+        for (name, keyword) in virtual_cases {
+            assert!(
+                is_virtual_friendly_name(name),
+                "{name} 应命中关键字 {keyword}"
+            );
+        }
 
-    #[test]
-    fn test_virtual_name_vmware() {
-        assert!(is_virtual_friendly_name("VMware Virtual Ethernet Adapter"));
-    }
-
-    #[test]
-    fn test_virtual_name_vbox() {
-        assert!(is_virtual_friendly_name(
-            "VirtualBox Host-Only Ethernet Adapter"
-        ));
-    }
-
-    #[test]
-    fn test_virtual_name_wsl() {
-        assert!(is_virtual_friendly_name("vEthernet (WSL)"));
-    }
-
-    #[test]
-    fn test_virtual_name_vpn() {
-        assert!(is_virtual_friendly_name("VPN Client Adapter"));
-    }
-
-    #[test]
-    fn test_virtual_name_loopback() {
-        assert!(is_virtual_friendly_name("Microsoft Loopback Adapter"));
-    }
-
-    #[test]
-    fn test_virtual_name_case_insensitive() {
-        // 大小写不敏感匹配。
-        assert!(is_virtual_friendly_name("VBOX Network Adapter"));
-        assert!(is_virtual_friendly_name("Virtual Ethernet Device"));
-    }
-
-    #[test]
-    fn test_virtual_name_physical_not_matched() {
         // 真实物理网卡的常见名称不应被误判为虚拟。
-        assert!(!is_virtual_friendly_name(
-            "Intel(R) Ethernet Connection I219-LM"
-        ));
-        assert!(!is_virtual_friendly_name(
-            "Realtek PCIe GbE Family Controller"
-        ));
-        assert!(!is_virtual_friendly_name("Killer Wi-Fi 6 AX1650"));
+        for name in [
+            "Intel(R) Ethernet Connection I219-LM",
+            "Realtek PCIe GbE Family Controller",
+            "Killer Wi-Fi 6 AX1650",
+        ] {
+            assert!(!is_virtual_friendly_name(name), "{name} 不应误判");
+        }
     }
 
     // ===== 黑名单缓存刷新语义 =====

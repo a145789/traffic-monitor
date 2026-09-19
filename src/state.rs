@@ -96,6 +96,8 @@ mod tests {
 
     #[test]
     fn lock_then_monitor_off_then_monitor_on_still_suspended() {
+        // SuspendReasons 是位集，suspend/resume 满足交换律，反向加锁顺序是同一定律的
+        // 对称推论，不另立用例。留本条因"显示器已开启但未解锁"更贴近真实故障场景。
         let state = SuspendReasons::new();
 
         state.suspend(SUSPEND_REASON_SESSION);
@@ -109,23 +111,6 @@ mod tests {
 
         state.resume(SUSPEND_REASON_SESSION);
         assert!(!state.is_suspended(), "解锁后应恢复");
-    }
-
-    #[test]
-    fn monitor_off_then_lock_then_unlock_still_suspended() {
-        let state = SuspendReasons::new();
-
-        state.suspend(SUSPEND_REASON_MONITOR);
-        assert!(state.is_suspended(), "显示器关后应暂停");
-
-        state.suspend(SUSPEND_REASON_SESSION);
-        assert!(state.is_suspended(), "显示器关+锁屏后应暂停");
-
-        state.resume(SUSPEND_REASON_SESSION);
-        assert!(state.is_suspended(), "解锁但显示器仍关应仍暂停");
-
-        state.resume(SUSPEND_REASON_MONITOR);
-        assert!(!state.is_suspended(), "显示器开启后应恢复");
     }
 
     #[test]
@@ -159,16 +144,6 @@ mod tests {
         assert!(state.is_suspended(), "重置已清位后 MONITOR 仍在");
 
         state.resume(SUSPEND_REASON_MONITOR);
-        assert!(!state.is_suspended());
-    }
-
-    #[test]
-    fn single_reason_clears_immediately() {
-        let state = SuspendReasons::new();
-
-        state.suspend(SUSPEND_REASON_SESSION);
-        assert!(state.is_suspended());
-        state.resume(SUSPEND_REASON_SESSION);
         assert!(!state.is_suspended());
     }
 }

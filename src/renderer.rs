@@ -637,35 +637,19 @@ mod tests {
     // ===== write_u32 =====
 
     #[test]
-    fn test_write_u32_zero() {
-        let mut buf = Vec::new();
-        write_u32(&mut buf, 0);
-        assert_eq!(wide_to_string(&buf), "0");
-    }
-
-    #[test]
-    fn test_write_u32_digit_boundaries() {
-        let mut buf = Vec::new();
-        // 1 位 → 2 位边界
-        write_u32(&mut buf, 9);
-        assert_eq!(wide_to_string(&buf), "9");
-        buf.clear();
-        write_u32(&mut buf, 10);
-        assert_eq!(wide_to_string(&buf), "10");
-
-        // 2 位 → 3 位边界
-        buf.clear();
-        write_u32(&mut buf, 99);
-        assert_eq!(wide_to_string(&buf), "99");
-        buf.clear();
-        write_u32(&mut buf, 100);
-        assert_eq!(wide_to_string(&buf), "100");
-    }
-
-    #[test]
-    fn test_write_u32_max() {
-        let mut buf = Vec::new();
-        write_u32(&mut buf, u32::MAX);
-        assert_eq!(wide_to_string(&buf), "4294967295");
+    fn test_write_u32() {
+        // 10 行整数格式化：零值、各进位边界、最大值，一条表驱动即够。
+        for (input, expected) in [
+            (0, "0"),
+            (9, "9"),
+            (10, "10"),
+            (99, "99"),
+            (100, "100"),
+            (u32::MAX, "4294967295"),
+        ] {
+            let mut buf = Vec::new();
+            write_u32(&mut buf, input);
+            assert_eq!(wide_to_string(&buf), expected);
+        }
     }
 }

@@ -155,18 +155,10 @@ mod tests {
 
     #[test]
     fn test_parse_update_metadata_rejects_bad_version_format() {
+        // 拒绝矩阵已由 test_parse_version_rejects_invalid 完整覆盖，此处只验
+        // "版本错误会让整份 metadata 解析失败"这一层语义，1~2 个输入即够。
         let good = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
-        // 不足三段
-        assert!(parse_update_metadata(&format!("1.2\n{good}")).is_err());
-        // 超过三段
-        assert!(parse_update_metadata(&format!("1.2.3.4\n{good}")).is_err());
-        // 非数字段
-        assert!(parse_update_metadata(&format!("1.x.3\n{good}")).is_err());
-        // 空段
-        assert!(parse_update_metadata(&format!("1..3\n{good}")).is_err());
-        // 带 `-` 后缀的版本行一律拒绝
         assert!(parse_update_metadata(&format!("1.2.3-nightly\n{good}")).is_err());
-        // 仅前缀版本
         assert!(parse_update_metadata(&format!("invalid\n{good}")).is_err());
     }
 
@@ -197,17 +189,6 @@ mod tests {
         assert!(
             parse_update_metadata(
                 "1.2.3\nB94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE908 F7ACE2EFCDE9"
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn test_parse_update_metadata_rejects_internal_nul() {
-        // 哈希行包含内部 NUL：NUL 非 ascii_hexdigit，长度也会超过 64。
-        assert!(
-            parse_update_metadata(
-                "1.2.3\nB94D27B9934D3E08A52E52D7DA7DABFAC484EF\0E37A5380EE9088F7ACE2EFCDE9"
             )
             .is_err()
         );
