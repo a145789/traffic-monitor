@@ -15,6 +15,9 @@ use crate::config::APP_TITLE;
 
 /// 业务字符串 → NUL 结尾 UTF-16。Win32 API 的标准入口。
 ///
+/// 只用于进程内已是合法 `str` 的业务文案；路径与外部原始数据请用
+/// [`os_to_wide`]（无损），勿经 `to_string_lossy()` 中转。
+///
 /// `config` 中已含尾 NUL 的常量请直接 `encode_utf16().collect()`，勿再套本函数
 /// （会多一个多余的 NUL，虽通常无害但语义不清晰）。
 pub fn to_wide(s: &str) -> Vec<u16> {

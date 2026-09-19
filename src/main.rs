@@ -719,9 +719,9 @@ mod tests {
     use super::{CURRENT_MAIN_HWND, claim_exit_request, live_main_hwnd, parse_cli_args};
 
     #[test]
-    fn quit_coexists_with_check_update_and_wins() {
-        // 组合语义：两者共存时解析结果两标记同为真，而 main() 先检查 quit，
-        // 故该组合走退出分支而非子进程分支（优先级由代码顺序钉死）。
+    fn quit_coexists_with_check_update_both_parsed() {
+        // 该组合走退出分支是 main() 先检查 quit 的代码顺序保证的，
+        // 本测试只钉死解析结果（两标记同为真），不证明分支优先级。
         let cli = parse_cli_args(
             ["--quit", "--check-update", "--manual"]
                 .into_iter()
