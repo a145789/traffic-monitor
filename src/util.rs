@@ -15,6 +15,9 @@ use crate::config::APP_TITLE;
 
 /// 业务字符串 → NUL 结尾 UTF-16。Win32 API 的标准入口。
 ///
+/// 只用于进程内已是合法 `str` 的业务文案；路径与外部原始数据请用
+/// [`os_to_wide`]（无损），勿经 `to_string_lossy()` 中转。
+///
 /// `config` 中已含尾 NUL 的常量请直接 `encode_utf16().collect()`，勿再套本函数
 /// （会多一个多余的 NUL，虽通常无害但语义不清晰）。
 pub fn to_wide(s: &str) -> Vec<u16> {
@@ -27,6 +30,16 @@ pub fn to_wide(s: &str) -> Vec<u16> {
 pub fn push_wide(buf: &mut Vec<u16>, s: &str) {
     buf.extend(s.encode_utf16());
     buf.push(0);
+}
+
+/// `OsStr` → NUL 结尾 UTF-16。Windows 上 `OsStr` 可无损转宽字符，
+/// 不经 `String` 中转：含非 Unicode 可解码字符的路径不再被替换成 U+FFFD。
+/// 常规路径输出与 `to_wide(&s.to_string_lossy())` 逐字节一致。
+pub fn os_to_wide(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut v: Vec<u16> = s.encode_wide().collect();
+    v.push(0);
+    v
 }
 
 /// 当前进程模块句柄（HINSTANCE），用于注册窗口类、加载内置资源。
@@ -231,5 +244,25 @@ mod tests {
         push_wide(&mut buf, "B");
         // "A\0" + "B\0"
         assert_eq!(buf, vec![b'A' as u16, 0, b'B' as u16, 0]);
+    }
+
+    #[test]
+    fn test_os_to_wide_matches_to_wide_on_ascii() {
+        // 不变量：常规路径输出逐字节不变。
+        let w = os_to_wide(std::ffi::OsStr::new("C:\\Temp\\a.exe"));
+        assert_eq!(w, to_wide("C:\\Temp\\a.exe"));
+    }
+
+    #[test]
+    fn test_os_to_wide_preserves_lone_surrogate() {
+        // 含非 Unicode 可解码字符（孤立代理项）：无损直转保留原码元，
+        // 而 to_string_lossy 会替换成 U+FFFD。
+        use std::os::windows::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_wide(&[0x41u16, 0xD800u16, 0x42u16]);
+        assert_eq!(
+            os_to_wide(raw.as_os_str()),
+            vec![0x41u16, 0xD800u16, 0x42u16, 0]
+        );
+        assert_ne!(to_wide(&raw.to_string_lossy()), os_to_wide(raw.as_os_str()));
     }
 }

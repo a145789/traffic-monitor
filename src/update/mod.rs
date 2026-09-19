@@ -40,8 +40,8 @@ use crate::config::{
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{
-    compact_and_trim, configure_background_process, message_box, reg_read_dword, reg_read_string,
-    reg_write_dword, reg_write_string, show_error, show_info, to_wide,
+    compact_and_trim, configure_background_process, message_box, os_to_wide, reg_read_dword,
+    reg_read_string, reg_write_dword, reg_write_string, show_error, show_info, to_wide,
 };
 
 use crypto::compute_sha256_hex_locked;
@@ -90,9 +90,11 @@ pub fn save_auto_update_enabled(enabled: bool) {
 }
 
 fn get_temp_installer_path() -> std::path::PathBuf {
-    let local_appdata = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-    std::path::PathBuf::from(local_appdata)
+    // var_os + PathBuf::from 无损：LOCALAPPDATA 含非 Unicode 可解码字符时，
+    // var 会因非法 Unicode 返回 Err 而误走 temp 回退，有损中转则替换字符。
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
         .join("Traffic Monitor")
         .join(TEMP_FILE_NAME)
 }
@@ -620,7 +622,7 @@ fn relaunch_main_app() {
         Ok(path) => path,
         Err(_) => return,
     };
-    let path_wide = to_wide(&exe.to_string_lossy());
+    let path_wide = os_to_wide(exe.as_os_str());
     let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
     // SAFETY: 两个缓冲均含尾 NUL，ShellExecuteW 同步返回前存活。
     unsafe {
@@ -673,13 +675,24 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
         Err(_) => return failed(),
     };
 
-    let (parsed_action, exit_signalled, read_failed, exit_forwarded) = match child.stdout.take() {
+    let outcome_scan = match child.stdout.take() {
         Some(stdout) => {
             let mut reader = BufReader::new(stdout);
             scan_subprocess_protocol(&mut reader, post_update_action_to_watchdog)
         }
-        None => (None, false, true, false),
+        None => ScanOutcome {
+            action: None,
+            exit_signalled: false,
+            read_failed: true,
+            exit_forwarded: false,
+        },
     };
+    let ScanOutcome {
+        action: parsed_action,
+        exit_signalled,
+        read_failed,
+        exit_forwarded,
+    } = outcome_scan;
 
     let exit_status = match child.wait() {
         Ok(status) => status,
@@ -699,8 +712,22 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     }
 }
 
-/// 逐行扫描子进程 stdout 协议，返回
-/// `(首个有效动作, 是否读到 EXIT_MAIN, 读取是否失败, 转发是否送达)`。
+/// 子进程 stdout 协议扫描结果：[`scan_subprocess_protocol`] 的具名返回。
+///
+/// 替代 `(Option<UpdateAction>, bool, bool, bool)` 四元组——三个 `bool` 在位置上
+/// 无法区分，调用点只能靠顺序记忆；字段名即文档，零运行时成本。
+struct ScanOutcome {
+    /// 扫描到的首个有效动作（`DONE` / `EXIT_MAIN`）；空流或全无效行时为 `None`。
+    action: Option<UpdateAction>,
+    /// 是否读到 `EXIT_MAIN`（协议层事实，不代表通知已送达）。
+    exit_signalled: bool,
+    /// 读取是否失败（I/O 错误，含遇到无效 UTF-8 行）。
+    read_failed: bool,
+    /// `EXIT_MAIN` 是否成功转发给看门狗（UI 侧接到通知）。
+    exit_forwarded: bool,
+}
+
+/// 逐行扫描子进程 stdout 协议，返回 [`ScanOutcome`]。
 ///
 /// 不变量（由本模块 tests 以 Cursor 喂协议行钉死）：读到 `EXIT_MAIN` 即调用
 /// `on_exit_main` 转发且仅转发一次（exit_signalled 守卫），转发发生在扫描期间、
@@ -709,7 +736,7 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
 fn scan_subprocess_protocol(
     reader: &mut impl BufRead,
     mut on_exit_main: impl FnMut() -> bool,
-) -> (Option<UpdateAction>, bool, bool, bool) {
+) -> ScanOutcome {
     let mut parsed_action: Option<UpdateAction> = None;
     let mut exit_signalled = false;
     let mut read_failed = false;
@@ -740,7 +767,12 @@ fn scan_subprocess_protocol(
         }
     }
 
-    (parsed_action, exit_signalled, read_failed, exit_forwarded)
+    ScanOutcome {
+        action: parsed_action,
+        exit_signalled,
+        read_failed,
+        exit_forwarded,
+    }
 }
 
 fn parse_update_action(stdout: &[u8]) -> Option<UpdateAction> {
@@ -835,8 +867,7 @@ fn is_transient_launch_error(launch: &InstallerLaunch) -> bool {
 }
 
 fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
-    let path_str = path.to_string_lossy();
-    let path_wide = to_wide(&path_str);
+    let path_wide = os_to_wide(path.as_os_str());
     let verb_wide = to_wide("runas");
     let params_wide = to_wide("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
 
@@ -931,20 +962,25 @@ mod tests {
     fn scan(data: &[u8]) -> (Option<UpdateAction>, bool, bool, usize, bool) {
         let mut reader = std::io::Cursor::new(data);
         let mut forwards = 0usize;
-        let (parsed, exit_signalled, read_failed, forwarded) =
-            scan_subprocess_protocol(&mut reader, || {
-                forwards += 1;
-                true
-            });
-        (parsed, exit_signalled, read_failed, forwards, forwarded)
+        let outcome = scan_subprocess_protocol(&mut reader, || {
+            forwards += 1;
+            true
+        });
+        (
+            outcome.action,
+            outcome.exit_signalled,
+            outcome.read_failed,
+            forwards,
+            outcome.exit_forwarded,
+        )
     }
 
     /// 用内存队列驱动协议扫描，模拟「转发目标已失效」：回调返回 false，等价于
     /// 看门狗窗口已销毁时 `PostMessageW` 失败。
     fn scan_with_dead_target(data: &[u8]) -> (bool, bool) {
         let mut reader = std::io::Cursor::new(data);
-        let (_, exit_signalled, _, forwarded) = scan_subprocess_protocol(&mut reader, || false);
-        (exit_signalled, forwarded)
+        let outcome = scan_subprocess_protocol(&mut reader, || false);
+        (outcome.exit_signalled, outcome.exit_forwarded)
     }
 
     #[test]
