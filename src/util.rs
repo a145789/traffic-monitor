@@ -1,4 +1,6 @@
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
+use windows::Win32::System::Power::HPOWERNOTIFY;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
     PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
@@ -54,6 +56,88 @@ pub fn os_to_wide(s: &std::ffi::OsStr) -> Vec<u16> {
 /// 差一像素（96–384 范围实测 77 处），故保持宽度推导以逐像素不变。
 pub fn dpi_scaled(base: i32, dpi: u32) -> i32 {
     ((base as f64) * (dpi as f64) / 96.0).round() as i32
+}
+
+/// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处.
+///
+/// - `store`（Release）：发布新句柄。
+/// - `load`（Acquire）：只读查询，0 映射为 `None`；不做 `IsWindow` 校验，
+///   有效性由调用方按需查询。
+/// - `take`（AcqRel `swap(0)`）：取走语义，重建/注销路径专用；
+///   查询路径误用会清零丢句柄，类型层面与 `load` 区分。
+/// - `clear`（Release）：无条件归零（缓存失效）。
+pub struct AtomicHwnd(std::sync::atomic::AtomicIsize);
+
+impl AtomicHwnd {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicIsize::new(0))
+    }
+
+    pub fn store(&self, hwnd: HWND) {
+        self.0
+            .store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn load(&self) -> Option<HWND> {
+        let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(HWND(raw as *mut std::ffi::c_void))
+        }
+    }
+
+    pub fn take(&self) -> Option<HWND> {
+        let raw = self.0.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if raw == 0 {
+            None
+        } else {
+            Some(HWND(raw as *mut std::ffi::c_void))
+        }
+    }
+
+    pub fn clear(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn store_raw(&self, raw: isize) {
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `HPOWERNOTIFY` 的原子存储：与 [`AtomicHwnd`] 同构单列.
+///
+/// 内值为 `isize`，无需指针转换；内存序契约与 `AtomicHwnd` 一致
+/// （`store`/`clear` 用 Release，`load` 用 Acquire，`take` 用 AcqRel）。
+pub struct AtomicPowerNotify(std::sync::atomic::AtomicIsize);
+
+impl AtomicPowerNotify {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicIsize::new(0))
+    }
+
+    pub fn store(&self, handle: HPOWERNOTIFY) {
+        self.0.store(handle.0, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn load(&self) -> Option<HPOWERNOTIFY> {
+        let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(HPOWERNOTIFY(raw))
+        }
+    }
+
+    pub fn take(&self) -> Option<HPOWERNOTIFY> {
+        let raw = self.0.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if raw == 0 {
+            None
+        } else {
+            Some(HPOWERNOTIFY(raw))
+        }
+    }
 }
 
 /// 当前进程模块句柄（HINSTANCE），用于注册窗口类、加载内置资源。
