@@ -40,8 +40,8 @@ use crate::config::{
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::tray::remove_tray_icon;
 use crate::util::{
-    compact_and_trim, configure_background_process, message_box, reg_read_dword, reg_read_string,
-    reg_write_dword, reg_write_string, show_error, show_info, to_wide,
+    compact_and_trim, configure_background_process, message_box, os_to_wide, reg_read_dword,
+    reg_read_string, reg_write_dword, reg_write_string, show_error, show_info, to_wide,
 };
 
 use crypto::compute_sha256_hex_locked;
@@ -90,9 +90,11 @@ pub fn save_auto_update_enabled(enabled: bool) {
 }
 
 fn get_temp_installer_path() -> std::path::PathBuf {
-    let local_appdata = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-    std::path::PathBuf::from(local_appdata)
+    // var_os + PathBuf::from 无损：LOCALAPPDATA 含非 Unicode 可解码字符时，
+    // var 会因非法 Unicode 返回 Err 而误走 temp 回退，to_string_lossy 则替换字符。
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
         .join("Traffic Monitor")
         .join(TEMP_FILE_NAME)
 }
@@ -620,7 +622,7 @@ fn relaunch_main_app() {
         Ok(path) => path,
         Err(_) => return,
     };
-    let path_wide = to_wide(&exe.to_string_lossy());
+    let path_wide = os_to_wide(exe.as_os_str());
     let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
     // SAFETY: 两个缓冲均含尾 NUL，ShellExecuteW 同步返回前存活。
     unsafe {
@@ -835,8 +837,7 @@ fn is_transient_launch_error(launch: &InstallerLaunch) -> bool {
 }
 
 fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
-    let path_str = path.to_string_lossy();
-    let path_wide = to_wide(&path_str);
+    let path_wide = os_to_wide(path.as_os_str());
     let verb_wide = to_wide("runas");
     let params_wide = to_wide("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
 
