@@ -1,6 +1,6 @@
 # Agent Note：删除安装包流式哈希早验，锁定句柄重哈希为唯一校验裁决
 
-Status: proposed
+Status: implemented
 
 ## 问题
 安装包哈希是否等于远端预期，这一个事实存在两份表示，其中一份被模块自己宣告为非权威。`src/update/http.rs:279` 的 `fetch_to_file` 边下载边哈希并返回流式哈希（签名 `src/update/http.rs:284` 为 `Result<String, FetchFileError>`，哈希构造/更新/收尾在 `src/update/http.rs:289`、`:292`、`:303`），`src/update/installer.rs:121` 取其返回值并由 `src/update/installer.rs:136-143` 做早验比对、失败即删文件；而模块不变量明文写着这份表示不作数——`src/update/installer.rs:3-4`「最终构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），不采信流式哈希、不按路径另开文件」，`src/update/installer.rs:83-84` 在函数文档里逐字重复同一句。结果是每次成功下载都要为一份注定不被采信的哈希多算一次整包 SHA-256——它在 `fetch_to_file` 的消费闭包内随下载增量计算（`src/update/http.rs:291-297`），不产生额外文件 I/O，删掉省下的是下载期的哈希 CPU（典型几 MB 包为毫秒级、`INSTALLER_MAX_BYTES` 上限量级为亚秒级）。检索记录：内置 grep `streaming_hash|fetch_to_file|hash\.update|hash\.finish`（`src/`）——`streaming_hash` 3 处命中（`src/update/installer.rs:121` 绑定、`:136` 比对、`:141` 失败文案插值），`fetch_to_file` 定义 1（`src/update/http.rs:279`）、生产调用 1（`src/update/installer.rs:121`），另 `src/update/http.rs:3` 与 `src/update/crypto.rs:29` 为注释提及。

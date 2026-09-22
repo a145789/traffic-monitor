@@ -1,6 +1,6 @@
 # Agent Note：清理 update 模块四处无消费者表示（动作 memo、弃用返回值、死归一化、多余 derive）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 `src/update/` 下四处「表示存在但没有读者、或被更强契约覆盖」的表面积。(a) 子进程协议扫描的「首个动作」memo：`src/update/protocol.rs:126` 的 `action: Option<UpdateAction>` 只记首个有效动作（写入逻辑 `src/update/protocol.rs:157-158` 的 `if parsed_action.is_none() { parsed_action = Some(action); }`），而它唯一的生产消费 `src/update/protocol.rs:114` 只读 `.is_none()`（等价于「是否出现过有效行」），Done 与 ExitMain 的**值**没有任何生产读者——读到 EXIT_MAIN 时的转发判定（`src/update/protocol.rs:160`）用的是当行解析出的局部变量，不读 memo。(b) `wait_main_instance_gone() -> bool` 的返回值无消费者：定义 `src/update/installer.rs:182`、两个返回点 `src/update/installer.rs:196` 与 `:215`，唯一调用 `src/update/mod.rs:354` 直接丢弃。(c) 三处 `to_uppercase()` 死归一化：`src/update/installer.rs:70`、`:136`、`:162` 对已是大写的哈希再转大写——比对左侧由 `src/update/crypto.rs:122-126` 的 `format_hex`（`{b:02X}`）保证大写，右侧 `expected_hash_hex` 源自 `src/update/version.rs:68` 的 `hash_line.to_ascii_uppercase()`，两份契约各有测试钉死（`src/update/crypto.rs:136` 的 `test_format_hex`、`src/update/version.rs:133` 的 `test_parse_update_metadata_lowercases_hash_to_upper`）。(d) `Version` 的多余 derive：`src/update/version.rs:5` 的 `Clone, Copy, Eq, Ord` 无消费（比较只用 `>` 即 `PartialOrd`，断言只需 `PartialEq + Debug`）。检索记录：内置 grep `parsed_action|action: Option<UpdateAction>|test_scan_memo|is_error: read_failed`（`src/update/protocol.rs`）命中 8 行、值级消费 0；`wait_main_instance_gone`（`src/`）命中定义 1、use 1（`src/update/mod.rs:43`）、调用 1（`src/update/mod.rs:354`）；`to_uppercase`（`src/update/`）命中 `installer.rs:70/136/162` 三处；`derive(Clone`（`src/update/version.rs`）命中 1 行。
