@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SetCoalescableTimer,
     WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
+use windows::core::PCWSTR;
 
 use crate::collector::{reset_cpu_baseline, reset_network_baseline};
 use crate::config::{
@@ -301,28 +302,17 @@ pub fn check_fullscreen(hwnd: HWND) {
 ///
 /// 调用者必须保证 `lparam` 指向一个有效的、以 NUL 结尾的 UTF-16 宽字符序列。
 /// 由 `WM_SETTINGCHANGE` 消息传入时 OS 保证此条件成立。
+///
+/// 判定必须是**精确相等**：更长的 `ImmersiveColorSetFoo`、仅同前缀的
+/// `ImmersiveColor` 都不得判为主题变更，禁止改成前缀或定长切片匹配。
 pub unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
     let ptr = lparam.0 as *const u16;
     if ptr.is_null() {
         return false;
     }
-    // 低频路径（WM_SETTINGCHANGE 一天至多数次）：运行时比较与原 `utf16::<18>`
-    // 逐字等价（含尾 NUL、长 18），去掉整套 const 展开器与误传非 ASCII 即错的隐式契约。
-    let expected: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
-    for (i, &expected_char) in expected.iter().enumerate() {
-        // SAFETY: 调用者保证 ptr 指向有效的 NUL 结尾 UTF-16 序列，按偏移遍历安全。
-        let actual_char = unsafe { *ptr.add(i) };
-        if actual_char != expected_char {
-            return false;
-        }
-        if actual_char == 0 {
-            return true;
-        }
-    }
-    // 类型系统要求的兜底，不是死代码：运行时 `expected` 恒以尾 NUL 结尾，
-    // 循环内必在 NUL 处返回而不可达；但编译器不认为 `for` 必然执行
-    // （迭代器可能为空），删掉本行直接编译失败（E0308）。
-    true
+    // SAFETY: 调用者保证 ptr 指向有效的 NUL 结尾 UTF-16 序列；非法 UTF-16 只返回 Err，
+    // 与「不等于字面量」同判 false。
+    unsafe { PCWSTR(ptr).to_string() }.is_ok_and(|s| s == "ImmersiveColorSet")
 }
 
 #[cfg(test)]
@@ -346,23 +336,6 @@ mod tests {
         // SAFETY: valid 在栈上，指针在调用期间有效。
         let result = unsafe { is_immersive_color_set(LPARAM(valid.as_ptr() as isize)) };
         assert!(result);
-    }
-
-    #[test]
-    fn test_immersive_color_wrong_string() {
-        let wrong: Vec<u16> = "SomeOtherSetting\0".encode_utf16().collect();
-        // SAFETY: wrong 在栈上，指针在调用期间有效。
-        let result = unsafe { is_immersive_color_set(LPARAM(wrong.as_ptr() as isize)) };
-        assert!(!result);
-    }
-
-    #[test]
-    fn test_immersive_color_prefix_only() {
-        // 仅前缀匹配（如 "ImmersiveColor" 无 "Set"），应返回 false。
-        let partial: Vec<u16> = "ImmersiveColor\0".encode_utf16().collect();
-        // SAFETY: partial 在栈上，指针有效。
-        let result = unsafe { is_immersive_color_set(LPARAM(partial.as_ptr() as isize)) };
-        assert!(!result);
     }
 
     #[test]

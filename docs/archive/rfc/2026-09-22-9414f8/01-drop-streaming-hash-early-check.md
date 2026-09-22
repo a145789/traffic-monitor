@@ -1,12 +1,12 @@
 # Agent Note：删除安装包流式哈希早验，锁定句柄重哈希为唯一校验裁决
 
-Status: proposed
+Status: implemented
 
 ## 问题
 安装包哈希是否等于远端预期，这一个事实存在两份表示，其中一份被模块自己宣告为非权威。`src/update/http.rs:279` 的 `fetch_to_file` 边下载边哈希并返回流式哈希（签名 `src/update/http.rs:284` 为 `Result<String, FetchFileError>`，哈希构造/更新/收尾在 `src/update/http.rs:289`、`:292`、`:303`），`src/update/installer.rs:121` 取其返回值并由 `src/update/installer.rs:136-143` 做早验比对、失败即删文件；而模块不变量明文写着这份表示不作数——`src/update/installer.rs:3-4`「最终构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），不采信流式哈希、不按路径另开文件」，`src/update/installer.rs:83-84` 在函数文档里逐字重复同一句。结果是每次成功下载都要为一份注定不被采信的哈希多算一次整包 SHA-256——它在 `fetch_to_file` 的消费闭包内随下载增量计算（`src/update/http.rs:291-297`），不产生额外文件 I/O，删掉省下的是下载期的哈希 CPU（典型几 MB 包为毫秒级、`INSTALLER_MAX_BYTES` 上限量级为亚秒级）。检索记录：内置 grep `streaming_hash|fetch_to_file|hash\.update|hash\.finish`（`src/`）——`streaming_hash` 3 处命中（`src/update/installer.rs:121` 绑定、`:136` 比对、`:141` 失败文案插值），`fetch_to_file` 定义 1（`src/update/http.rs:279`）、生产调用 1（`src/update/installer.rs:121`），另 `src/update/http.rs:3` 与 `src/update/crypto.rs:29` 为注释提及。
 
 ## 提案
-把 `fetch_to_file` 的返回类型改为 `Result<(), FetchFileError>`：删除 `src/update/http.rs:288-289` 的 `Sha256` 构造、消费闭包里的 `hash.update`（`src/update/http.rs:292-293`）、`hash.finish`（`src/update/http.rs:303-305`）以及「成功返回已下载内容的十六进制哈希（流式哈希）」的文档段；删除 `src/update/installer.rs:121` 的 `streaming_hash` 绑定与 `src/update/installer.rs:136-143` 的早验块（该块的 drop 写锁/删文件动作并入既有 `Err(FetchFileError::…)` 处理路径，清理顺序保持「先释放锁再删文件」不变）；同步改写 `src/update/crypto.rs:29` 的注释（「流式下载与锁定句柄重验共用同一增量能力」改为「锁定句柄重验是唯一校验路径」）。净删约 20 行（http.rs 约 12 行、installer.rs 约 8 行），并省去下载期一次整包哈希计算（纯 CPU、毫秒级，无 I/O 变化）。
+把 `fetch_to_file` 的返回类型改为 `Result<(), FetchFileError>`：删除 `src/update/http.rs:288-289` 的 `Sha256` 构造、消费闭包里的 `hash.update`（`src/update/http.rs:292-293`）、`hash.finish`（`src/update/http.rs:303-305`）以及「成功返回已下载内容的十六进制哈希（流式哈希）」的文档段；删除 `src/update/installer.rs:121` 的 `streaming_hash` 绑定与 `src/update/installer.rs:136-143` 的早验块（该块的 drop 写锁/删文件动作并入既有 `Err(FetchFileError::…)` 处理路径，清理顺序保持「先释放锁再删文件」不变）；同步改写 `src/update/crypto.rs:29` 的注释（「流式下载与锁定句柄重验共用同一增量能力」改为「锁定句柄重验是唯一校验路径」）。净删约 20 行（http.rs 约 12 行、installer.rs 约 8 行），并省去下载期一次整包哈希计算（纯 CPU、毫秒级，无 I/O 变化）。同步去掉措辞里的空事实：`src/update/http.rs:3-4` 模块头与 `src/update/installer.rs:3-4`、`:80-84` 的「边读边哈希」「不采信流式哈希」都必须一并删除——流式哈希已不存在，留着就是把不存在的表示继续写成规范。
 
 ## 明确不在本次范围
 `compute_sha256_hex_locked`（`src/update/crypto.rs:107`）与缓存复用路径的重哈希（`src/update/installer.rs:69`）绝不能一起删——它们是 accept 的唯一裁决，删掉等于无校验安装；`src/update/installer.rs:153-168` 的锁定句柄重验块一字不动，本提案只删它前面的早验，不改它的判据、错误文案与清理动作；`compute_sha256_hex`（cfg(test)）与 `compute_sha256_hex_reader`（`src/update/crypto.rs:89`）保留——前者是三处测试的正确性参照物，后者是「流式一致性」测试的被测面且不依赖 `fetch_to_file` 返回值；`Sha256` 结构及其 BCrypt 句柄守卫不动（AGENTS.md 第 8 条：业务守卫留在业务文件）。

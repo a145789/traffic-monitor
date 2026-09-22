@@ -1,6 +1,6 @@
 # Agent Note：删除 network.rs 三处永不改变结果的判据与兜底
 
-Status: proposed
+Status: implemented
 
 ## 问题
 `src/collector/network.rs` 有三处「存在但永不改变任何返回值或控制流」的判据。(a) `src/collector/network.rs:175` 的 `|| name_lower.contains("isatap")` 被同函数 `src/collector/network.rs:171` 的 `contains("tap")` 完全蕴含——字符串事实上 `"isatap"[3..6] == "tap"`，任何含 `isatap` 的名字必含 `tap`，前一行先命中，该行是死判据；而测试矩阵注释 `src/collector/network.rs:347` 声称「若删掉任一 contains 判据，对应样本即变红」，对这条判据不成立（删掉它全部断言仍绿），注释只好在 `src/collector/network.rs:349-350` 开一个「唯一例外是 isatap ⊃ tap 的子串蕴含」的口子。(b) 断网判定 `src/collector/network.rs:121` 的三合取中两个零速项被第三个蕴含：`select_winner_interface`（`src/collector/rate.rs:13-45`）对空 `current_data` 返回 `(0, 0)`（`src/collector/rate.rs:18-20` 零值初始化、循环空转、`:45` 原样返回），故 `current_data.is_empty()` 成立时前两项必为真，`A ∧ B ∧ C ≡ C`——「本周期无活动网口」这一事实被表示了两次（纯函数返回的零值、调用方的 emptiness 检查）。(c) `MibTable` 的空指针兜底不可达：`rows()` 的 `if self.0.is_null() { return &[]; }`（`src/collector/network.rs:40-42`）与 `Drop` 的 `if !self.0.is_null()` 包裹（`src/collector/network.rs:56`）所防的空指针，在唯一构造点 `src/collector/network.rs:84-88` 已被 `if result.0 != 0 || table.is_null() { return; }` 排除，结构私有、字段私有、无其他构造路径。检索记录：内置 grep `isatap`（全仓）命中 4 行（`src/collector/network.rs:175` 判据、`:349` 与 `:350` 例外注释各一行、`:361` 测试样本的标签），README 与 docs 0 命中；`is_null`（`src/collector/network.rs`）命中 `:40`、`:56`（本提案）、`:84`（构造点判空，保留）、`:187`、`:236`（FFI 输入防御，保留）；`MibTable(`（`src/`）命中 2 行（定义、构造各一）。

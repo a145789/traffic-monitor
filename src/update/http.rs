@@ -1,13 +1,12 @@
 //! WinHTTP 抓取与友好的中文错误映射。
 //!
 //! 元数据仍走 `fetch_url`（整包内存，上限仅 4KiB）；安装包走 `fetch_to_file`
-//!（固定缓冲复用，边读边哈希边写，上限 `INSTALLER_MAX_BYTES`）。
+//!（固定缓冲复用，边读边写，上限 `INSTALLER_MAX_BYTES`）。
 
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::{PCWSTR, w};
 
-use super::crypto::Sha256;
 use crate::config::{APP_TITLE, HTTP_READ_CHUNK_BYTES, HTTP_TIMEOUT_MS};
 use crate::util::to_wide;
 
@@ -261,15 +260,17 @@ pub(super) fn fetch_url(
     Ok(response)
 }
 
-/// 流式下载安装包：边 `WinHttpReadData` 边 `Sha256::update` 边写文件。
+/// 流式下载安装包：边 `WinHttpReadData` 边写文件。
 ///
 /// 固定复用 `HTTP_READ_CHUNK_BYTES` 缓冲，全程累计字节数上限为 `max_response_bytes`
 ///（不只信 `Content-Length`，以实际读到为准）；调用方传入的应是已用
 /// `create_new(true)` + `FILE_SHARE_READ` 建好的写锁文件。
-/// 成功返回已下载内容的十六进制哈希（流式哈希）；失败返回结构化错误：
-/// 抓取段（建连/发送/接收/状态码/查询/读取/超限）为 `Download`（可回落代理），
-/// 哈希段与写入段为 `Local`（磁盘/加密本地故障，不回落，避免空耗整包流量）。
-/// 文案均带中文 `op`，调用方按变体映射到回落决策，不要匹配文案猜来源。
+/// 本函数不产出校验结论：安装包是否可信的唯一裁决是锁定句柄的重算哈希
+///（`installer::fetch_verified_installer`），下载期不做第二份比对。
+/// 失败返回结构化错误：抓取段（建连/发送/接收/状态码/查询/读取/超限）为
+/// `Download`（可回落代理），写入段为 `Local`（磁盘本地故障，不回落，
+/// 避免空耗整包流量）。文案均带中文 `op`，调用方按变体映射到回落决策，
+/// 不要匹配文案猜来源。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FetchFileError {
     Download(String),
@@ -281,16 +282,12 @@ pub(super) fn fetch_to_file(
     path: &str,
     max_response_bytes: usize,
     file: &mut std::fs::File,
-) -> Result<String, FetchFileError> {
+) -> Result<(), FetchFileError> {
     use std::io::Write;
 
     let conn = HttpGet::open(host, path)?;
-    let hash =
-        Sha256::new().map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))?;
     {
         let consume = |data: &[u8]| -> Result<(), FetchFileError> {
-            hash.update(data)
-                .map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))?;
             file.write_all(data)
                 .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))?;
             Ok(())
@@ -299,9 +296,7 @@ pub(super) fn fetch_to_file(
     }
 
     file.flush()
-        .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))?;
-    hash.finish()
-        .map_err(|e| FetchFileError::Local(format!("计算安装包哈希失败: {e}")))
+        .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))
 }
 
 #[cfg(test)]

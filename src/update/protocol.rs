@@ -81,14 +81,14 @@ pub(super) fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
             scan_subprocess_protocol(&mut reader, post_update_action_to_watchdog)
         }
         None => ScanOutcome {
-            action: None,
+            saw_valid_action: false,
             exit_signalled: false,
             read_failed: true,
             exit_forwarded: false,
         },
     };
     let ScanOutcome {
-        action: parsed_action,
+        saw_valid_action,
         exit_signalled,
         read_failed,
         exit_forwarded,
@@ -111,7 +111,7 @@ pub(super) fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     }
 
     SubprocessOutcome {
-        is_error: read_failed || parsed_action.is_none() || !exit_status.success(),
+        is_error: read_failed || !saw_valid_action || !exit_status.success(),
         exit_signalled,
         exit_forwarded,
     }
@@ -122,8 +122,8 @@ pub(super) fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
 /// 替代 `(Option<UpdateAction>, bool, bool, bool)` 四元组——三个 `bool` 在位置上
 /// 无法区分，调用点只能靠顺序记忆；字段名即文档，零运行时成本。
 struct ScanOutcome {
-    /// 扫描到的首个有效动作（`DONE` / `EXIT_MAIN`）；空流或全无效行时为 `None`。
-    action: Option<UpdateAction>,
+    /// 是否读到过至少一个有效动作行（`DONE` / `EXIT_MAIN`）；空流或全无效行时为 `false`。
+    saw_valid_action: bool,
     /// 是否读到 `EXIT_MAIN`（协议层事实，不代表通知已送达）。
     exit_signalled: bool,
     /// 读取是否失败（I/O 错误，含遇到无效 UTF-8 行）。
@@ -142,7 +142,7 @@ fn scan_subprocess_protocol(
     reader: &mut impl BufRead,
     mut on_exit_main: impl FnMut() -> bool,
 ) -> ScanOutcome {
-    let mut parsed_action: Option<UpdateAction> = None;
+    let mut saw_valid_action = false;
     let mut exit_signalled = false;
     let mut read_failed = false;
     let mut exit_forwarded = false;
@@ -154,9 +154,7 @@ fn scan_subprocess_protocol(
             Ok(0) => break,
             Ok(_) => {
                 if let Some(action) = parse_update_action(line.as_bytes()) {
-                    if parsed_action.is_none() {
-                        parsed_action = Some(action);
-                    }
+                    saw_valid_action = true;
                     if action == UpdateAction::ExitMain && !exit_signalled {
                         exit_signalled = true;
                         // 收到即转发，不等子进程退出：主进程须抢在安装器拷贝前
@@ -173,7 +171,7 @@ fn scan_subprocess_protocol(
     }
 
     ScanOutcome {
-        action: parsed_action,
+        saw_valid_action,
         exit_signalled,
         read_failed,
         exit_forwarded,
@@ -266,7 +264,7 @@ mod tests {
     // ===== scan_subprocess_protocol =====
 
     /// 用内存缓冲驱动协议扫描，并记录转发回调次数与送达结果。
-    fn scan(data: &[u8]) -> (Option<UpdateAction>, bool, bool, usize, bool) {
+    fn scan(data: &[u8]) -> (bool, bool, bool, usize, bool) {
         let mut reader = std::io::Cursor::new(data);
         let mut forwards = 0usize;
         let outcome = scan_subprocess_protocol(&mut reader, || {
@@ -274,7 +272,7 @@ mod tests {
             true
         });
         (
-            outcome.action,
+            outcome.saw_valid_action,
             outcome.exit_signalled,
             outcome.read_failed,
             forwards,
@@ -294,8 +292,9 @@ mod tests {
     fn test_scan_exit_main_forwards_exactly_once() {
         // forwards（回调次数）与 forwarded（送达结果）是两个独立观测通道：
         // 前者证明"只转发一次"，后者证明"转发成功被正确上报"，互不可推导。
-        let (parsed, exit_signalled, read_failed, forwards, forwarded) = scan(b"EXIT_MAIN\n");
-        assert_eq!(parsed, Some(UpdateAction::ExitMain));
+        let (saw_valid_action, exit_signalled, read_failed, forwards, forwarded) =
+            scan(b"EXIT_MAIN\n");
+        assert!(saw_valid_action);
         assert!(exit_signalled);
         assert!(!read_failed);
         assert_eq!(forwards, 1);
@@ -312,8 +311,8 @@ mod tests {
 
     #[test]
     fn test_scan_done_does_not_forward() {
-        let (parsed, exit_signalled, read_failed, forwards, _) = scan(b"DONE\n");
-        assert_eq!(parsed, Some(UpdateAction::Done));
+        let (saw_valid_action, exit_signalled, read_failed, forwards, _) = scan(b"DONE\n");
+        assert!(saw_valid_action);
         assert!(!exit_signalled);
         assert!(!read_failed);
         assert_eq!(forwards, 0);
@@ -324,9 +323,9 @@ mod tests {
         // 无效行必须只被跳过，不得阻断其后的有效动作：EXIT_MAIN 故意放在无效行之后。
         // 旧输入（无效行之后无有效动作）对任何实现都成立，本用例才能真正区分
         // 「跳过无效行」与「遇无效行即停止读取」两种实现。
-        let (parsed, exit_signalled, read_failed, forwards, _) =
+        let (saw_valid_action, exit_signalled, read_failed, forwards, _) =
             scan(b"NO_UPDATE\nEXIT_MAIN|extra\nEXIT_MAIN\n");
-        assert_eq!(parsed, Some(UpdateAction::ExitMain));
+        assert!(saw_valid_action);
         assert!(exit_signalled);
         assert!(!read_failed);
         assert_eq!(forwards, 1);
@@ -334,8 +333,8 @@ mod tests {
 
     #[test]
     fn test_scan_empty_stream() {
-        let (parsed, exit_signalled, read_failed, forwards, _) = scan(b"");
-        assert_eq!(parsed, None);
+        let (saw_valid_action, exit_signalled, read_failed, forwards, _) = scan(b"");
+        assert!(!saw_valid_action);
         assert!(!exit_signalled);
         assert!(!read_failed);
         assert_eq!(forwards, 0);
@@ -343,20 +342,12 @@ mod tests {
 
     #[test]
     fn test_scan_invalid_utf8_marks_read_failed() {
-        let (parsed, exit_signalled, read_failed, forwards, _) = scan(&[0xFF, 0xFE, b'\n']);
-        assert_eq!(parsed, None);
+        let (saw_valid_action, exit_signalled, read_failed, forwards, _) =
+            scan(&[0xFF, 0xFE, b'\n']);
+        assert!(!saw_valid_action);
         assert!(!exit_signalled);
         assert!(read_failed);
         assert_eq!(forwards, 0);
-    }
-
-    #[test]
-    fn test_scan_memo_keeps_first_action_but_still_forwards() {
-        // memo 记录首个有效动作（is_error 判定只消费 is_none）；转发与 memo 无关。
-        let (parsed, exit_signalled, _, forwards, _) = scan(b"DONE\nEXIT_MAIN\n");
-        assert_eq!(parsed, Some(UpdateAction::Done));
-        assert!(exit_signalled);
-        assert_eq!(forwards, 1);
     }
 
     // ===== 转发送达与进行中标志复位 =====

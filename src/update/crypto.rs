@@ -26,7 +26,7 @@ impl Drop for BcryptHandles {
 }
 
 /// 增量式 SHA-256 计算。句柄由 RAII 守卫托管，`finish` 后自动销毁。
-/// 流式下载（`http::fetch_to_file`）与锁定句柄重验共用同一增量能力：
+/// 唯一生产消费者是锁定句柄重验（`compute_sha256_hex_locked`）：
 /// 边读边喂，避免整包常驻内存。
 pub(super) struct Sha256 {
     handles: BcryptHandles,
