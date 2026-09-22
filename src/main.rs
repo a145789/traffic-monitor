@@ -376,8 +376,6 @@ fn unregister_session_notification() {
     }
 }
 
-/// 启动与 Explorer 重建共用的资源绑定尾段：托盘图标 → 渲染参数 → 窗口失效
-/// → 监测定时器。两条生命周期路径保持唯一实现，失败文案由各自调用方报告。
 /// 把窗口回滚到渲染器当前的位图尺寸。
 ///
 /// DPI 更新失败时渲染器维持旧尺寸，而窗口已按新 DPI 改过：不拉回同一尺寸，
@@ -389,6 +387,8 @@ fn rollback_window_to_bitmap(hwnd: HWND) {
     });
 }
 
+/// 启动与 Explorer 重建共用的资源绑定尾段：托盘图标 → 渲染参数 → 窗口失效
+/// → 监测定时器。两条生命周期路径保持唯一实现，失败文案由各自调用方报告。
 fn bind_display_and_timers(hwnd: HWND) -> bool {
     // 托盘为 best-effort：失败不阻断监测主功能，由 diag 留痕。
     if !create_tray_icon(hwnd) {

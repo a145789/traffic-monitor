@@ -485,6 +485,7 @@ impl Renderer {
         self.height = height;
         self.layout = Layout::new(width, height);
 
+        // hdc_mem 常驻：背景模式只需 new() 设一次，此处仅换位图/字体。
         self.arrow_width = measure_arrow_width(self.hdc_mem);
         true
     }
