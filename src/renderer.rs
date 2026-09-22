@@ -87,6 +87,7 @@ struct DisplayValues {
 }
 
 impl DisplayValues {
+    /// 本值为跨 tick 拼接快照，禁止基于「快照一致」写更强的去重逻辑。
     fn load() -> Self {
         Self {
             speed_up: NET_SPEED_UP.load(Ordering::Relaxed),

@@ -84,7 +84,9 @@ pub fn collect_cpu() {
             return;
         }
 
-        let usage = ((total - idle_diff) * 100 / total).min(100) as u32;
+        // 两处饱和各自独立，故减法侧也必须饱和：idle_diff > total（近不可构造）时
+        // 饱和为 0% 写入、下一周期自愈，此处选择钳制而非保持上次值。
+        let usage = (total.saturating_sub(idle_diff) * 100 / total).min(100) as u32;
         CPU_USAGE.store(usage, Ordering::Relaxed);
     });
 }

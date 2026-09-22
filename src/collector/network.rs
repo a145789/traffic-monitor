@@ -253,19 +253,20 @@ fn build_virtual_blacklist() -> Option<HashSet<u64>> {
     Some(blacklist)
 }
 
-/// 在 UI 线程上以不可变借用读取黑名单；过期时先就地重建缓存。
+/// 在 UI 线程上读取黑名单；过期时先就地重建缓存。判定与重建合并进单一可变
+/// 借用锁域，避免「条件内临时借用 + 块内 borrow_mut」依赖借用 drop 时序——
+/// 等价重构会变成运行时双重借用，在 `panic = "abort"` 下直接中止进程。
 ///
-/// 闭包执行期间持有 `VIRTUAL_BLACKLIST` 的不可变借用，闭包内禁止再次调用本函数。
+/// 闭包执行期间持有 `VIRTUAL_BLACKLIST` 的可变借用，闭包内禁止再次调用本函数。
 fn with_virtual_blacklist<R>(f: impl FnOnce(&HashSet<u64>) -> R) -> R {
     VIRTUAL_BLACKLIST.with(|cell| {
         let now = Instant::now();
-        if blacklist_needs_refresh(&cell.borrow(), now) {
-            let mut cache = cell.borrow_mut();
+        let mut cache = cell.borrow_mut();
+        if blacklist_needs_refresh(&cache, now) {
             rebuild_virtual_blacklist(&mut cache, now, build_virtual_blacklist);
         }
 
         // 类型即不变量：空名单是合法初值，重建后必然有值，无需再解 Option 兜底。
-        let cache = cell.borrow();
         let (blacklist, _) = &*cache;
         f(blacklist)
     })

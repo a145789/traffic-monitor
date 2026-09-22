@@ -220,6 +220,12 @@ pub fn embed_in_taskbar(hwnd: HWND) -> Result<(), String> {
     //    SetLayeredWindowAttributes）。调换会导致分层透明失效或被任务栏图标遮挡。
     //    任一步失败立即返回 Err，避免任务栏嵌入进入不可恢复的中间状态。
     unsafe {
+        // 已评估、采取现状：SetParent 的 HWND 返回值有歧义（NULL 既可能是「前值」
+        // 也可能表示失败，且 Win32 不保证失败时 set last error），故此处不加
+        // GetLastError 判别分支——忽略 Err 会让后续序列作用在未 reparent 的窗口上，
+        // 比现状「Err 即失败、由守卫静默重试」更不安全。本机 Win11 实测该路径返回
+        // 桌面句柄而非 NULL，现状不误报。同函数内 SetWindowLongPtrW 用的是
+        // SetLastError(0) 加事后判别，见下方各段。
         SetParent(hwnd, Some(h_taskbar)).map_err(|e| format!("SetParent 嵌入任务栏失败: {e:?}"))?;
 
         // SetWindowLongPtrW 返回 isize（前值），0 既可能表示"前值就是 0"也可能表示失败，

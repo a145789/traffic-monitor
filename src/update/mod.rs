@@ -191,6 +191,10 @@ fn spawn_update_worker(is_manual: bool) {
     }
 }
 
+// 编译期契约：错误冷却不得大于正常冷却，否则下方差值 u64 下溢、release 回绕出
+// 巨大 Duration，随后 Instant - Duration panic → abort。
+const _: () = assert!(AUTO_CHECK_ERROR_COOLDOWN_SECS <= AUTO_CHECK_COOLDOWN_SECS);
+
 fn update_check_worker(is_manual: bool) {
     let outcome = run_check_subprocess(is_manual);
 

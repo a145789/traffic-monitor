@@ -1,6 +1,6 @@
 # Agent Note：panic=abort 语境下的异常路径防御收口
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -8,8 +8,8 @@ release 构建为 `panic = "abort"`（`Cargo.toml:12`），进程没有兜底 UI
 
 1. **CPU 使用率存在无保护减法（防御性对齐）。** `src/collector/cpu_mem.rs:87` 为 `((total - idle_diff) * 100 / total).min(100) as u32`，而三个差分在 `src/collector/cpu_mem.rs:71-73` 各自 `saturating_sub`——彼此独立饱和，不保证 `idle_diff <= total`（其中 `total = kernel_diff + user_diff`）。若该组合成立：release 下 u64 减法回绕成天文数字、乘 100 再回绕，`.min(100)` 只截上界救不回来；debug 下直接 panic → abort。`.min(100)` 的存在说明作者已考虑「结果超界」，漏的只是下界。**如实说明严重度**：该组合近乎不可构造——三个计数器出自同一次 `GetSystemTimes` 的同一组内核快照，异常复位时三者同时回退、差分一并饱和为 0 并走 `total == 0` 早退（`src/collector/cpu_mem.rs:83-85`）；即便命中，基线每 tick 覆盖（`:75-79`），影响也只有一个 5 秒显示周期，不是长期错乱。
 2. **`RefCell` 借用依赖微妙作用域规则（真实地雷）。** `src/collector/network.rs:262-263` 是 `if blacklist_needs_refresh(&cell.borrow(), now) { let mut cache = cell.borrow_mut(); ... }`：今天正确（if 条件表达式的临时借用先于块体 drop），任何「把条件提成 `let stale = ...`」的等价重构都会变成运行时双重借用，而在 `panic = "abort"` 下没有 unwind、直接终止进程。同仓 `src/renderer.rs:37-45` 已用 `try_borrow_mut` 把重入降级为「跳过」以避免同类 abort，两处谨慎程度不一致。
-3. **一条常量关系未钉死。** `src/update/mod.rs:204` 是 `AUTO_CHECK_COOLDOWN_SECS - AUTO_CHECK_ERROR_COOLDOWN_SECS`（`src/config.rs:76-77`，当前 3600 与 300）。u64 下溢无编译期兜底：把错误冷却调得比正常冷却大，release 会回绕出约 584 年的 `Duration`，随后 `Instant - Duration` panic → abort。本仓已有把常量关系钉成测试的先例（`src/suspend.rs:405` 的 `auto_update_poll_interval_must_be_far_below_cooldown`），此处没有。
-4. **`SetParent` 返回值歧义与同函数内的判别标准不一致（只做注释）。** `src/window.rs:223` 只做 `map_err`，而 `src/window.rs:225-234` 与 `:237-247` 对 `SetWindowLongPtrW` 精心做了 `SetLastError(0)` 加事后判别。Win32 对 `SetParent` 有同样的「返回 NULL 既是『前值』也是失败」歧义；本机 Win11 实测（审查期间以 P/Invoke 复现）该路径返回的是桌面句柄而非 NULL，故现状不误报。**本项不改判定逻辑**——把 `Err` 在 last error 为 0 时当成功继续，会把失败态变成「未 reparent 却继续后续序列」，比现状的安全侧重试更糟，理由见「明确不在本次范围」。
+3. **一条常量关系未钉死。** `src/update/mod.rs:204` 是 `AUTO_CHECK_COOLDOWN_SECS - AUTO_CHECK_ERROR_COOLDOWN_SECS`（`src/config.rs:76-77`，当前 3600 与 300）。u64 下溢无编译期兜底：把错误冷却调得比正常冷却大，release 会回绕出 2⁶⁴ 秒量级（约 5845 亿年）的 `Duration`，随后 `Instant - Duration` panic → abort。本仓已有把常量关系钉成测试的先例（`src/suspend.rs:405` 的 `auto_update_poll_interval_must_be_far_below_cooldown`），此处没有。
+4. **`SetParent` 返回值歧义与同函数内的判别标准不一致（只做注释）。** `src/window.rs:223` 只做 `map_err`，而 `src/window.rs:225-234` 与 `:237-248` 对 `SetWindowLongPtrW` 精心做了 `SetLastError(0)` 加事后判别。Win32 对 `SetParent` 有同样的「返回 NULL 既是『前值』也是失败」歧义；本机 Win11 实测（审查期间以 P/Invoke 复现）该路径返回的是桌面句柄而非 NULL，故现状不误报。**本项不改判定逻辑**——把 `Err` 在 last error 为 0 时当成功继续，会把失败态变成「未 reparent 却继续后续序列」，比现状的安全侧重试更糟，理由见「明确不在本次范围」。
 
 ## 提案
 
@@ -39,7 +39,7 @@ release 构建为 `panic = "abort"`（`Cargo.toml:12`），进程没有兜底 UI
 - `grep -n 'saturating_sub(idle_diff)' src/collector/cpu_mem.rs` 有命中（本笔记**不含**协议读取侧改动，`src/update/mod.rs` 的 `read_line` 保持原样）。
 - `grep -n 'const _: () = assert' src/update/mod.rs` 有命中；把 `src/config.rs:77` 临时改为 `4000` 后 `cargo build --release --locked` 必须失败（证伪依据），还原后通过。
 - `grep -n 'borrow()' src/collector/network.rs` 的命中不再出现在 `if` 条件内。
-- `cargo test --locked`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo fmt` 全绿（本次不触碰 `src/update/mod.rs` 的 9 条 `test_scan_*`，它们应原样通过）。
+- `cargo test --locked`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo fmt` 全绿（本次不触碰 `src/update/mod.rs` 的 8 条 `test_scan_*`，它们应原样通过）。
 
 ## 风险
 
