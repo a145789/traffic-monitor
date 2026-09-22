@@ -40,7 +40,8 @@ impl MibTable {
         if self.0.is_null() {
             return &[];
         }
-        // SAFETY: self.0 是由成功返回的 GetIfTable2 分配的非空有效指针。
+        // SAFETY: self.0 是由成功返回的 GetIfTable2 分配的非空有效指针
+        //（唯一构造点 `collect_network` 已判空，无其他构造路径）。
         let num_entries = unsafe { (*self.0).NumEntries as usize };
         if num_entries == 0 {
             return &[];
@@ -118,7 +119,7 @@ pub fn collect_network(hwnd: HWND) {
             NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
             NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
 
-            if best_speed_down == 0 && best_speed_up == 0 && current_data.is_empty() {
+            if current_data.is_empty() {
                 let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if count == BACKOFF_ZERO_THRESHOLD {
                     post_to_main(hwnd, WM_USER_NETWORK_DISCONNECTED);
@@ -172,7 +173,6 @@ fn is_virtual_friendly_name(name: &str) -> bool {
         || name_lower.contains("vpn")
         || name_lower.contains("loopback")
         || name_lower.contains("teredo")
-        || name_lower.contains("isatap")
         || name_lower.contains("6to4")
         || name_lower.contains("ppp")
         || name_lower.contains("kvm")
@@ -346,8 +346,7 @@ mod tests {
     fn test_virtual_friendly_name_matrix() {
         // 每个样本只命中其标注的关键字：若删掉任一 contains 判据，对应样本即变红。
         // 旧 hyperv/vmware 样本双命中 "virtual"，旧 vbox 样本实际被 "virtual" 命中，
-        // 此处全部换成单命中样本（见 C1/C2）。唯一例外是 isatap ⊃ tap 的子串蕴含
-        //（任何含 "isatap" 的名字必然含 "tap"），该行无法单命中，特此说明。
+        // 此处全部换成单命中样本（见 C1/C2）。
         let virtual_cases = [
             ("Virtual Ethernet Device", "virtual"),
             ("VBoxNetLwf", "vbox"),
@@ -358,7 +357,8 @@ mod tests {
             ("VPN Client Adapter", "vpn"),
             ("Microsoft Loopback Adapter", "loopback"),
             ("Teredo Tunneling Pseudo-Interface", "teredo"),
-            ("Microsoft ISATAP Adapter", "isatap"),
+            // ISATAP 名字含 "tap" 子串，经 tap 判据命中，不需要单独的判据。
+            ("Microsoft ISATAP Adapter", "tap"),
             ("Microsoft 6to4 Adapter", "6to4"),
             ("PPP Adapter", "ppp"),
             ("KVM Net Adapter", "kvm"),

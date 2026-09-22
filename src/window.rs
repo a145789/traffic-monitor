@@ -230,6 +230,8 @@ pub fn embed_in_taskbar(hwnd: HWND) -> Result<(), String> {
 
         // SetWindowLongPtrW 返回 isize（前值），0 既可能表示"前值就是 0"也可能表示失败，
         // 必须先 SetLastError(WIN32_ERROR(0)) 再调用，事后用 GetLastError 才能可靠区分。
+        // TODO(dedup-setlong): 本段与下方 GWL_EXSTYLE 段的判别协议可抽同一私有 helper 收口；
+        // 为保住嵌入五步序列的逐字可核对性，暂各留一份。
         SetLastError(WIN32_ERROR(0));
         let prev_style = SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD.0 | WS_VISIBLE.0) as isize);
         if prev_style == 0 {

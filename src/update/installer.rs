@@ -1,7 +1,7 @@
-//! 安装器管线：缓存复用、流式下载校验、提权启动、主进程退出等待。
+//! 安装器管线：缓存复用、流式下载、提权启动、主进程退出等待。
 //!
-//! 不变量：最终构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希
-//! （`compute_sha256_hex_locked`），不采信流式哈希、不按路径另开文件。
+//! 不变量：构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希
+//! （`compute_sha256_hex_locked`），不按路径另开文件。
 
 use std::time::Instant;
 use windows::Win32::Foundation::{
@@ -51,7 +51,7 @@ pub(super) enum FetchFailure {
     /// 写盘/哈希失败由 `http` 归为 `FetchFileError::Local`，经调用方转为本枚举的
     /// `Local`，不在此变体。
     Download(String),
-    /// 本地失败（创建、流式写盘/哈希、流式哈希早验、锁定、锁柄重验），直接返回不再回落。
+    /// 本地失败（创建、流式写盘、锁定、锁柄重验），直接返回不再回落。
     Local(String),
 }
 
@@ -77,11 +77,11 @@ pub(super) fn try_reuse_cached_installer(
     })
 }
 
-/// 单源流式下载并加锁重验：创建写锁文件 → 流式抓取（边读边哈希边写）
-/// → 流式哈希早验 → 降级只读锁 → 对锁定句柄重算哈希 → 构造持锁体。
+/// 单源流式下载并加锁重验：创建写锁文件 → 流式抓取（边读边写）→ 降级只读锁
+/// → 对锁定句柄重算哈希 → 构造持锁体。
 ///
-/// 不变量：最终构造的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），
-/// 不采信流式哈希、不按路径另开文件；失败路径尽力删文件（删除结果忽略，
+/// 不变量：构造的唯一依据是锁定句柄的重算哈希（`compute_sha256_hex_locked`），
+/// 不按路径另开文件；失败路径尽力删文件（删除结果忽略，
 /// 外部占用下可能残留，由下次缓存哈希不匹配触发重下）。
 /// 错误已带中文 `op`（抓取/哈希/写入/锁定），调用方按 `FetchFailure` 决定回落。
 pub(super) fn fetch_verified_installer(
@@ -118,28 +118,15 @@ pub(super) fn fetch_verified_installer(
             }
         }
     };
-    let streaming_hash = match fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock) {
-        Ok(h) => h,
-        // 错误来源由产生处分类，不匹配文案：Download 回落代理，Local 直接返回。
-        Err(FetchFileError::Download(e)) => {
-            // 先释放写锁再删，否则 Windows 下删除被占用文件会失败而残留。
-            drop(write_lock);
-            let _ = std::fs::remove_file(temp_path);
-            return Err(FetchFailure::Download(e));
-        }
-        Err(FetchFileError::Local(e)) => {
-            drop(write_lock);
-            let _ = std::fs::remove_file(temp_path);
-            return Err(FetchFailure::Local(e));
-        }
-    };
-    if streaming_hash.to_uppercase() != expected_hash_hex {
+    if let Err(e) = fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock) {
+        // 先释放写锁再删，否则 Windows 下删除被占用文件会失败而残留。
         drop(write_lock);
         let _ = std::fs::remove_file(temp_path);
-        return Err(FetchFailure::Local(format!(
-            "安装包校验失败 (预期: {}, 实际: {})",
-            expected_hash_hex, streaming_hash
-        )));
+        // 错误来源由产生处分类，不匹配文案：Download 回落代理，Local 直接返回。
+        return Err(match e {
+            FetchFileError::Download(e) => FetchFailure::Download(e),
+            FetchFileError::Local(e) => FetchFailure::Local(e),
+        });
     }
     // 降级为只读共享锁：映像加载器以 FILE_SHARE_READ|FILE_SHARE_DELETE 打开，
     // 不容纳并存句柄的写访问权，持写句柄启动必失败 32。先关写再开只读，
@@ -179,7 +166,7 @@ pub(super) fn fetch_verified_installer(
 /// 超时/轮询与 `--quit` 的 `quit_existing_instance`（`main.rs`）共用
 /// MAIN_EXIT_WAIT_TIMEOUT_MS / MAIN_EXIT_POLL_INTERVAL_MS（见 `config` 注释）。
 /// 本子进程在 main() 单例锁创建前即被拦截，自身绝不持有该互斥量。
-pub(super) fn wait_main_instance_gone() -> bool {
+pub(super) fn wait_main_instance_gone() {
     let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
     let deadline = Instant::now() + std::time::Duration::from_millis(MAIN_EXIT_WAIT_TIMEOUT_MS);
     let mut logged_probe_error = false;
@@ -193,7 +180,7 @@ pub(super) fn wait_main_instance_gone() -> bool {
                 // SAFETY: 紧接 OpenMutexW 失败读取 last-error，中间无其他 Win32 调用。
                 let last = unsafe { GetLastError() };
                 if last == ERROR_FILE_NOT_FOUND {
-                    return true;
+                    return;
                 }
                 // 其余错误（含 ACCESS_DENIED）保守按「互斥量仍存在」继续等待，
                 // 超时后交安装器 taskkill 兜底；只记首条，避免 50ms 轮询刷屏。
@@ -212,7 +199,7 @@ pub(super) fn wait_main_instance_gone() -> bool {
 
         if Instant::now() >= deadline {
             log_event!("等待主进程退出超时，交安装器兜底");
-            return false;
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(MAIN_EXIT_POLL_INTERVAL_MS));
     }

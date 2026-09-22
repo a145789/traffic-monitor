@@ -377,6 +377,17 @@ fn unregister_session_notification() {
 
 /// 启动与 Explorer 重建共用的资源绑定尾段：托盘图标 → 渲染参数 → 窗口失效
 /// → 监测定时器。两条生命周期路径保持唯一实现，失败文案由各自调用方报告。
+/// 把窗口回滚到渲染器当前的位图尺寸。
+///
+/// DPI 更新失败时渲染器维持旧尺寸，而窗口已按新 DPI 改过：不拉回同一尺寸，
+/// BitBlt 只覆盖旧位图区域、边缘露出色键底色。
+fn rollback_window_to_bitmap(hwnd: HWND) {
+    renderer::with_renderer(|r| {
+        let (width, height) = r.bitmap_size();
+        resize_embedded_window(hwnd, width, height);
+    });
+}
+
 fn bind_display_and_timers(hwnd: HWND) -> bool {
     // 托盘为 best-effort：失败不阻断监测主功能，由 diag 留痕。
     if !create_tray_icon(hwnd) {
@@ -390,12 +401,8 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
         r.update_text_color();
     });
     if !dpi_ok {
-        // 与 WM_DPICHANGED 失败分支对称：渲染器维持旧尺寸，把窗口回滚到同一尺寸，
-        // 否则「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、露出色键底色。
-        renderer::with_renderer(|r| {
-            let (width, height) = r.bitmap_size();
-            resize_embedded_window(hwnd, width, height);
-        });
+        // 与 WM_DPICHANGED 失败分支对称，共用同一份回滚实现。
+        rollback_window_to_bitmap(hwnd);
     }
 
     unsafe {
@@ -541,15 +548,6 @@ fn finish_exit_from_watchdog(watchdog: HWND) {
     begin_exit();
 }
 
-/// 处理退出请求（`--quit` 投递，可能重复到达）。
-///
-/// 看门狗**直接执行**退出序列而不转发给主窗口（论证见 [`begin_exit`]）；重复请求
-/// 由那里的幂等门吞掉，本函数只保留看门狗侧「先撤销重建重试、再执行退出序列」的
-/// 收尾顺序。
-fn route_exit_request(watchdog: HWND) {
-    finish_exit_from_watchdog(watchdog);
-}
-
 /// 主题（浅色/深色）变更的共享处理：重算文字颜色并整幅重绘。
 ///
 /// 两个窗口过程共用：主窗口分支只在启动后、嵌入任务栏之前的窗口期可达
@@ -585,9 +583,10 @@ pub extern "system" fn watchdog_wnd_proc(
 
     match msg {
         // 退出请求（--quit 按 WATCHDOG_CLASS 检索到本窗口后投递）：主窗口嵌入
-        // 任务栏后检索不到，重建间隙更是完全不存在。
+        // 任务栏后检索不到，重建间隙更是完全不存在；请求可能重复到达，重复的
+        // 由 [`begin_exit`] 的幂等门吞掉。
         WM_USER_QUIT_REQUEST => {
-            route_exit_request(hwnd);
+            finish_exit_from_watchdog(hwnd);
             LRESULT(0)
         }
 
@@ -730,13 +729,9 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 // 避免跨屏拖动时连环弹窗。
                 let _ = embed_in_taskbar(hwnd);
             } else {
-                // 位图/字体创建失败：渲染器维持旧尺寸，须把窗口回滚到同一尺寸，
-                // 否则「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、
-                // 边缘露出色键底色；跨屏后的合身位置由下个成功周期自愈。
-                renderer::with_renderer(|r| {
-                    let (width, height) = r.bitmap_size();
-                    resize_embedded_window(hwnd, width, height);
-                });
+                // 位图/字体创建失败：须把窗口回滚到渲染器维持的旧尺寸；
+                // 跨屏后的合身位置由下个成功周期自愈。
+                rollback_window_to_bitmap(hwnd);
             }
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);

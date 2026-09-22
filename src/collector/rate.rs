@@ -165,6 +165,12 @@ mod tests {
         // 但此时它的数据应该已经被正确记入历史中
         assert!(history.contains_key(&100));
         assert_eq!(history.get(&100).unwrap().0, 5000);
+
+        // 空输入恒返回零值：network.rs 的断网判定只查 is_empty，蕴含依赖于此。
+        assert_eq!(
+            select_winner_interface(&HashMap::new(), &mut HashMap::new(), t0),
+            (0, 0)
+        );
     }
 
     #[test]

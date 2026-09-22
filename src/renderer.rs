@@ -15,12 +15,11 @@ use crate::config::{
     REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
-use crate::util::{
-    copy_wide_truncated, diag, dpi_scaled, log_event, push_wide, reg_read_dword, to_wide,
-};
+use crate::util::{copy_wide_truncated, diag, dpi_scaled, log_event, reg_read_dword, to_wide};
 
-/// 上行箭头「↑」的 NUL 结尾 UTF-16 常量；下行箭头仍走 `Self::wide` 复用 `buf`。
+/// 网速箭头「↑」「↓」的 NUL 结尾 UTF-16 常量：直接给码元，免去逐帧 `encode_utf16`。
 const ARROW_UP: [u16; 2] = [0x2191, 0];
+const ARROW_DOWN: [u16; 2] = [0x2193, 0];
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
@@ -296,12 +295,6 @@ impl Renderer {
         }
     }
 
-    fn wide<'a>(buf: &'a mut Vec<u16>, s: &str) -> &'a mut [u16] {
-        buf.clear();
-        push_wide(buf, s);
-        buf
-    }
-
     fn format_cpu_mem_wide<'a>(buf: &'a mut Vec<u16>, label: &str, value: u32) -> &'a mut [u16] {
         buf.clear();
         buf.extend(label.encode_utf16());
@@ -384,8 +377,8 @@ impl Renderer {
             right: arrow_right,
             bottom: self.height,
         };
-        let down_arrow = Self::wide(&mut self.buf, "\u{2193}");
-        draw_text(self.hdc_mem, down_arrow, &mut rc_down_arrow, DT_LEFT);
+        let mut down_arrow = ARROW_DOWN;
+        draw_text(self.hdc_mem, &mut down_arrow, &mut rc_down_arrow, DT_LEFT);
 
         let mut rc_down_val = RECT {
             left: arrow_right,
@@ -491,11 +484,6 @@ impl Renderer {
         self.width = width;
         self.height = height;
         self.layout = Layout::new(width, height);
-
-        // SAFETY: self.hdc_mem 有效。
-        unsafe {
-            let _ = SetBkMode(self.hdc_mem, TRANSPARENT);
-        }
 
         self.arrow_width = measure_arrow_width(self.hdc_mem);
         true
@@ -645,9 +633,13 @@ mod tests {
             "1.0 KB/s"
         );
         // KB→MB 由 KB 十分位闸门裁决：x >= 10240（即显示值将达 1024.0 KB/s）
-        // 落入 MB 分支重新舍入。1048575 B/s 的 KB 定点值恰为 10240，
-        // 是最后一条落入 MB 分支的输入——钉死该边界，改回「先判字节数」
-        // 或移动闸门阈值即红。
+        // 落入 MB 分支重新舍入。下面两条是闸门两侧最近的邻居：1048474 B/s 的
+        // 定点值恰为 10239（留在 KB 分支），1048575 B/s 的恰为 10240（落入 MB
+        // 分支）——上移或下移闸门、或改回「先判字节数」，必有一条变红。
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 102)),
+            "1023.9 KB/s"
+        );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 1)),
             "1.0 MB/s"
