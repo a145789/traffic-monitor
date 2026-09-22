@@ -1,6 +1,6 @@
 # Agent Note：收敛发布链路的版本号与产物名事实，并删除失实前提的二次构建
 
-Status: proposed
+Status: implemented
 
 ## 问题
 版本号这一个事实被存了两份、读它的解析器有四套且语义互不一致：存储点是 `Cargo.toml:3`（`version = "1.5.0"`）与 `installer.iss:3`（`AppVersion=1.5.0`）；解析器分别是 `scripts/release.ts:12` 的严格 semver 正则（配 `scripts/release.ts:38` 读 Cargo.toml 的 `^version\s*=\s*"(\d+\.\d+\.\d+)"`，拒绝 dev 后缀）、`scripts/release.ts:62` 读 iss 的 `^AppVersion=(.+)$`、`scripts/package.ts:11` 读 Cargo.toml 的宽松 `^version\s*=\s*"(.+)"`、以及 `.github/workflows/release.yml:34-35` 的 `grep+sed+cut` 两条 shell 解析。改写点同样成对：`scripts/release.ts:93-100` 发版时把两文件都改写为新版本，`scripts/package.ts:47-48` 与 `:66-72` dev 打包时改写并恢复两文件（外加 `Cargo.lock`）。产物名同病：`installer.iss:8`（`OutputBaseFilename=TrafficMonitor-Setup`，不含版本）与 `.github/workflows/release.yml:118-121` 的 rename 补偿步骤、`.github/workflows/release.yml:127` 与 `:201` 的两次拼接、`scripts/package.ts:62` 的提示串。另有一处建立在失实前提上的构建：`scripts/release.ts:106-108` 注释「Build release again to verify updated dependencies compile」，但其上一行 `scripts/release.ts:104` 的 `cargo update --workspace` 只把 workspace 自身版本同步进 Cargo.lock、不更新任何 registry 依赖，「更新后的依赖」并不存在；产物 `target/release/traffic-monitor.exe` 在发版流程中也没有下游（CI 在 `.github/workflows/release.yml:47` 全新构建并上传 `:201` 处的产物）。检索记录：内置 grep `AppVersion|OutputBaseFilename|Rename installer|TrafficMonitor-Setup|post-update|cargo update --workspace`（`scripts/*.ts`、`installer.iss`、`.github/workflows/*.yml`、`Cargo.toml`）命中 12 行，逐条见上；README 检索 `bun|release\.ts|package\.ts` 0 命中（README 非消费者）。
