@@ -13,7 +13,7 @@ description: 本地串行实施 docs/rfc/ 下的待办 RFC 笔记——顶层 ag
 
 编排者 = 当前**顶层** agent，也就是你。你不是实现者、不是审阅者。
 
-**你可以做**：只读 git 元数据命令（`status`/`diff --name-only`/`diff --cached --name-only`/`rev-parse`/`branch --list`/`merge-base`/`log`/`show --stat`）、`git write-tree`（只写一个悬空 tree 对象，不动 ref/索引/工作区）、`Test-Path`/`Get-Item`（mtime 与存在性断言）、派发 `subagent`、读写 `target/rfc-run/**`。
+**你可以做**：只读 git 元数据命令（`status`/`diff --name-only`/`diff --cached --name-only`/`rev-parse`/`branch --list`/`merge-base`/`log`/`show --stat`）、`git write-tree`（只写一个悬空 tree 对象，不动 ref/索引/工作区）、`Test-Path`/`Get-Item`（mtime 与存在性断言）、派发 `subagent`、读写 `.rfc-local-loop-temp/rfc-run/**`。
 
 **你绝对不做**：
 
@@ -25,7 +25,7 @@ description: 本地串行实施 docs/rfc/ 下的待办 RFC 笔记——顶层 ag
 
 **子 agent 只能一次一个**：同一时刻只允许一个 agent 在写工作区。串行是这套流程全部安全性的前提，不要为了快改成并行。
 
-**上下文预算**：每个子 agent 自己把长产物写进 `target/rfc-run/<runId>/`，最终回复只给 ≤10 行摘要 + 产物路径。你把 `w<N>.md` / 门禁日志当**路径**用，不要读进上下文；审阅方的 verdict JSON 因为已瘦身（不内嵌门禁输出）可以读。
+**上下文预算**：每个子 agent 自己把长产物写进 `.rfc-local-loop-temp/rfc-run/<runId>/`，最终回复只给 ≤10 行摘要 + 产物路径。你把 `w<N>.md` / 门禁日志当**路径**用，不要读进上下文；审阅方的 verdict JSON 因为已瘦身（不内嵌门禁输出）可以读。
 
 ## 1. 前置检查（建任何子 agent 之前，你亲自执行）
 
@@ -34,13 +34,13 @@ description: 本地串行实施 docs/rfc/ 下的待办 RFC 笔记——顶层 ag
 ```powershell
 git rev-parse --abbrev-ref HEAD          # 必须是 main
 git status --porcelain                   # 必须为空（含未跟踪文件）；非空即停，不 stash、不清理
-Test-Path target                          # 必须为 True（/target 已在 .gitignore，运行产物写这里永不脏工作区）
+Test-Path .rfc-local-loop-temp                          # 必须为 True（/.rfc-local-loop-temp 已在 .gitignore，运行产物写这里永不脏工作区）
 grep -rn "^Status: *proposed" docs/rfc/   # 只认 docs/rfc/<会话目录>/NN-*.md 的命中；0 条就如实报告「当前没有待办」，不要自己找活
 ```
 
 另外逐条核对：
 
-- **冻结清单**：把命中的笔记按 (会话目录名, `NN`) 升序定序，写进 `target/rfc-run/<runId>/state.md`。用户指定了子集或起始篇就用用户的。
+- **冻结清单**：把命中的笔记按 (会话目录名, `NN`) 升序定序，写进 `.rfc-local-loop-temp/rfc-run/<runId>/state.md`。用户指定了子集或起始篇就用用户的。
 - **分支不冲突**：每篇的目标分支名 `rfc/<NN>-<topic>` 用 `git branch --list <name>` 确认不存在（本仓库已有多条 `rfc/*` 分支，冲突是真实风险）。
 - **串篇检查**：该篇所属会话目录里若还有别的 `proposed`，一并进清单，不要跳着做。
 - **不检查 `origin/main`**：本流程只在本地推进，main 合法地领先于 origin/main，不要拿它当断言。
@@ -50,16 +50,16 @@ grep -rn "^Status: *proposed" docs/rfc/   # 只认 docs/rfc/<会话目录>/NN-*.
 
 ## 2. 每轮时间线
 
-| 步 | 执行者 | 动作 | 产物 |
-|:--|:--|:--|:--|
-| 1 | 你 | 机械断言（见第 4 节 A） | — |
-| 2 | 编写子 agent | 建分支 → 实施 → `cargo fmt` → 归档笔记 → 暂存 → 四条门禁 | `w<K>.md`、`w<K>-gate-*.log`、`w<K>-index.txt` |
-| 3 | 你 | 交接断言（见第 4 节 B）；不通过就把日志路径退回第 2 步重跑 | 指纹 |
-| 4 | 审阅子 agent | 只读验收：diff × 笔记 × AGENTS.md × 门禁日志 | `r<K>.json` |
-| 5 | 你 | 判定（见第 6 节）。`lgtm` → 第 6 步；`changes_requested` 且有 blocker → 第 2' 步；无 blocker → 按 lgtm；`blocked` → 弃轮协议 | — |
-| 2' | 编写子 agent（全新实例） | 修订：接受或反驳，重跑门禁，重新暂存 | `w2.md`、`w2-gate-*.log` |
-| 6 | 审阅子 agent（同模型，独立一次调用） | 收尾：提交 → 守卫 → `checkout main` → `rebase <branch>` → 删分支 | 提交 SHA |
-| 7 | 你 | 更新 `state.md`，进入下一篇 | — |
+| 步  | 执行者                               | 动作                                                                                                                         | 产物                                           |
+| :-- | :----------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------- |
+| 1   | 你                                   | 机械断言（见第 4 节 A）                                                                                                      | —                                              |
+| 2   | 编写子 agent                         | 建分支 → 实施 → `cargo fmt` → 归档笔记 → 暂存 → 四条门禁                                                                     | `w<K>.md`、`w<K>-gate-*.log`、`w<K>-index.txt` |
+| 3   | 你                                   | 交接断言（见第 4 节 B）；不通过就把日志路径退回第 2 步重跑                                                                   | 指纹                                           |
+| 4   | 审阅子 agent                         | 只读验收：diff × 笔记 × AGENTS.md × 门禁日志                                                                                 | `r<K>.json`                                    |
+| 5   | 你                                   | 判定（见第 6 节）。`lgtm` → 第 6 步；`changes_requested` 且有 blocker → 第 2' 步；无 blocker → 按 lgtm；`blocked` → 弃轮协议 | —                                              |
+| 2'  | 编写子 agent（全新实例）             | 修订：接受或反驳，重跑门禁，重新暂存                                                                                         | `w2.md`、`w2-gate-*.log`                       |
+| 6   | 审阅子 agent（同模型，独立一次调用） | 收尾：提交 → 守卫 → `checkout main` → `rebase <branch>` → 删分支                                                             | 提交 SHA                                       |
+| 7   | 你                                   | 更新 `state.md`，进入下一篇                                                                                                  | —                                              |
 
 最多 **3 轮**审阅（即最多 `w1/r1/w2/r2/w3/r3`）。修订轮一律派**全新** `subagent`，不 fork：上一轮的全部产物靠磁盘路径传递。
 
@@ -75,7 +75,7 @@ cargo build --release --locked
 ```
 
 - `cargo fmt`（**就地格式化，不是门禁**）是修复动作，必须在暂存之前跑；验证项永远是 `cargo fmt -- --check`。反过来做的后果是验证自己改文件，把索引和工作区打散。
-- 每条命令用 `Tee-Object` 把输出落盘：`target/rfc-run/<runId>/<NN>/w<K>-gate-<cmd>.log`。**门禁正文不进任何 LLM 的汇报文本**——审阅方读文件的原始字节，不读另一个模型的转述。这是"命令真的绿了"唯一可信的来源。
+- 每条命令用 `Tee-Object` 把输出落盘：`.rfc-local-loop-temp/rfc-run/<runId>/<NN>/w<K>-gate-<cmd>.log`。**门禁正文不进任何 LLM 的汇报文本**——审阅方读文件的原始字节，不读另一个模型的转述。这是"命令真的绿了"唯一可信的来源。
 - 改了 `Cargo.toml` 必须把 `Cargo.lock` 一并暂存。
 - 门禁失败**改代码**，不许 `#[allow]`、不许注释断言、不许删测试变绿。删测试仅在笔记明确要求时允许，且要点名哪条性质由哪条更强的用例接管。
 
@@ -128,21 +128,21 @@ AGENTS.md 已在你的上下文里；若不在（少数 harness 不注入），�
 
 占位符映射（`{{NN}}` 是笔记序号，`{{K}}` 是当前修订轮，`{{GATE_PREFIX}}` 为 `w1`/`w2`/`w3`）：
 
-| 占位符 | 值 |
-|:--|:--|
-| `{{RUN_ID}}` | `target/rfc-run/` 下的本次运行目录名 |
-| `{{NN}}` | 笔记文件名的两位序号 |
-| `{{RFC_PATH}}` | `docs/rfc/{{RFC_DIR_NAME}}/{{NN}}-<topic>.md` |
-| `{{RFC_DIR_NAME}}` | 会话目录名（如 `2026-09-19-code-quality`） |
-| `{{NOTE_DST}}` | `docs/archive/rfc/{{RFC_DIR_NAME}}/{{NN}}-<topic>.md` |
-| `{{BRANCH}}` | `rfc/{{NN}}-<topic>` |
-| `{{BASE}}` | `target/rfc-run/{{RUN_ID}}/{{NN}}` |
-| `{{GATE_PREFIX}}` | 当前轮前缀 `w1` / `w2` / `w3` |
-| `{{GATE_LOG_DIR}}` | `{{BASE}}`（日志即 `{{GATE_PREFIX}}-gate-*.log`） |
-| `{{W_MD_PATH}}` | `{{BASE}}/{{GATE_PREFIX}}.md`（本轮作者报告） |
-| `{{W_INDEX_PATH}}` | `{{BASE}}/{{GATE_PREFIX}}-index.txt` |
-| `{{R_JSON_PATH}}` | `{{BASE}}/r{{K}}.json`（本轮审阅结论） |
-| `{{W_PREV_MD_PATH}}` / `{{R_PREV_JSON_PATH}}` | 上一轮的 `w<K-1>.md` / `r<K-1>.json` |
+| 占位符                                        | 值                                                    |
+| :-------------------------------------------- | :---------------------------------------------------- |
+| `{{RUN_ID}}`                                  | `.rfc-local-loop-temp/rfc-run/` 下的本次运行目录名    |
+| `{{NN}}`                                      | 笔记文件名的两位序号                                  |
+| `{{RFC_PATH}}`                                | `docs/rfc/{{RFC_DIR_NAME}}/{{NN}}-<topic>.md`         |
+| `{{RFC_DIR_NAME}}`                            | 会话目录名（如 `2026-09-19-code-quality`）            |
+| `{{NOTE_DST}}`                                | `docs/archive/rfc/{{RFC_DIR_NAME}}/{{NN}}-<topic>.md` |
+| `{{BRANCH}}`                                  | `rfc/{{NN}}-<topic>`                                  |
+| `{{BASE}}`                                    | `.rfc-local-loop-temp/rfc-run/{{RUN_ID}}/{{NN}}`      |
+| `{{GATE_PREFIX}}`                             | 当前轮前缀 `w1` / `w2` / `w3`                         |
+| `{{GATE_LOG_DIR}}`                            | `{{BASE}}`（日志即 `{{GATE_PREFIX}}-gate-*.log`）     |
+| `{{W_MD_PATH}}`                               | `{{BASE}}/{{GATE_PREFIX}}.md`（本轮作者报告）         |
+| `{{W_INDEX_PATH}}`                            | `{{BASE}}/{{GATE_PREFIX}}-index.txt`                  |
+| `{{R_JSON_PATH}}`                             | `{{BASE}}/r{{K}}.json`（本轮审阅结论）                |
+| `{{W_PREV_MD_PATH}}` / `{{R_PREV_JSON_PATH}}` | 上一轮的 `w<K-1>.md` / `r<K-1>.json`                  |
 
 ### 5.1 编写（首轮）
 
@@ -301,9 +301,9 @@ INDEX: <{{W_INDEX_PATH}}；变更文件数>
 
 ## 8. 中断、超限与恢复
 
-- **状态落盘**：每次阶段切换往 `target/rfc-run/<runId>/state.md` 追加一行：时间戳、篇目、轮次、分支、指纹、verdict、未结 issue id。你的上下文被截断也不丢进度。
+- **状态落盘**：每次阶段切换往 `.rfc-local-loop-temp/rfc-run/<runId>/state.md` 追加一行：时间戳、篇目、轮次、分支、指纹、verdict、未结 issue id。你的上下文被截断也不丢进度。
 - **子 agent 超时或返回空**：不要盲目重派。先按 `state.md` + 磁盘产物判断该阶段是否已完成（产物在磁盘上，阶段完成与否不依赖它的回复），再决定补派哪一段。
-- **硬上限 3 轮**：超限不合并、不 reset，走 5.5 弃轮收尾，把 dispute 包（双方最后主张 + 门禁日志路径 + 你的判定依据）写进 `target/rfc-run/<runId>/<NN>/dispute.md`，继续下一篇。
+- **硬上限 3 轮**：超限不合并、不 reset，走 5.5 弃轮收尾，把 dispute 包（双方最后主张 + 门禁日志路径 + 你的判定依据）写进 `.rfc-local-loop-temp/rfc-run/<runId>/<NN>/dispute.md`，继续下一篇。
 - **恢复**：新会话里重新 grep 待办 → 重新冻结清单 → 从第一篇未归档的开始。已合并的篇目已进 main，天然不会重做。
 
 ## 9. 收尾交付清单
@@ -311,6 +311,6 @@ INDEX: <{{W_INDEX_PATH}}；变更文件数>
 全部待办处理完后，一次性报告（不要复述 diff 或日志正文）：
 
 | 篇目 | 结果 | 轮次 | 提交 SHA | 备注 |
-|:--|:--|:--|:--|:--|
+| :--- | :--- | :--- | :------- | :--- |
 
 另附：**未完成/被弃轮的篇目**及其分支名、**累计 nit 清单**、**环境级失败**（若有）、`docs/rfc/<会话目录>/` 下残留的非笔记文件、`state.md` 与 dispute 包路径。诚实标注哪些验收标准是实测通过、哪些只是静态核对。
