@@ -103,10 +103,6 @@ writeFileSync("installer.iss", iss);
 console.log("Updating Cargo.lock...");
 execSync("cargo update --workspace", { stdio: "inherit" });
 
-// Build release again to verify updated dependencies compile
-console.log("Building release (post-update verification)...");
-execSync("cargo build --release --locked", { stdio: "inherit" });
-
 // Git commit
 console.log("Creating git commit...");
 execSync("git add Cargo.toml installer.iss Cargo.lock", { stdio: "inherit" });

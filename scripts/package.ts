@@ -59,7 +59,7 @@ try {
   console.log("Compiling installer...");
   execSync(`& "${iscc}" installer.iss`, { stdio: "inherit", shell: "powershell" });
 
-  console.log(`\nDone! Installer: Output\\TrafficMonitor-Setup.exe`);
+  console.log(`\nDone! Installer: Output\\TrafficMonitor-Setup-${taggedVersion}.exe`);
   if (tag) console.log(`Version: ${taggedVersion}`);
 } finally {
   if (tag) {
