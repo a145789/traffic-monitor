@@ -115,11 +115,6 @@ jobs:
         run: |
           & "${{ steps.iscc.outputs.path }}" installer.iss
 
-      - name: Rename installer
-        shell: bash
-        run: |
-          mv Output/TrafficMonitor-Setup.exe Output/TrafficMonitor-Setup-${{ steps.version.outputs.VERSION }}.exe
-
       - name: Generate version.txt
         shell: bash
         run: |

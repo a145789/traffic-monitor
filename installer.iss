@@ -5,7 +5,10 @@ AppPublisher=Traffic Monitor
 AppMutex=TrafficMonitor_Mutex_Instance
 DefaultDirName={autopf}\Traffic Monitor
 DefaultGroupName=Traffic Monitor
-OutputBaseFilename=TrafficMonitor-Setup
+; 安装包名派生自本节 AppVersion（更新器按 TrafficMonitor-Setup-<version>.exe 拼下载地址）；
+; 只可用 {#SetupSetting("AppVersion")}——{#AppVersion} 不是 ISPP 变量、编译直接失败，
+; 且 SetupSetting 只读本行之上已解析的指令，故本行须留在 AppVersion 之后，倒序会静默产出 TrafficMonitor-Setup-.exe。
+OutputBaseFilename=TrafficMonitor-Setup-{#SetupSetting("AppVersion")}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
