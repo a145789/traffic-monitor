@@ -1,0 +1,21 @@
+# Agent Note：删除 network.rs 三处永不改变结果的判据与兜底
+
+Status: proposed
+
+## 问题
+`src/collector/network.rs` 有三处「存在但永不改变任何返回值或控制流」的判据。(a) `src/collector/network.rs:175` 的 `|| name_lower.contains("isatap")` 被同函数 `src/collector/network.rs:171` 的 `contains("tap")` 完全蕴含——字符串事实上 `"isatap"[3..6] == "tap"`，任何含 `isatap` 的名字必含 `tap`，前一行先命中，该行是死判据；而测试矩阵注释 `src/collector/network.rs:347` 声称「若删掉任一 contains 判据，对应样本即变红」，对这条判据不成立（删掉它全部断言仍绿），注释只好在 `src/collector/network.rs:349-350` 开一个「唯一例外是 isatap ⊃ tap 的子串蕴含」的口子。(b) 断网判定 `src/collector/network.rs:121` 的三合取中两个零速项被第三个蕴含：`select_winner_interface`（`src/collector/rate.rs:13-45`）对空 `current_data` 返回 `(0, 0)`（`src/collector/rate.rs:18-20` 零值初始化、循环空转、`:45` 原样返回），故 `current_data.is_empty()` 成立时前两项必为真，`A ∧ B ∧ C ≡ C`——「本周期无活动网口」这一事实被表示了两次（纯函数返回的零值、调用方的 emptiness 检查）。(c) `MibTable` 的空指针兜底不可达：`rows()` 的 `if self.0.is_null() { return &[]; }`（`src/collector/network.rs:40-42`）与 `Drop` 的 `if !self.0.is_null()` 包裹（`src/collector/network.rs:56`）所防的空指针，在唯一构造点 `src/collector/network.rs:84-88` 已被 `if result.0 != 0 || table.is_null() { return; }` 排除，结构私有、字段私有、无其他构造路径。检索记录：内置 grep `isatap`（全仓）命中 4 行（`src/collector/network.rs:175` 判据、`:349` 与 `:350` 例外注释各一行、`:361` 测试样本的标签），README 与 docs 0 命中；`is_null`（`src/collector/network.rs`）命中 `:40`、`:56`（本提案）、`:84`（构造点判空，保留）、`:187`、`:236`（FFI 输入防御，保留）；`MibTable(`（`src/`）命中 2 行（定义、构造各一）。
+
+## 提案
+(a) 删 `src/collector/network.rs:175` 一行，删 `src/collector/network.rs:349-350` 的例外注释两行；样本 `("Microsoft ISATAP Adapter", "isatap")`（`src/collector/network.rs:361`）保留，标注改为「经由 `tap` 命中」——删掉该判据后 `src/collector/network.rs:347` 的矩阵命题严格为真（每样本单命中其标注关键字）。净删 3-4 行。(b) `src/collector/network.rs:121` 改写为 `if current_data.is_empty()`。净删 0-1 行。(c)（评审裁定撤回，不删守卫）原提案删 `rows()` 的空指针早退（`src/collector/network.rs:40-42`）与 `Drop` 的 `is_null` 包裹（净删约 5 行）——但真正的增量（把不变量写成显式契约）零删除即可完成，删守卫是用注释换代码防御、风险不对称（未来新增构造路径时 `rows()` 直接对空指针解引用且编译器不拦）。故只在 `rows()` 的 SAFETY 注释补一句「构造点已保证非空（见 `collect_network`）」，两道 FFI 兜底原样保留。本笔记实施 (a)(b) 加该注释。
+
+## 明确不在本次范围
+`num_entries == 0` 的早退（`src/collector/network.rs:44-47`）不能删——它可达（合法的空表）且是 C 柔性数组切片化的长度闸门，与 (c) 的「不可达兜底」性质相反；`read_wide_string` 的 null 早退（`src/collector/network.rs:187`）与链表游标判空（`:236`）是 FFI 输入防御（`FriendlyName`/`Description` 可为 null、链表尾为 null），不可达性无从证明，不删；`src/ffi_guard.rs:10` 的 `MutexGuard::drop` 空句柄判断与 (c) 同形但绝不能顺手删——`MutexGuard` 是 pub 结构 + pub 字段（`src/ffi_guard.rs:6`），外部可构造出空句柄，不可达性证明不封闭；`is_valid_interface` 的 `PhysicalAddressLength == 0` 判据可达且承重；`is_valid_interface` 故意不查 `HardwareInterface` 标志位的注释块（Hyper-V/WSL2 语义）不动。
+
+## 为什么不保留？
+(a) 反方：显式列出 `isatap` 有自文档价值（点名覆盖的隧道协议），且未来若有人删掉 `tap` 判据会漏掉 ISATAP。回应：`src/collector/network.rs:361` 的 ISATAP 样本正是那个「未来误删」的守卫——删掉 `tap` 判据该样本即变红，守卫作用与死判据无关；自文档价值由样本行标注承担即可。(b) 反方：三合取是「断网 = 零速 ∧ 无接口」的语义文档，还防御 `select_winner_interface` 契约未来变化。回应：该语义的事实源头是纯函数契约（`src/collector/rate.rs:13` 的择大语义与零值初始化），文档应落在契约处而非调用点的冗余合取；「契约未来变化」是推测性通用性，且 `test_select_winner_interface_first_appearance` 已把「无历史返回 (0, 0)」钉为可执行事实。(c) 反方：裸指针 RAII 守卫的空指针防御是 FFI 惯用法，5 行收益对上「未来重构时消失的 UB 兜底」，风险不对称。回应：此处不可达性是封闭证明（私有结构 + 私有字段 + 唯一构造点判空），不是「调用方保证」式的一厢情愿；未来新增构造点时，防线应是「构造点判空」这一不变量本身（提案已把它写进 SAFETY 注释），而非每个方法里的兜底分支。这是三条中反方最强的一条：若评审认为 FFI 防御优先，可单独放弃 (c)，(a)(b) 独立成立。
+
+## 验收标准
+`grep -rn "isatap" src/` 0 命中；`grep -n "唯一例外" src/collector/network.rs` 0 命中且 `test_virtual_friendly_name_matrix` 的注释不再声称例外；`grep -n "is_null" src/collector/network.rs` 维持 5 处不动（(c) 撤回，`rows()` 与 `Drop` 的两道 FFI 兜底保留，仅 `rows()` 的 SAFETY 注释补一句不变量说明）；`grep -n "current_data.is_empty()" src/collector/network.rs` 的命中行不含 `best_speed_down == 0`；`cargo test --locked` 全绿，点名 `test_virtual_friendly_name_matrix`（ISATAP 样本经 `tap` 判据仍判真、三条真实物理网卡名仍判假）、`test_is_valid_interface_ethernet`/`_wifi`/`_unknown_type_rejected`/`_zero_mac_rejected`、`test_baseline_reset_first_sample_rebaselines_second_sample_diffs`、`test_blacklist_refresh_failure_keeps_old_list_and_resets_timer`；`cargo clippy --all-targets --locked -- -D warnings` 无任何警告。
+
+## 风险
+(c) 的真实残留：若未来 `MibTable` 新增构造路径且未判空，`rows()` 会拿空指针做 `from_raw_parts`（原兜底返回空切片、`Drop` 跳过 `FreeMibTable`），而 `FreeMibTable(null)` 是否安全未在本审计证伪——此点计入反对票，缓解是 SAFETY 注释写明不变量并在 review 时点名。(b) 的残留：若 `select_winner_interface` 契约改为「空输入返回非零」，断网退避会失效——证伪依据是 `test_select_winner_interface_first_appearance`；建议实施时在该测试补一行空输入断言 `select_winner_interface(&HashMap::new(), …) == (0, 0)`（净增 1 行）把蕴含关系钉成可执行事实。(a) 无残留：判定结果逐输入不变（`isatap` ⊃ `tap` 是字符串事实，不需要运行时验证）。
