@@ -15,7 +15,7 @@ use windows::core::{PCWSTR, w};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WATCHDOG_CLASS, WINDOW_CLASS, WINDOW_TITLE,
 };
-use crate::util::{AtomicHwnd, diag, dpi_scaled, module_instance};
+use crate::util::{AtomicHwnd, diag, dpi_scaled, log_event, module_instance};
 
 static TASKBAR_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 看门狗窗口句柄；`None` 表示尚未创建。
@@ -312,6 +312,7 @@ pub fn reembed_if_lost(hwnd: HWND) -> bool {
         Ok(()) => true,
         Err(e) => {
             diag!("周期重嵌入任务栏失败: {e}");
+            log_event!("周期重嵌入任务栏失败: {e}");
             false
         }
     }

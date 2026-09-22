@@ -19,10 +19,12 @@ use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GetLastError,
-    LPARAM, WPARAM,
+    CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
+    ERROR_SHARING_VIOLATION, GetLastError, LPARAM, WPARAM,
 };
-use windows::Win32::System::Threading::{CREATE_NO_WINDOW, MUTEX_ALL_ACCESS, OpenMutexW};
+use windows::Win32::System::Threading::{
+    CREATE_NO_WINDOW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+};
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
 };
@@ -40,8 +42,9 @@ use crate::config::{
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::{
-    compact_and_trim, configure_background_process, message_box, os_to_wide, reg_read_dword,
-    reg_read_string, reg_write_dword, reg_write_string, show_error, show_info, to_wide,
+    compact_and_trim, configure_background_process, log_event, message_box, os_to_wide,
+    refresh_debug_log_flag, reg_read_dword, reg_read_string, reg_write_dword, reg_write_string,
+    show_error, show_info, to_wide,
 };
 
 use crypto::compute_sha256_hex_locked;
@@ -524,6 +527,7 @@ fn fetch_verified_installer(
 pub fn subprocess_main(is_manual: bool) -> i32 {
     // EcoQoS/低内存优先级只加给本短生命周期子进程，不拖慢常驻监控主进程。
     configure_background_process();
+    refresh_debug_log_flag();
 
     let result = do_update_check(is_manual);
     let is_error = matches!(result, CheckResult::Error(_));
@@ -566,17 +570,23 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
             // 关键顺序：先发 EXIT_MAIN 让主进程退出让出 exe 映像，等单实例
             // 互斥量消失后再启动安装器；安装器的 taskkill 仅负责清理残存进程。
             emit_protocol_line("EXIT_MAIN");
+            log_event!("已发出 EXIT_MAIN，等待主进程退出");
             wait_main_instance_gone();
 
             match launch_installer(verified) {
-                InstallerLaunch::Started => UpdateAction::ExitMain,
+                InstallerLaunch::Started => {
+                    log_event!("安装器已启动");
+                    UpdateAction::ExitMain
+                }
                 InstallerLaunch::Cancelled => {
                     // 主进程已按约定退出（如 UAC 被取消），重新拉起应用，
                     // 避免任务栏小组件凭空消失。
+                    log_event!("安装器启动被取消，重新拉起主程序");
                     relaunch_main_app();
                     UpdateAction::ExitMain
                 }
                 InstallerLaunch::Failed(code) => {
+                    log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
                     show_error(&format!("启动安装程序失败 (错误码: {code})"));
                     relaunch_main_app();
                     UpdateAction::ExitMain
@@ -584,6 +594,7 @@ fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAc
             }
         }
         CheckResult::Error(message) => {
+            log_event!("更新检查失败: {message}");
             if is_manual {
                 show_error(&format!("检查更新失败: {message}"));
             }
@@ -603,17 +614,36 @@ fn emit_protocol_line(line: &str) {
 fn wait_main_instance_gone() -> bool {
     let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
     let deadline = Instant::now() + std::time::Duration::from_millis(MAIN_EXIT_WAIT_TIMEOUT_MS);
+    let mut logged_probe_error = false;
 
     loop {
         // SAFETY: name 以 NUL 结尾；句柄仅用于存在性探测，立即关闭。
-        match unsafe { OpenMutexW(MUTEX_ALL_ACCESS, false, PCWSTR(name.as_ptr())) } {
-            Err(_) => return true,
+        // 最小权限：SYNCHRONIZE 只够打开既有互斥量做存在性探测；
+        // 主进程提权运行时低完整性子进程只会拿到 ACCESS_DENIED 而非「已消失」。
+        match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+            Err(_) => {
+                // SAFETY: 紧接 OpenMutexW 失败读取 last-error，中间无其他 Win32 调用。
+                let last = unsafe { GetLastError() };
+                if last == ERROR_FILE_NOT_FOUND {
+                    return true;
+                }
+                // 其余错误（含 ACCESS_DENIED）保守按「互斥量仍存在」继续等待，
+                // 超时后交安装器 taskkill 兜底；只记首条，避免 50ms 轮询刷屏。
+                if !logged_probe_error {
+                    logged_probe_error = true;
+                    log_event!(
+                        "等待主进程退出: 互斥量仍存在或无权打开 (0x{:08X})，继续等待",
+                        last.0
+                    );
+                }
+            }
             Ok(handle) => unsafe {
                 let _ = CloseHandle(handle);
             },
         }
 
         if Instant::now() >= deadline {
+            log_event!("等待主进程退出超时，交安装器兜底");
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(MAIN_EXIT_POLL_INTERVAL_MS));
@@ -626,7 +656,10 @@ fn wait_main_instance_gone() -> bool {
 fn relaunch_main_app() {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
-        Err(_) => return,
+        Err(_) => {
+            log_event!("重新拉起主程序失败: 无法获取自身路径");
+            return;
+        }
     };
     let path_wide = os_to_wide(exe.as_os_str());
     let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
@@ -660,7 +693,10 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     };
     let exe = match std::env::current_exe() {
         Ok(path) => path,
-        Err(_) => return failed(),
+        Err(_) => {
+            log_event!("更新检查中止: 无法获取自身路径");
+            return failed();
+        }
     };
 
     let mut command = std::process::Command::new(exe);
@@ -676,7 +712,10 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return failed(),
+        Err(_) => {
+            log_event!("更新子进程启动失败");
+            return failed();
+        }
     };
 
     let outcome_scan = match child.stdout.take() {
@@ -701,6 +740,7 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     let exit_status = match child.wait() {
         Ok(status) => status,
         Err(_) => {
+            log_event!("等待更新子进程退出失败");
             return SubprocessOutcome {
                 is_error: true,
                 exit_signalled,
@@ -708,6 +748,10 @@ fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
             };
         }
     };
+
+    if exit_signalled && !exit_forwarded {
+        log_event!("EXIT_MAIN 已读到但未送达看门狗，主进程不会退出");
+    }
 
     SubprocessOutcome {
         is_error: read_failed || parsed_action.is_none() || !exit_status.success(),

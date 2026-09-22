@@ -59,7 +59,15 @@ jobs:
         run: |
           $url = "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe"
           $installer = "$env:TEMP\innosetup-7.1.0-x64.exe"
+          # 原料 pin：版本号 + SHA-256 双钉死；哈希不匹配即失败退出，不执行不可信安装包。
+          # 注意：下方产物侧 sha256sum（version.txt 生成）不算满足本条。
+          $expectedHash = "0362A383ED217D4C4239B5933866DD96D3EB2102737DA92F80F6057A4B40DF2F"
           Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          $actualHash = (Get-FileHash -Path $installer -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            Write-Error "Inno Setup 安装包哈希不匹配: 预期 $expectedHash, 实际 $actualHash"
+            exit 1
+          }
           Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/DIR="C:\Program Files\Inno Setup 7"' -Wait
 
       - name: Download Chinese language file
@@ -90,7 +98,8 @@ jobs:
           if (-not (Test-Path $langDir)) {
             New-Item -ItemType Directory -Force -Path $langDir
           }
-          $url = "https://raw.githubusercontent.com/kira-96/Inno-Setup-Chinese-Simplified-Translation/main/ChineseSimplified.isl"
+          # 语言文件 pin 到 40 位 commit SHA（非 main 分支）：上游更新需手动改 SHA 并同步评审。
+          $url = "https://raw.githubusercontent.com/kira-96/Inno-Setup-Chinese-Simplified-Translation/1ff90acc4ed4aee82b1cda43253243deee3daed4/ChineseSimplified.isl"
           Invoke-WebRequest -Uri $url -OutFile (Join-Path $langDir "ChineseSimplified.isl") -UseBasicParsing
 
       - name: Compile installer

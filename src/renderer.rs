@@ -14,7 +14,7 @@ use crate::config::{
     LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN, REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
-use crate::util::{diag, dpi_scaled, push_wide, reg_read_dword, to_wide};
+use crate::util::{diag, dpi_scaled, log_event, push_wide, reg_read_dword, to_wide};
 
 /// 上行箭头「↑」的 NUL 结尾 UTF-16 常量；下行箭头仍走 `Self::wide` 复用 `buf`。
 const ARROW_UP: [u16; 2] = [0x2191, 0];
@@ -36,9 +36,11 @@ pub fn set_renderer(renderer: Renderer) {
 /// release 构建为 `panic = "abort"`，`borrow_mut` 双重借用会直接中止进程。
 pub fn with_renderer(f: impl FnOnce(&mut Renderer)) {
     RENDERER.with(|r| {
-        if let Ok(mut borrowed) = r.try_borrow_mut()
-            && let Some(renderer) = borrowed.as_mut()
-        {
+        let Ok(mut borrowed) = r.try_borrow_mut() else {
+            log_event!("渲染器重入被跳过");
+            return;
+        };
+        if let Some(renderer) = borrowed.as_mut() {
             f(renderer);
         }
     });

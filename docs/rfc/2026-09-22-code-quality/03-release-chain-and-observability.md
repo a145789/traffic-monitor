@@ -4,7 +4,7 @@ Status: proposed
 
 ## 问题
 
-复核确认：更新链路的不可信输入侧（网络 + UAC 提权执行）防护是本仓最强的部分——锁定句柄重验、严格 metadata 解析、按实际读取字节计上限、代理回落与哈希校验配合都到位；短板在发布侧与现场诊断侧，共六处，其中第 4 项经复核判定**本轮不改**（理由见「明确不在本次范围」）。
+复核确认：更新链路的不可信输入侧（网络 + UAC 提权执行）防护是本仓最强的部分——锁定句柄重验、严格 metadata 解析、按实际读取字节计上限、代理回落与哈希校验配合都到位；短板在发布侧与现场诊断侧，共六处，其中第 1 项已裁定不做、第 4 项经复核判定**本轮不改**（理由见「明确不在本次范围」）。
 
 1. **无 Authenticode 签名。** 信任链 = GitHub Release + TLS。`version.txt`（含 SHA-256，由 `.github/workflows/release.yml:126-132` 生成）与安装包同源：哈希校验挡得住传输/镜像篡改（对 `src/update/mod.rs:60` 的 `ghproxy.cn` 代理回落必要且有效——代理拿不到 `version.txt`，伪造包过不了哈希），但挡不住发布源被攻陷后的同源投放，而下一步是 `ShellExecuteExW("runas")` 提权执行。
 2. **CI 原料未校验。** `.github/workflows/release.yml:60-63` 从 `jrsoftware/issrc` 下载安装包后直接执行（只有版本号 pin，无 SHA-256）；`.github/workflows/release.yml:93-94` 从第三方仓库 `kira-96/Inno-Setup-Chinese-Simplified-Translation` 的 `main` 分支裸拉 `ChineseSimplified.isl`，连 commit 都未 pin。两者都直接参与最终产物生产。
@@ -15,13 +15,12 @@ Status: proposed
 
 ## 提案
 
-本笔记的四项为**一次实施范围**（同一分支内可分组提交，PR 怎么切由实施阶段判断），另有 1 项是需先裁定的决策项：
+本笔记的四项为**一次实施范围**（同一分支内可分组提交，PR 怎么切由实施阶段判断）：
 
 1. **`SYNCHRONIZE` + 错误码分流**（小）：`src/update/mod.rs:606` 改 `SYNCHRONIZE`，只把「互斥量不存在」（`Err` 且 `GetLastError() == ERROR_FILE_NOT_FOUND`）判为已退出；其余错误（含 `ACCESS_DENIED`）按「仍存在」保守处理，继续等或走到超时。`installer.iss` 用 `CheckForMutexes`，无此问题、不改。
 2. **自启路径无损写**（小）：`src/util.rs` 增加写入宽字符串的注册表接口（或让 `reg_write_string` 接受 `OsStr`），`src/tray.rs:251-258` 改走 `os_to_wide`；读取侧（`src/tray.rs:247-249`）不变。
 3. **CI 原料 pin**（小）：`issrc` 安装包补 SHA-256 校验；`.isl` 二选一——pin 到含 40 位 commit SHA 的 raw URL（最小改动），或把该语言文件 vendored 进仓库（彻底消除对上游 `main` 的依赖，代价是上游更新需手动同步，且需先确认该文件的再分发许可）。
 4. **运行时日志开关**（中）：沿用既有 `src/config.rs:21` 的 `REG_PATH_APP` 加 `EnableDebugLog`（DWORD），日志写 `%LOCALAPPDATA%\Traffic Monitor\debug.log` 并环形截断；新增 `util::log_event!`（开关未开时只做一次 `Relaxed` 原子读即返回，release 开销与今天几乎等价），把现有静默点接上：`src/window.rs:308`（周期重嵌入失败）、`src/main.rs:372`（托盘创建失败）、`src/suspend.rs:47` 与 `:62` 的 `let _ = sync_monitoring_timers(...)`、`src/renderer.rs:37-45`（渲染器重入被跳过）、`src/update/mod.rs` 的协议与启动失败路径。`diag!` 保持不变、继续只服务开发期。
-5. **代码签名（决策项：实施前必须先裁定）**：安装包加 Authenticode 签名，并在启动安装器前插入一次 `WinVerifyTrust`——落点为 `VerifiedInstaller`（`src/update/mod.rs:251`）构造之后、`try_launch_installer`（`src/update/mod.rs:870`）之前，与该类型「不持锁就无法构造」的既有不变量同层。对个人项目这是持续现金成本（OV 证书年费），需用户裁定。**处理规则**：本笔记的实施范围 = 裁定后实际要做的项，不保留悬置项——裁定做则四项 + 签名一起实施；裁定不做则**先把本条从笔记中删除**（或单独立一篇决策笔记），再实施其余四项，使本笔记能随实施 PR 一次性归档。
 
 ## 明确不在本次范围
 
@@ -31,10 +30,11 @@ Status: proposed
 - **不把强杀条件收窄为「映像路径 = `{app}`」**（原报告 B4 不采纳）：这是**兜底路径**，收窄它的风险高于它要防的误杀。三条理由——`Win32_Process.ExecutablePath` 对跨会话/受保护进程可能为空，需再加保守分支；8.3 短路径（`C:\PROGRA~1\...`）与 `{app}` 长路径前缀会静默失配；把 `{app}` 嵌进 `cmd /C powershell -Command "..."` 的转义链更长，写错即「兜底静默失效 → 安装器弹文件占用」。而误杀的前提是用户机器上恰有一个同名 exe，概率极低。若确要做，先在同名 exe + 含 `--check-update` 参数的伪装场景实测后再议。
 - 更新检查的冷却/退避与常量关系断言不在这里，见 `01-abort-safety-and-invariants.md`。
 - 不做遥测：日志只落本地文件，不出网。
+- 不做 Authenticode 签名与安装前 `WinVerifyTrust`（原提案第 5 项，已裁定不做：个人项目、无签名证书是常态，且无用户明确要求；信任链维持 GitHub Release + TLS + 同源哈希校验）。
 
 ## 为什么不保留？
 
-反方其一：「签名成本高，个人项目不值得」——本项已降级为决策项而非实施项，写进笔记的目的是让它有明确落点与判据，其余四项与签名无关、不被它阻塞。反方其二：「日志开关与 AGENTS 的 release 零成本取向冲突」——冲突只在「每次判一次」与「事件发生才写」之间：用一次 `Relaxed` 原子读作门，未开启时不产生系统调用与分配；收益是把两类现场问题的诊断成本降一个量级，而更新链路与本地状态机之间的防御深度本就是倒三角，日志是同时补两侧的最低成本手段。反方其三：「CI pin 只是把信任从上游挪到仓库里的哈希常量，还得手动维护」——哈希常量一次写入、每次发布自动生效，改动只发生在升级 pinned 版本时；vendored `.isl` 更是 pin 到内容的极端形式，许可允许时应优先。
+反方其一：「日志开关与 AGENTS 的 release 零成本取向冲突」——冲突只在「每次判一次」与「事件发生才写」之间：用一次 `Relaxed` 原子读作门，未开启时不产生系统调用与分配；收益是把两类现场问题的诊断成本降一个量级，而更新链路与本地状态机之间的防御深度本就是倒三角，日志是同时补两侧的最低成本手段。反方其二：「CI pin 只是把信任从上游挪到仓库里的哈希常量，还得手动维护」——哈希常量一次写入、每次发布自动生效，改动只发生在升级 pinned 版本时；vendored `.isl` 更是 pin 到内容的极端形式，许可允许时应优先。
 
 ## 验收标准
 

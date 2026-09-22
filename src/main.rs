@@ -53,7 +53,8 @@ use crate::update::{
     subprocess_main,
 };
 use crate::util::{
-    AtomicHwnd, AtomicPowerNotify, diag, set_low_memory_priority, show_error, trim_working_set,
+    AtomicHwnd, AtomicPowerNotify, diag, log_event, refresh_debug_log_flag,
+    set_low_memory_priority, show_error, trim_working_set,
 };
 use crate::window::{
     create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_taskbar_cache,
@@ -243,6 +244,7 @@ fn main() {
 
     let auto_update = load_auto_update_enabled();
     ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Relaxed);
+    refresh_debug_log_flag();
 
     match Renderer::new() {
         Ok(r) => renderer::set_renderer(r),
@@ -374,6 +376,7 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
     // 托盘为 best-effort：失败不阻断监测主功能，由 diag 留痕。
     if !create_tray_icon(hwnd) {
         diag!("绑定显示与定时器: 托盘图标创建失败，本会话无图标");
+        log_event!("绑定显示与定时器: 托盘图标创建失败，本会话无图标");
     }
 
     let mut dpi_ok = true;

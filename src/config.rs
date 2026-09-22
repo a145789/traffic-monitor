@@ -22,6 +22,15 @@ pub const REG_PATH_APP: &str = "Software\\Traffic Monitor";
 pub const REG_PATH_RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 pub const REG_PATH_PERSONALIZE: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+/// 调试日志开关（DWORD：1=开，0/缺失=关，见 `util::log_event!`）。
+pub const REG_VALUE_DEBUG_LOG: &str = "EnableDebugLog";
+/// release 现场诊断日志位置：`%LOCALAPPDATA%\Traffic Monitor\debug.log`。
+pub const DEBUG_LOG_DIR_NAME: &str = "Traffic Monitor";
+pub const DEBUG_LOG_FILE_NAME: &str = "debug.log";
+/// 日志环形截断上限（字节）：超限时只保留尾部一半。
+pub const DEBUG_LOG_MAX_BYTES: u64 = 256 * 1024;
+/// 连续写失败达此次数即在进程内自动关开关（注册表值不动，重启后重载）。
+pub const DEBUG_LOG_DISABLE_AFTER_FAILURES: u32 = 3;
 
 pub const DISPLAY_WIDTH: i32 = 170;
 pub const DISPLAY_HEIGHT: i32 = 32;

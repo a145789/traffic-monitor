@@ -1,3 +1,5 @@
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
 use windows::Win32::System::Power::HPOWERNOTIFY;
@@ -13,7 +15,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 use windows_registry::CURRENT_USER;
 
-use crate::config::APP_TITLE;
+use crate::config::{
+    APP_TITLE, DEBUG_LOG_DIR_NAME, DEBUG_LOG_DISABLE_AFTER_FAILURES, DEBUG_LOG_FILE_NAME,
+    DEBUG_LOG_MAX_BYTES, REG_PATH_APP, REG_VALUE_DEBUG_LOG,
+};
 
 /// 业务字符串 → NUL 结尾 UTF-16。Win32 API 的标准入口。
 ///
@@ -257,6 +262,116 @@ macro_rules! diag {
 
 pub(crate) use diag;
 
+/// release 现场诊断日志开关的进程内缓存。
+///
+/// 唯一真值源是注册表 `REG_PATH_APP\EnableDebugLog`（DWORD）；本原子量是其
+/// 启动时快照：`refresh_debug_log_flag` 在主进程与更新子进程入口各加载一次。
+/// 写失败达阈值时复位为 false，使后续调用在 `log_event!` 门即返回、不再产生
+/// 系统调用；注册表值本身不动（瞬时故障不应抹掉用户设置），重启后按注册表重载。
+/// 读/写均为 Relaxed：单进程内开关轮询，无跨线程握手语义。
+static DEBUG_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 连续写失败计数；成功一次即清零。Relaxed（与开关同理）。
+static DEBUG_LOG_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// `log_event!` 的唯一门：开关关闭时仅一次 Relaxed 原子读即返回。
+pub fn debug_log_enabled() -> bool {
+    DEBUG_LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 从注册表重载调试日志开关并清零失败计数。启动入口调用一次；
+/// 运行中改注册表需重启生效（热路径不读注册表，开关关闭时零系统调用）。
+pub fn refresh_debug_log_flag() {
+    let on = reg_read_dword(REG_PATH_APP, REG_VALUE_DEBUG_LOG)
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    DEBUG_LOG_ENABLED.store(on, Ordering::Relaxed);
+    DEBUG_LOG_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// 调试日志落盘（`%LOCALAPPDATA%\Traffic Monitor\debug.log`，环形截断）。
+///
+/// 调用前必须已由 `log_event!` 门控；本函数不再重复读开关（热路径只付一次
+/// 原子读）。任何失败静默丢弃并计入连续失败，达阈值自动关开关：
+/// 不 panic、不弹框、不阻塞 UI 线程（单次追加写 + 偶发截断读，均有界）。
+pub fn write_debug_log(line: &str) {
+    if append_debug_log(&debug_log_path(), line).is_ok() {
+        DEBUG_LOG_CONSEC_FAILURES.store(0, Ordering::Relaxed);
+    } else {
+        let n = DEBUG_LOG_CONSEC_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures_should_disable(n) {
+            DEBUG_LOG_ENABLED.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 连续失败达阈值即停写（纯函数，阈值见 `DEBUG_LOG_DISABLE_AFTER_FAILURES`）。
+fn failures_should_disable(consec_failures: u32) -> bool {
+    consec_failures >= DEBUG_LOG_DISABLE_AFTER_FAILURES
+}
+
+/// 日志完整路径。`LOCALAPPDATA` 缺失时回退 temp（与安装包缓存同策略）；
+/// 含非 Unicode 字符时 `var_os` 无损直转，不经 `String` 中转。
+fn debug_log_path() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    debug_log_path_for_base(&base)
+}
+
+/// 纯拼接：`base\Traffic Monitor\debug.log`（单测钉死目录文件名）。
+fn debug_log_path_for_base(base: &std::path::Path) -> std::path::PathBuf {
+    base.join(DEBUG_LOG_DIR_NAME).join(DEBUG_LOG_FILE_NAME)
+}
+
+/// 单次追加写；超限时先保留尾部一半（环形截断）。失败由调用方计数。
+fn append_debug_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::metadata(path)
+        .map(|m| m.len() > DEBUG_LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        truncate_debug_log(path);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "[{now}] {line}")?;
+    Ok(())
+}
+
+/// 环形截断：只保留尾部一半；截断本身失败由本次追加写一并承担
+/// （追加大概率同样失败，调用方统一计数，不单独处理）。
+fn truncate_debug_log(path: &std::path::Path) {
+    let keep = (DEBUG_LOG_MAX_BYTES / 2) as usize;
+    if let Ok(content) = std::fs::read(path) {
+        let start = content.len().saturating_sub(keep);
+        let _ = std::fs::write(path, &content[start..]);
+    }
+}
+
+/// release 现场诊断埋点（写 `%LOCALAPPDATA%\Traffic Monitor\debug.log`）。
+///
+/// 与 `diag!` 分工：`diag!` 只服务开发期（release 空展开），本宏服务 release
+/// 现场（嵌入失败、更新卡住等只能靠用户转述的问题）。开关关闭时仅一次
+/// Relaxed 原子读即返回：`format!` 不求值，无系统调用、无分配。
+/// 开关开启且写失败时静默丢弃并计数，达阈值自动关开关（见 `write_debug_log`）。
+macro_rules! log_event {
+    ($($arg:tt)*) => {{
+        if $crate::util::debug_log_enabled() {
+            $crate::util::write_debug_log(&::std::format!($($arg)*));
+        }
+    }};
+}
+
+pub(crate) use log_event;
+
 pub fn reg_read_dword(subkey: &str, value_name: &str) -> Option<u32> {
     CURRENT_USER
         .open(subkey)
@@ -282,6 +397,24 @@ pub fn reg_write_string(subkey: &str, value_name: &str, value: &str) -> bool {
     CURRENT_USER
         .create(subkey)
         .and_then(|key| key.set_string(value_name, value))
+        .is_ok()
+}
+
+/// `OsStr` → REG_SZ 无损写入。自启项等路径值请走本函数：
+/// `reg_write_string` 的 `&str` 接口会把非 Unicode 路径堵死在
+/// `to_string_lossy()` 的替换字符上。
+///
+/// 与 `set_string` 同布局：`os_to_wide` 恒含尾 NUL，逐码元 reinterpret 为
+/// LE 字节流后按 `Type::String` 原样写入，不经 `String` 中转。
+pub fn reg_write_string_os(subkey: &str, value_name: &str, value: &std::ffi::OsStr) -> bool {
+    let wide = os_to_wide(value);
+    // SAFETY/内存布局：u16 LE 码元与 REG_SZ 字节流逐字节对应；`wide` 恒含尾
+    // NUL 从而非空，切片与 `wide` 同生死、不逃逸本函数。
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+    CURRENT_USER
+        .create(subkey)
+        .and_then(|key| key.set_bytes(value_name, windows_registry::Type::String, bytes))
         .is_ok()
 }
 
@@ -432,5 +565,67 @@ mod tests {
                 assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
             }
         }
+    }
+
+    #[test]
+    fn test_debug_log_path_layout() {
+        // 日志目录文件名钉死：改名即红，调用方不再各自拼接路径。
+        let p = debug_log_path_for_base(std::path::Path::new("C:\\Base"));
+        assert_eq!(
+            p,
+            std::path::Path::new("C:\\Base\\Traffic Monitor\\debug.log")
+        );
+    }
+
+    #[test]
+    fn test_debug_log_disable_threshold() {
+        use crate::config::DEBUG_LOG_DISABLE_AFTER_FAILURES;
+        // 未达阈值不断写（容忍瞬时故障），达阈值即停写、后续调用在宏门返回。
+        assert!(!failures_should_disable(0));
+        assert!(!failures_should_disable(
+            DEBUG_LOG_DISABLE_AFTER_FAILURES - 1
+        ));
+        assert!(failures_should_disable(DEBUG_LOG_DISABLE_AFTER_FAILURES));
+        assert!(failures_should_disable(
+            DEBUG_LOG_DISABLE_AFTER_FAILURES + 1
+        ));
+    }
+
+    #[test]
+    fn test_log_event_disabled_writes_nothing() {
+        // 开关默认关闭（本进程内无测试开启它）：log_event 只做一次原子读即返回，
+        // 不得产生任何文件操作。本用例零副作用：只读不断言存在性，前后内容一致即过。
+        assert!(!debug_log_enabled());
+        let path = debug_log_path();
+        let before = std::fs::read(&path).ok();
+        log_event!("disabled-noop-marker");
+        let after = std::fs::read(&path).ok();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_append_debug_log_ring_truncates() {
+        use crate::config::DEBUG_LOG_MAX_BYTES;
+        // 真实文件行为：小写追加留痕；超限后只保留尾部一半 + 本次行。
+        let dir = std::env::temp_dir().join(format!(
+            "traffic-monitor-debuglog-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("debug.log");
+
+        append_debug_log(&path, "hello").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("hello"));
+
+        let big = vec![b'x'; DEBUG_LOG_MAX_BYTES as usize + 100];
+        std::fs::write(&path, &big).unwrap();
+        append_debug_log(&path, "tail").unwrap();
+        let kept = std::fs::read(&path).unwrap();
+        assert!(kept.len() < big.len(), "超限文件必须被截断");
+        assert!(kept.ends_with(b"tail\n"), "截断后本次行必须保留");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

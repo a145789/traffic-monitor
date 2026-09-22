@@ -26,7 +26,7 @@ use crate::state::{
     CONSECUTIVE_ZERO_COUNT, MONITOR_FULLSCREEN, SUSPEND_REASON_MONITOR, SUSPEND_REASON_SESSION,
     SUSPEND_REASON_SYSTEM, SUSPEND_REASONS, SuspendReasons, reset_network_backoff,
 };
-use crate::util::{diag, trim_working_set};
+use crate::util::{diag, log_event, trim_working_set};
 use crate::window::get_taskbar_hwnd;
 
 pub fn is_suspended() -> bool {
@@ -44,7 +44,9 @@ fn force_repaint(hwnd: HWND) {
 pub fn suspend_system(hwnd: HWND, reason: u32) {
     let previous = SUSPEND_REASONS.suspend(reason);
     MONITOR_FULLSCREEN.store(false, Ordering::Release);
-    let _ = sync_monitoring_timers(hwnd);
+    if !sync_monitoring_timers(hwnd) {
+        log_event!("挂起时同步监测定时器失败");
+    }
     if previous == 0 {
         trim_working_set();
     }
@@ -59,7 +61,9 @@ pub fn resume_system(hwnd: HWND, reason: u32) {
     }
     // 恢复即复位网络退避：唤醒/解锁后立即回到快速采样节奏。
     reset_network_backoff();
-    let _ = sync_monitoring_timers(hwnd);
+    if !sync_monitoring_timers(hwnd) {
+        log_event!("恢复时同步监测定时器失败");
+    }
     force_repaint(hwnd);
 }
 

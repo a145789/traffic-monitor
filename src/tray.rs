@@ -22,7 +22,7 @@ use crate::config::{
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::{
-    diag, module_instance, reg_read_string, reg_remove_value, reg_write_string, to_wide,
+    diag, module_instance, reg_read_string, reg_remove_value, reg_write_string_os, to_wide,
 };
 
 thread_local! {
@@ -260,9 +260,12 @@ fn toggle_autostart() {
     if is_autostart_enabled() {
         reg_remove_value(REG_PATH_RUN, APP_NAME);
     } else if let Ok(exe_path) = std::env::current_exe() {
-        let path_str = exe_path.to_string_lossy().to_string();
-        let path_quoted = format!("\"{path_str}\"");
-        reg_write_string(REG_PATH_RUN, APP_NAME, &path_quoted);
+        // OsString 直拼引号：不经 String 中转，安装目录含非 Unicode
+        // 可解码字符时自启项无损；读取侧（is_autostart_enabled）只判存在性，不动。
+        let mut quoted = std::ffi::OsString::from("\"");
+        quoted.push(&exe_path);
+        quoted.push("\"");
+        reg_write_string_os(REG_PATH_RUN, APP_NAME, &quoted);
     }
 }
 
