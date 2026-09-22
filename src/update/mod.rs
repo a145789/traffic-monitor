@@ -27,7 +27,7 @@ use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONINFORMATION, MB_YESNO, PostMessageW, PostQuitMessage, SW_SHOWNORMAL,
+    IDYES, MB_ICONINFORMATION, MB_YESNO, PostMessageW, SW_SHOWNORMAL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -39,7 +39,6 @@ use crate::config::{
     WM_USER_UPDATE_ACTION,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
-use crate::tray::remove_tray_icon;
 use crate::util::{
     compact_and_trim, configure_background_process, message_box, os_to_wide, reg_read_dword,
     reg_read_string, reg_write_dword, reg_write_string, show_error, show_info, to_wide,
@@ -803,20 +802,15 @@ fn post_update_action_to_watchdog() -> bool {
     unsafe { PostMessageW(Some(hwnd), WM_USER_UPDATE_ACTION, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
-/// 执行更新交接的退出语义：复位进行中标志、清理托盘并结束消息循环。
+/// 执行更新交接的退出语义：复位进行中标志并进入退出序列。
 ///
 /// 仅由看门狗过程处理 `WM_USER_UPDATE_ACTION` 时调用；看门狗与主窗口同属 UI 消息
-/// 循环线程，因此线程前提（`PostQuitMessage` 面向当前线程）成立。
+/// 循环线程，因此线程前提（`PostQuitMessage` 面向当前线程）成立。本路径不触碰
+/// `EXIT_REQUESTED`，[`crate::begin_exit`] 的幂等门会正常放行。
 pub fn handle_update_action() {
     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
 
-    remove_tray_icon();
-    // SAFETY:
-    // 两个调用方都运行在 UI 消息循环所属线程上；PostQuitMessage 会向当前线程
-    // 队列投递 WM_QUIT。
-    unsafe {
-        PostQuitMessage(0);
-    }
+    crate::begin_exit();
 }
 
 fn show_yes_no(msg: &str) -> bool {

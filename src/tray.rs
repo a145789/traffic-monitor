@@ -34,6 +34,9 @@ thread_local! {
 pub fn create_tray_icon(hwnd: HWND) -> bool {
     let Ok(hinstance) = module_instance() else {
         diag!("创建托盘图标失败: 无法获取模块实例");
+        // 失败早退同样置空：返回 false 时 `TRAY_DATA` 必为空，不留旧句柄让
+        // 移除/重建路径误判图标仍在。
+        TRAY_DATA.with(|t| *t.borrow_mut() = None);
         return false;
     };
 
@@ -68,6 +71,8 @@ pub fn create_tray_icon(hwnd: HWND) -> bool {
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
     if !added {
         diag!("创建托盘图标失败: Shell_NotifyIconW(NIM_ADD) 未成功");
+        // 同上：失败早退保证 `TRAY_DATA` 为空。
+        TRAY_DATA.with(|t| *t.borrow_mut() = None);
         return false;
     }
 
@@ -88,12 +93,15 @@ pub fn create_tray_icon(hwnd: HWND) -> bool {
 
 pub fn remove_tray_icon() {
     TRAY_DATA.with(|t| {
-        if let Some(nid) = t.borrow().as_ref() {
+        let mut slot = t.borrow_mut();
+        if let Some(nid) = slot.as_ref() {
             // SAFETY: nid 来自 create_tray_icon，生命周期由 TRAY_DATA 管理。
             unsafe {
                 let _ = Shell_NotifyIconW(NIM_DELETE, nid);
             }
         }
+        // 删除后置空：`TRAY_DATA` 非空 ⟺ 图标存在，不再靠「重复 NIM_DELETE 无害」兜底。
+        *slot = None;
     });
 }
 

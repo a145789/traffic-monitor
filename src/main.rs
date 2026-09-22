@@ -254,6 +254,10 @@ fn main() {
 
     if !bind_display_and_timers(hwnd) {
         show_error("创建监测定时器失败");
+        // 启动失败早退同样要归还已建资源：否则任务栏会留下悬空托盘图标直到
+        // 进程退出，渲染器持有的 GDI 资源也不会提前归还。
+        remove_tray_icon();
+        renderer::take_renderer();
         return;
     }
 
@@ -498,14 +502,24 @@ fn disarm_rebuild_retry(watchdog: HWND) {
     }
 }
 
-/// 退出序列：清理托盘并结束消息循环。
+/// 退出序列：清理托盘并结束消息循环。全仓唯一的退出收尾实现。
 ///
-/// 主窗口过程的 `WM_CLOSE`（托盘菜单「退出」）与看门狗的退出请求共用这一份实现，
-/// 避免退出语义在两处漂移。
-fn begin_exit() {
+/// 幂等门收口在此：`EXIT_REQUESTED` 由 false 翻到 true 的那一次才执行。
+/// 主窗口过程的 `WM_CLOSE`（托盘菜单「退出」）、看门狗的退出请求与更新交接
+/// 三个入口共用这一份实现，「退出序列只执行一次」因此是代码事实而不是注释承诺，
+/// 退出语义也不会在多处漂移。
+///
+/// 看门狗**直接执行**退出序列而不转发给主窗口：转发只能确认「消息已入队」，无法
+/// 确认主窗口真的执行了——Explorer 崩溃会由 OS 级联销毁主窗口，队列里那条消息随之
+/// 消失。直接执行让幂等门恰好对应「退出序列已执行」这一不可逆事实，主窗口是否存在
+/// 都不影响退出，也就不存在「已置位却没退成、后续请求又被吞掉」的失效窗口。
+pub(crate) fn begin_exit() {
+    if !claim_exit_request(&EXIT_REQUESTED) {
+        return;
+    }
     remove_tray_icon();
-    // SAFETY: 两个调用方（主窗口过程、看门狗过程）都运行在 UI 消息循环所属线程上，
-    // PostQuitMessage 向该线程队列投递 WM_QUIT。
+    // SAFETY: 三个入口（主窗口过程、看门狗过程、更新交接）都运行在 UI 消息
+    // 循环所属线程上，PostQuitMessage 向该线程队列投递 WM_QUIT。
     unsafe {
         PostQuitMessage(0);
     }
@@ -521,14 +535,10 @@ fn finish_exit_from_watchdog(watchdog: HWND) {
 
 /// 处理退出请求（`--quit` 投递，可能重复到达）。
 ///
-/// 看门狗**直接执行**退出序列而不转发给主窗口：转发只能确认「消息已入队」，无法
-/// 确认主窗口真的执行了——Explorer 崩溃会由 OS 级联销毁主窗口，队列里那条消息随之
-/// 消失。直接执行让幂等门恰好对应「退出序列已执行」这一不可逆事实，主窗口是否存在
-/// 都不影响退出，也就不存在「已置位却没退成、后续请求又被吞掉」的失效窗口。
+/// 看门狗**直接执行**退出序列而不转发给主窗口（论证见 [`begin_exit`]）；重复请求
+/// 由那里的幂等门吞掉，本函数只保留看门狗侧「先撤销重建重试、再执行退出序列」的
+/// 收尾顺序。
 fn route_exit_request(watchdog: HWND) {
-    if !claim_exit_request(&EXIT_REQUESTED) {
-        return;
-    }
     finish_exit_from_watchdog(watchdog);
 }
 

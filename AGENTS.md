@@ -50,6 +50,8 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
    - **生产路径禁止 `unwrap`/`expect`**（测试与 mutex poison 除外）；失败用 `Result`/`Option` 或早退。
    - **`unsafe` 旁注只写不变量 / 失败歧义 / 内存布局**，禁止复述“句柄有效因为 OS 给了我们”。
    - **原子序约定**见 [src/state.rs](src/state.rs) 模块头与各字段注释（Relaxed 展示/开关；Acq/Rel 跨线程握手）。
+10. **跨消息/跨线程事实的单点真值源**
+   - **设计决策**：新增跨消息/跨线程事实时，必须指认唯一真值源并写明竞争处理（谁写、谁读、何时置位/清位、并发到达如何收敛）；同一事实禁止散落到多个可写位置。注释范式见 `EMBEDDED`、`EXIT_REQUESTED`、`UPDATE_IN_PROGRESS`。
 
 ---
 
