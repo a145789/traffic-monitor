@@ -5,12 +5,18 @@ inputs:
   cache-key:
     description: Swatinem/rust-cache 的 shared-key
     required: true
+  toolchain:
+    description: dtolnay/rust-toolchain 的 toolchain 参数（默认 stable；MSRV job 传 1.85）
+    required: false
+    default: stable
 
 runs:
   using: composite
   steps:
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
 
     - name: Cache Cargo
       uses: Swatinem/rust-cache@v2

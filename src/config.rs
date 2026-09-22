@@ -96,6 +96,11 @@ pub const UPDATE_WORKER_STACK_BYTES: usize = 64 * 1024;
 
 /// 子进程发出 EXIT_MAIN 后等待主进程退出（单实例互斥量消失）的总超时与轮询间隔。
 /// 超时后照常启动安装器，由安装器内 taskkill 兜底强杀。
+/// 同一对常量亦被 `--quit` 的 `quit_existing_instance`（`main.rs`）共用：两处都是
+/// “等主进程退净、上限 5 秒”，仅存在性探针不同（此处 `OpenMutexW` 互斥量消失，
+/// 对方 `FindWindowW` 看门狗窗口消失），原先两处轮询间隔（50ms/100ms）之差无原则含义，
+/// 故收口到同一对常量。
+/// `installer.iss` 的 `GracefulWaitTimeoutMs` 与此同量级，三处调整须同步。
 pub const MAIN_EXIT_WAIT_TIMEOUT_MS: u64 = 5000;
 pub const MAIN_EXIT_POLL_INTERVAL_MS: u64 = 50;
 
@@ -120,6 +125,20 @@ pub const COLOR_DARK_TEXT: u32 = 0x00282828;
 pub const COLOR_LIGHT_TEXT: u32 = 0x00FFFFFF;
 
 pub const FONT_BASE_SIZE: i32 = 13;
+/// GDI 逻辑字体面名（`LOGFONTW.lfFaceName` 来源，调用方经 `util::to_wide` 转宽串）。
+/// 字重与品质见 `FONT_WEIGHT_NORMAL`；品质具名常量（`NONANTIALIASED_QUALITY`）
+/// 由 `windows` crate 提供，避免裸数字构造该 newtype 时被改错位宽或取值。
+pub const FONT_FACE_NAME: &str = "Segoe UI";
+/// 常规字重 400（`LOGFONTW.lfWeight`）。
+pub const FONT_WEIGHT_NORMAL: i32 = 400;
+
+/// 托盘图标资源 ID（`MAKEINTRESOURCEW` 语义）：`assets/icon.ico` 经 `build.rs`
+///（`winresource::set_icon`）写入资源表的默认 ID。三处命名关联，改 ID 须同步。
+pub const TRAY_ICON_RESOURCE_ID: u16 = 1;
+
+/// 流式 SHA-256 分块读缓冲（字节）：吞吐调参，只影响单次 `read` 大小，
+/// 不改变哈希结果；调用方不得依赖该值做截断。
+pub const HASH_READ_BUF_BYTES: usize = 8 * 1024;
 
 pub const MENU_ID_AUTOSTART: u32 = 1001;
 pub const MENU_ID_EXIT: u32 = 1002;

@@ -49,7 +49,9 @@ Flags: nowait postinstall
 // 依次调用 RequestGracefulExit、WaitForSingleInstanceGone，
 // 仅当等待超时才调用 ForceKillRemnant。
 const
-  // 优雅退出等待上限（毫秒），与 src/config.rs 的 MAIN_EXIT_WAIT_TIMEOUT_MS 同量级。
+  // 优雅退出等待上限（毫秒）：与 src/config.rs 的 MAIN_EXIT_WAIT_TIMEOUT_MS 同值同源语义，
+  // 两处 Rust 等待（main.rs 的 quit_existing_instance、update 的 wait_main_instance_gone）
+  // 均以此为上限，超时后由下方 ForceKillRemnant / 安装器内 taskkill 兜底。
   GracefulWaitTimeoutMs = 5000;
   // 兜底强杀的最大轮次；每轮重新枚举残留进程并复查单例互斥量。
   ForceKillMaxAttempts = 3;

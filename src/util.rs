@@ -39,6 +39,19 @@ pub fn push_wide(buf: &mut Vec<u16>, s: &str) {
     buf.push(0);
 }
 
+/// 定长宽字符缓冲截断拷贝：`src`（含尾 NUL 的 `to_wide` 产出）截断装入 `dst`
+/// 并保证尾 NUL。托盘 `szTip` 与字体 `lfFaceName` 共用同一份实现。
+///
+/// 空 `dst` 直接返回；其余情况下必写 `dst[len-1] = 0`，调用方无需再补 NUL。
+pub fn copy_wide_truncated(dst: &mut [u16], src: &[u16]) {
+    if dst.is_empty() {
+        return;
+    }
+    let copy_len = (src.len() + 1).min(dst.len()) - 1;
+    dst[..copy_len].copy_from_slice(&src[..copy_len]);
+    dst[copy_len] = 0;
+}
+
 /// `OsStr` → NUL 结尾 UTF-16。Windows 上 `OsStr` 可无损转宽字符，
 /// 不经 `String` 中转：含非 Unicode 可解码字符的路径不再被替换成 U+FFFD。
 /// 常规路径输出与 `to_wide(&s.to_string_lossy())` 逐字节一致。
@@ -509,6 +522,23 @@ mod tests {
         push_wide(&mut buf, "B");
         // "A\0" + "B\0"
         assert_eq!(buf, vec![b'A' as u16, 0, b'B' as u16, 0]);
+    }
+
+    #[test]
+    fn test_copy_wide_truncated_fits_and_truncates() {
+        // 恰好装下：整体搬入（含尾 NUL）并补一位 NUL。
+        let mut dst = [0xFFFFu16; 4];
+        copy_wide_truncated(&mut dst, &to_wide("ab"));
+        assert_eq!(dst, [b'a' as u16, b'b' as u16, 0, 0]);
+
+        // 装不下：截断并保证尾 NUL，调用方无需再补。
+        let mut dst = [0xFFFFu16; 3];
+        copy_wide_truncated(&mut dst, &to_wide("abcd"));
+        assert_eq!(dst, [b'a' as u16, b'b' as u16, 0]);
+
+        // 空目标：静默返回，不 panic。
+        let mut dst: [u16; 0] = [];
+        copy_wide_truncated(&mut dst, &to_wide("ab"));
     }
 
     #[test]

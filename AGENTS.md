@@ -30,8 +30,8 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
         **调换或遗漏步骤会导致分层透明失效或小组件被任务栏图标遮挡**。
 2. **构建优化与编译 OOM 规避**
    - **设计决策**：由于依赖了庞大的 `windows` crate，在开启 `panic="abort"` 且 `codegen-units=1` 时编译 release 会导致内存 OOM。必须在 [Cargo.toml](Cargo.toml) 中为 `[profile.release.package.windows]` 单独配置较大的 `codegen-units`（如 8）以降低编译峰值内存。
-3. **单物理网卡流量锁定**
-   - **设计决策**：[src/collector/network.rs](src/collector/network.rs) 中的网速采集**不累加**所有网卡流量。每个周期独立计算各个 LUID 的流量变化，并在排除了虚拟网卡（通过 `GetAdaptersAddresses` 黑名单关键字过滤）后，选取**当前流量最大的一张单一物理网卡**锁定并展示，规避虚拟机、VPN 或回环网卡的流量干扰。
+3. **单物理网卡流量选择（每周期独立择大）**
+   - **设计决策**：[src/collector/network.rs](src/collector/network.rs) 中的网速采集**不累加**所有网卡流量。每个周期独立计算各个 LUID 的流量变化，并在排除了虚拟网卡（通过 `GetAdaptersAddresses` 黑名单关键字过滤）后，选取**当前周期流量最大的一张单一物理网卡**展示：单卡速率、不跨周期粘滞、不累加多卡，规避虚拟机、VPN 或回环网卡的流量干扰。双网卡同时活跃时显示逐秒择大的一张卡，这是既有产品语义（加粘滞会引入切换延迟感，见 RFC 04 决策项 5，裁定为澄清措辞、不加粘滞）。
 4. **更新功能完整进程隔离与 DLL 延迟加载**
    - **设计决策**：为避免网络、加密、UI、输入法和 Shell 相关 DLL 常驻主进程，[build.rs](build.rs) 通过 `/DELAYLOAD` 延迟导入 `winhttp.dll` / `bcrypt.dll` / `bcryptprimitives.dll`；[src/update/mod.rs](src/update/mod.rs) 通过 re-exec 自身创建短生命周期子进程，由子进程完整执行 HTTP 下载、SHA-256 校验、更新弹窗、打开网页及提权启动安装器。子进程仅通过 stdout 单行协议（`DONE` / `EXIT_MAIN`）通知主进程继续运行或退出，其中 `EXIT_MAIN` 必须在子进程启动安装器**之前**发出，结束后由操作系统整体回收其 DLL 与内存。更新相关 `MessageBoxW` / `ShellExecuteW` / `ShellExecuteExW` 不得移回主进程。
    - **隐式约束**：`--check-update` 参数拦截**必须在 [src/main.rs](src/main.rs) 的单例 Mutex 锁之前**执行，否则子进程会被当作重复实例直接退出；手动检查必须额外传递 `--manual`，用于决定无更新或检查失败时是否提示。`EXIT_MAIN` 发出后，子进程必须轮询等待单实例互斥量消失（主进程完全退出）才允许 `ShellExecuteExW` 启动安装器，安装器内的 taskkill 仅是兜底而非主要退出机制；启动失败/UAC 取消时由子进程负责重新拉起主程序。主进程必须在首个窗口创建前调用 `ImmDisableIME(u32::MAX)`，且托盘菜单必须先以 `TPM_RETURNCMD` 取得命令、把前台权交还任务栏后再执行命令，否则更新弹窗关闭后的焦点回落会在主进程中初始化第三方 TSF/IME。`/DELAYLOAD` 配置不可从 build.rs 中删除，否则网络与加密 DLL 会回到标准导入表，进程隔离失去意义。

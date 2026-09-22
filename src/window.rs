@@ -352,6 +352,9 @@ pub fn update_taskbar_position(hwnd: HWND) -> bool {
 
     // 缓存只在移动成功后提交：SetWindowPos 瞬时失败（如 Explorer 重启竞态）时
     // 下个周期会重试，而不是因“矩形==缓存”被永久跳过。
+    // 刻意不让 embed_in_taskbar 提交本缓存：LAST_RECT 藏在函数体内，
+    // 跨函数读写须先提到模块作用域；嵌入成功后多一次 SetWindowPos 属无害冗余，
+    // 为它付结构成本不划算（见 RFC 04 明确不在本次范围）。
     let moved = unsafe {
         SetWindowPos(
             hwnd,

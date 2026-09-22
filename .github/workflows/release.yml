@@ -70,8 +70,10 @@ jobs:
           }
           Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/DIR="C:\Program Files\Inno Setup 7"' -Wait
 
-      - name: Download Chinese language file
-        if: steps.cache-is.outputs.cache-hit != 'true'
+      - name: Resolve ISCC path
+        # 唯一真值源：两段 ISCC 查找（语言文件目录定位、编译器调用）曾各写一份，
+        # 现收口到此一步，下游经 outputs 引用，不再各自枚举候选路径。
+        id: iscc
         run: |
           $candidatePaths = @(
             "C:\Program Files\Inno Setup 7",
@@ -91,9 +93,16 @@ jobs:
             }
           }
           if (-not $innoPath) {
-            Write-Error "Inno Setup not found!"
+            Write-Error "ISCC.exe not found!"
             exit 1
           }
+          "path=$innoPath\ISCC.exe" >> $env:GITHUB_OUTPUT
+          "dir=$innoPath" >> $env:GITHUB_OUTPUT
+
+      - name: Download Chinese language file
+        if: steps.cache-is.outputs.cache-hit != 'true'
+        run: |
+          $innoPath = "${{ steps.iscc.outputs.dir }}"
           $langDir = Join-Path $innoPath "Languages"
           if (-not (Test-Path $langDir)) {
             New-Item -ItemType Directory -Force -Path $langDir
@@ -104,28 +113,7 @@ jobs:
 
       - name: Compile installer
         run: |
-          $candidatePaths = @(
-            "C:\Program Files\Inno Setup 7",
-            "C:\Program Files (x86)\Inno Setup 7"
-          )
-          $iscc = ""
-          foreach ($path in $candidatePaths) {
-            if (Test-Path "$path\ISCC.exe") {
-              $iscc = "$path\ISCC.exe"
-              break
-            }
-          }
-          if (-not $iscc) {
-            $isccCmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-            if ($isccCmd) {
-              $iscc = $isccCmd.Source
-            }
-          }
-          if (-not $iscc) {
-            Write-Error "ISCC.exe not found!"
-            exit 1
-          }
-          & $iscc installer.iss
+          & "${{ steps.iscc.outputs.path }}" installer.iss
 
       - name: Rename installer
         shell: bash

@@ -9,6 +9,7 @@ use std::time::Instant;
 pub(super) type Sample = (u64, u64, Instant);
 
 /// 选择总流量（上行+下行）最大的单一网卡，更新历史并清理已离线 LUID。
+/// 每 tick 独立重新择大，无跨周期赢家粘滞、无多卡累加（见 AGENTS.md 第 3 条）。
 pub(super) fn select_winner_interface(
     current_data: &HashMap<u64, (u64, u64)>,
     history: &mut HashMap<u64, Sample>,

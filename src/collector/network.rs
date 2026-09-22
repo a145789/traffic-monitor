@@ -26,6 +26,7 @@ const IF_TYPE_IEEE80211: u32 = 71;
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
+    // 容量提示（非约束）：网卡数量级为个位数，超限时 HashMap 自动扩容。
     // 值 + 可选时间戳：空名单即合法初值，None 表示从未刷新。
     // 注：HashSet::new 需要运行时随机种子，无法放进 const 初始化块。
     static VIRTUAL_BLACKLIST: RefCell<(HashSet<u64>, Option<Instant>)> =

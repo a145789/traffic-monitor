@@ -4,17 +4,20 @@ use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreateSolidBrush,
     DRAW_TEXT_FORMAT, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DeleteObject, DrawTextW, FONT_QUALITY, FillRect, GetTextExtentPoint32W, GetWindowDC, HBITMAP,
-    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, ReleaseDC, SRCCOPY, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    DeleteObject, DrawTextW, FillRect, GetTextExtentPoint32W, GetWindowDC, HBITMAP, HBRUSH, HDC,
+    HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, NONANTIALIASED_QUALITY, ReleaseDC, SRCCOPY,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE,
-    LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN, REG_PATH_PERSONALIZE,
+    FONT_FACE_NAME, FONT_WEIGHT_NORMAL, LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN,
+    REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
-use crate::util::{diag, dpi_scaled, log_event, push_wide, reg_read_dword, to_wide};
+use crate::util::{
+    copy_wide_truncated, diag, dpi_scaled, log_event, push_wide, reg_read_dword, to_wide,
+};
 
 /// 上行箭头「↑」的 NUL 结尾 UTF-16 常量；下行箭头仍走 `Self::wide` 复用 `buf`。
 const ARROW_UP: [u16; 2] = [0x2191, 0];
@@ -280,6 +283,7 @@ impl Renderer {
             height: DISPLAY_HEIGHT,
             arrow_width,
             layout: Layout::new(DISPLAY_WIDTH, DISPLAY_HEIGHT),
+            // 容量提示（非约束）：格式化缓冲常规输出远小于此，超限时 Vec 自动扩容。
             buf: Vec::with_capacity(32),
         })
     }
@@ -582,15 +586,13 @@ fn measure_arrow_width(hdc: HDC) -> i32 {
 fn create_font(size: i32) -> HFONT {
     let mut lf = LOGFONTW {
         lfHeight: -size,
-        lfWeight: 400,
+        lfWeight: FONT_WEIGHT_NORMAL,
         // NONANTIALIASED_QUALITY：避免 Layered 窗口上 GDI 半透明粉红毛边。
-        lfQuality: FONT_QUALITY(3),
+        lfQuality: NONANTIALIASED_QUALITY,
         ..Default::default()
     };
-    let font_name = to_wide("Segoe UI");
-    let copy_len = (font_name.len() + 1).min(lf.lfFaceName.len()) - 1;
-    lf.lfFaceName[..copy_len].copy_from_slice(&font_name[..copy_len]);
-    lf.lfFaceName[copy_len] = 0;
+    let font_name = to_wide(FONT_FACE_NAME);
+    copy_wide_truncated(&mut lf.lfFaceName, &font_name);
     // SAFETY: lfFaceName 经上式截断后必含尾 NUL；返回的 HFONT 由调用方独占释放。
     unsafe { CreateFontIndirectW(&lf) }
 }

@@ -21,8 +21,8 @@ if (tag) {
 }
 
 function findISCC(): string | null {
+  // 仅查系统标准安装路径 + PATH（where 兜底）：个人机器路径禁止入库。
   const candidates = [
-    "D:\\soft\\Inno Setup 7\\ISCC.exe",
     "C:\\Program Files\\Inno Setup 7\\ISCC.exe",
     "C:\\Program Files (x86)\\Inno Setup 7\\ISCC.exe",
   ];

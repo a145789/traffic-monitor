@@ -17,12 +17,14 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::config::{
     APP_NAME, APP_TITLE, MENU_ID_AUTO_UPDATE_TOGGLE, MENU_ID_AUTOSTART,
-    MENU_ID_CHECK_UPDATE_MANUAL, MENU_ID_EXIT, REG_PATH_RUN, VERSION, WM_APP_TRAY,
+    MENU_ID_CHECK_UPDATE_MANUAL, MENU_ID_EXIT, REG_PATH_RUN, TRAY_ICON_RESOURCE_ID, VERSION,
+    WM_APP_TRAY,
 };
 use crate::ffi_guard::MenuGuard;
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::{
-    diag, module_instance, reg_read_string, reg_remove_value, reg_write_string_os, to_wide,
+    copy_wide_truncated, diag, module_instance, reg_read_string, reg_remove_value,
+    reg_write_string_os, to_wide,
 };
 
 thread_local! {
@@ -40,10 +42,10 @@ pub fn create_tray_icon(hwnd: HWND) -> bool {
         return false;
     };
 
-    // 1 as *const u16 对应 MAKEINTRESOURCEW(1)，资源 ID 1（assets/icon.ico）。
+    // TRAY_ICON_RESOURCE_ID 对应 MAKEINTRESOURCEW 语义（见 config 注释的命名关联）。
     #[allow(clippy::manual_dangling_ptr)]
     let hicon = unsafe {
-        LoadIconW(Some(hinstance), PCWSTR(1 as *const u16))
+        LoadIconW(Some(hinstance), PCWSTR(TRAY_ICON_RESOURCE_ID as *const u16))
             .or_else(|_| LoadIconW(None, IDI_APPLICATION))
             .unwrap_or_default()
     };
@@ -63,9 +65,8 @@ pub fn create_tray_icon(hwnd: HWND) -> bool {
     nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
 
     let tip = to_wide(APP_TITLE);
-    let copy_len = (tip.len() + 1).min(nid.szTip.len()) - 1;
-    nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
-    nid.szTip[copy_len] = 0;
+    // 定长截断语义见 util::copy_wide_truncated（与字体 lfFaceName 共用）。
+    copy_wide_truncated(&mut nid.szTip, &tip);
 
     // SAFETY: nid 完整初始化，同步调用期间存活。
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();

@@ -319,6 +319,9 @@ pub unsafe fn is_immersive_color_set(lparam: LPARAM) -> bool {
             return true;
         }
     }
+    // 类型系统要求的兜底，不是死代码：运行时 `expected` 恒以尾 NUL 结尾，
+    // 循环内必在 NUL 处返回而不可达；但编译器不认为 `for` 必然执行
+    // （迭代器可能为空），删掉本行直接编译失败（E0308）。
     true
 }
 

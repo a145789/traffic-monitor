@@ -35,11 +35,12 @@ use windows::core::{PCWSTR, w};
 
 use crate::collector::{collect_cpu, collect_memory, collect_network};
 use crate::config::{
-    LOWORD_MASK, RELAUNCHED_BY_UPDATE_ARG, TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM,
-    TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM, TIMER_ID_NETWORK, TIMER_ID_REBUILD_RETRY,
-    TIMER_INTERVAL_INIT_TRIM, TIMER_INTERVAL_REBUILD_RETRY_MAX, TIMER_INTERVAL_REBUILD_RETRY_MIN,
-    WATCHDOG_CLASS, WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED,
-    WM_USER_QUIT_REQUEST, WM_USER_UPDATE_ACTION,
+    LOWORD_MASK, MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS, RELAUNCHED_BY_UPDATE_ARG,
+    TIMER_ID_AUTO_UPDATE, TIMER_ID_CPU_MEM, TIMER_ID_FULLSCREEN, TIMER_ID_INIT_TRIM,
+    TIMER_ID_NETWORK, TIMER_ID_REBUILD_RETRY, TIMER_INTERVAL_INIT_TRIM,
+    TIMER_INTERVAL_REBUILD_RETRY_MAX, TIMER_INTERVAL_REBUILD_RETRY_MIN, WATCHDOG_CLASS,
+    WM_APP_TRAY, WM_USER_NETWORK_DISCONNECTED, WM_USER_NETWORK_RECONNECTED, WM_USER_QUIT_REQUEST,
+    WM_USER_UPDATE_ACTION,
 };
 use crate::renderer::Renderer;
 use crate::state::{ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, reset_network_backoff};
@@ -134,8 +135,12 @@ fn quit_existing_instance() {
         }
         // 轮询看门狗窗口消失即等价于进程退出：看门狗随进程结束而销毁，
         // 中途被替换的可能性不存在（它不参与重建）。
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        // 超时/轮询与子进程 `wait_main_instance_gone` 共用
+        // MAIN_EXIT_WAIT_TIMEOUT_MS / MAIN_EXIT_POLL_INTERVAL_MS：两处都是
+        // “等主进程退净、上限 5 秒”，仅存在性探针不同（此处看门狗窗口消失，
+        // 对方单实例互斥量消失）；`installer.iss` 的 GracefulWaitTimeoutMs 同量级。
+        for _ in 0..(MAIN_EXIT_WAIT_TIMEOUT_MS / MAIN_EXIT_POLL_INTERVAL_MS) {
+            std::thread::sleep(std::time::Duration::from_millis(MAIN_EXIT_POLL_INTERVAL_MS));
             let exist = unsafe { FindWindowW(class_pcw, PCWSTR(std::ptr::null())) };
             if exist.is_err() {
                 break;

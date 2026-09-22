@@ -4,6 +4,8 @@
 
 use windows::Win32::Security::Cryptography::*;
 
+use crate::config::HASH_READ_BUF_BYTES;
+
 struct BcryptHandles {
     h_hash: BCRYPT_HASH_HANDLE,
     h_alg: BCRYPT_ALG_HANDLE,
@@ -86,7 +88,7 @@ pub(super) fn compute_sha256_hex(data: &[u8]) -> Result<String, String> {
 /// 调用方负责累计字节上限；本函数只管喂数，不截断。
 pub(super) fn compute_sha256_hex_reader(reader: &mut impl std::io::Read) -> Result<String, String> {
     let hash = Sha256::new()?;
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; HASH_READ_BUF_BYTES];
     loop {
         let n = std::io::Read::read(reader, &mut buf)
             .map_err(|e| format!("读取待哈希文件失败: {e}"))?;
