@@ -1,6 +1,6 @@
 # Agent Note：发布链路硬化与 release 现场可诊断性
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -50,4 +50,3 @@ Status: proposed
 - 日志引入新失败面（磁盘满、路径权限、`LOCALAPPDATA` 缺失）：实现必须「写失败即静默丢弃并自动关开关」，不得 panic、不得阻塞 UI 线程（用原子量做失败计数与开关复位）。
 - `SYNCHRONIZE` 分流若写反（把 `ACCESS_DENIED` 判成已退出）会比现状更糟；必须有显式分支「`Err` 且非 `ERROR_FILE_NOT_FOUND` ⇒ 继续等待」，并在 PR 描述里说明该场景无法在 CI 复现（人工验证：管理员启动主程序 + 普通权限跑 `--check-update`）。
 - vendored `.isl` 需确认上游许可允许再分发；不允许则退回 pin commit 方案。
-
