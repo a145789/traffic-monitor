@@ -92,7 +92,13 @@ pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
 /// 版本文件抓取失败后的重试等待（毫秒）：防抖一次，避免抖动空转。
 pub const UPDATE_FETCH_RETRY_DELAY_MS: u64 = 500;
 /// 更新工作线程栈大小（字节）。
-pub const UPDATE_WORKER_STACK_BYTES: usize = 64 * 1024;
+///
+/// 该线程只做 `current_exe` + `Command::spawn` + 子进程 stdout 逐行扫描 + `wait`；
+/// WinHTTP/BCrypt/MessageBox 全在 re-exec 出的子进程主线程上（见 AGENTS.md 第 4 条），
+/// 不在本线程栈上。取 256KB 是因为 `Command::spawn` 的 CreateProcessW 路径在 64KB 下
+/// 余量过薄，而栈触顶是 STATUS_STACK_OVERFLOW 直接终结进程、无日志可查。
+/// 栈大小为**保留量**，Windows 按需提交页面，调大只占地址空间、不进工作集。
+pub const UPDATE_WORKER_STACK_BYTES: usize = 256 * 1024;
 
 /// 子进程发出 EXIT_MAIN 后等待主进程退出（单实例互斥量消失）的总超时与轮询间隔。
 /// 超时后照常启动安装器，由安装器内 taskkill 兜底强杀。
