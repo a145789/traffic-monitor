@@ -13,7 +13,7 @@ mod window;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Power::{
@@ -162,6 +162,10 @@ fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
             // SAFETY: 紧接 CreateMutexW 读取 last-error，避免被中间调用覆盖。
             let last_error = unsafe { GetLastError() };
             if last_error == ERROR_ALREADY_EXISTS {
+                // 重复实例：句柄不会交给 MutexGuard，须在此自行关闭，避免
+                // 「拿到句柄却不归还」这条与 RAII 归属相反的路径。
+                // SAFETY: handle 由紧邻的 CreateMutexW 成功返回，仅关闭一次。
+                let _ = unsafe { CloseHandle(handle) };
                 return None;
             }
             Some(crate::ffi_guard::MutexGuard(handle))
