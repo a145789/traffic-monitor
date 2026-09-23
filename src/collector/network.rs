@@ -7,6 +7,7 @@ use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HWND, LPARAM, WPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetIfTable2,
+    IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_WWANPP, IF_TYPE_WWANPP2,
     IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
@@ -20,8 +21,21 @@ use crate::config::{
 use crate::state::{CONSECUTIVE_ZERO_COUNT, NET_SPEED_DOWN, NET_SPEED_UP};
 use crate::util::diag;
 
-const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
-const IF_TYPE_IEEE80211: u32 = 71;
+/// 允许统计的接口类型。数值取自 windows crate 的 `IpHelper`，勿在本文件手写。
+///
+/// 除以太网/WiFi 外必须含蜂窝物理承载 `WWANPP`(243,GSM 系)/`WWANPP2`(244,CDMA 系)：
+/// 蜂窝上网设备（LTE/5G 模块）的流量由这两个类型的界面承载，漏放会让网速恒显示 0。
+/// 两者同为 NDIS 定义的物理承载类型，一并放行，不做「按设备代际挑单个类型」的取舍。
+///
+/// 刻意不含 `IF_TYPE_PPP`(23)：拨号/PPPoE 的 WAN Miniport 名字（如
+/// "WAN Miniport (PPPOE)"）含 "ppp" 子串，会先被 [`is_virtual_friendly_name`]
+/// 黑名单拦下，放行类型也无实际效果；该缺口需与黑名单策略一并决策。
+const SUPPORTED_IF_TYPES: [u32; 4] = [
+    IF_TYPE_ETHERNET_CSMACD,
+    IF_TYPE_IEEE80211,
+    IF_TYPE_WWANPP,
+    IF_TYPE_WWANPP2,
+];
 
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
@@ -144,9 +158,13 @@ fn post_to_main(hwnd: HWND, msg: u32) {
     }
 }
 
+/// 类型白名单 + MAC 非零两道判据；虚拟网卡黑名单由调用方随后叠加。
+///
+/// 两道过滤不可互相替代：黑名单是名字关键字启发式（见 [`is_virtual_friendly_name`]），
+/// 只认得已知虚拟设备名；类型白名单是显式的产品范围声明（仅统计实际承载流量的
+/// 物理接口类型），其增删须按类型逐个决策，不能靠名字兜底代替。
 fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
-    let if_type = row.Type;
-    if if_type != IF_TYPE_ETHERNET_CSMACD && if_type != IF_TYPE_IEEE80211 {
+    if !SUPPORTED_IF_TYPES.contains(&row.Type) {
         return false;
     }
 
@@ -316,6 +334,20 @@ mod tests {
             ..Default::default()
         };
         assert!(is_valid_interface(&row));
+    }
+
+    #[test]
+    fn test_is_valid_interface_wwan_accepted() {
+        // 用 crate 常量（而非本文件数组）作输入，删掉白名单里的 WWANPP 即变红：
+        // 蜂窝上网设备此前因白名单只放行 6/71 而恒显示 0 速率。
+        for if_type in [IF_TYPE_WWANPP, IF_TYPE_WWANPP2] {
+            let row = MIB_IF_ROW2 {
+                Type: if_type,
+                PhysicalAddressLength: 6,
+                ..Default::default()
+            };
+            assert!(is_valid_interface(&row), "IfType {if_type} 应被放行");
+        }
     }
 
     #[test]
