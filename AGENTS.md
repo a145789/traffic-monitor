@@ -76,7 +76,7 @@ cargo clippy --all-targets --locked -- -D warnings   # 验证 Clippy 无警告�
 cargo fmt                       # 格式化代码
 ```
 
-与 CI（`check.yml`）对齐：三条 cargo 命令都必须带 `--locked`，缺了会静默改写 `Cargo.lock` 而本地绿、CI 红；`cargo fmt` 是就地格式化，等价于 CI 的 `cargo fmt -- --check`。**改了 `Cargo.toml` 必须把 `Cargo.lock` 一并提交**。`rust-version` 钉在 1.89（MSRV，刻意滞后于 stable 的档位），CI 另有 msrv job 用 1.89 工具链跑 `cargo check --locked` 对账：禁止使用超过 MSRV 的语言特性（如 1.95 才稳定的 `cfg_select!`），除非同步升 `rust-version` 并让两个 job 都绿。提级口径：`Cargo.toml`、check.yml 的注释与缓存键与工具链参数、rust-setup action 的 input 描述、本句，六处文本同步改完再提。
+与 CI（`check.yml`）对齐：三条 cargo 命令都必须带 `--locked`，缺了会静默改写 `Cargo.lock` 而本地绿、CI 红；`cargo fmt` 是就地格式化，等价于 CI 的 `cargo fmt -- --check`。**改了 `Cargo.toml` 必须把 `Cargo.lock` 一并提交**。`rust-version` 钉在 1.95（MSRV，刻意滞后于 stable 的档位），CI 另有 msrv job 用 1.95 工具链跑 `cargo check --locked` 对账：禁止使用超过 MSRV 的语言特性（如 1.96 才稳定的 `assert_matches!`），除非同步升 `rust-version` 并让两个 job 都绿。提级口径：`Cargo.toml`、check.yml 的注释与缓存键与工具链参数、rust-setup action 的 input 描述、本句，六处文本同步改完再提。
 
 _注：`unsafe` 须遵守本文件第 9 节风格约束；完整历史 policy 在 `docs/archive/unsafe-code-policy.md`，**仅当用户要求时再读**。上述构建、Clippy 和格式化校验仅在修改了 Rust 相关的源码文件时才需要执行。CI（check.yml）使用 `dtolnay/rust-toolchain@stable` 即**最新 stable** 工具链，本地工具链落后时 clippy 可能通过而 CI 挂在新 lint 上；提交前若跨过 Rust 小版本，建议 `rustup update stable` 后复跑 clippy。_
 

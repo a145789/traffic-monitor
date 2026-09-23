@@ -34,7 +34,7 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
-  # MSRV 对账：Cargo.toml 声明 rust-version = "1.89"，此处用 1.89 工具链跑
+  # MSRV 对账：Cargo.toml 声明 rust-version = "1.95"，此处用 1.95 工具链跑
   # cargo check --locked，与最新 stable 并行。若红，在同一 PR 内决定
   # 「升 rust-version」还是「改代码」，不允许声明与 CI 静默脱节。
   msrv:
@@ -47,8 +47,8 @@ jobs:
 
       - uses: ./.github/actions/rust-setup
         with:
-          cache-key: msrv-1.89
-          toolchain: "1.89"
+          cache-key: msrv-1.95
+          toolchain: "1.95"
 
       - name: Check MSRV
         run: cargo check --locked
