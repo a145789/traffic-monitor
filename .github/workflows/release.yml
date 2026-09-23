@@ -129,7 +129,7 @@ jobs:
       #   - squash 合并的 PR（message 以 (#N) 结尾）-> PR 链接条目
       #   - merge commit -> 取标题行 -> PR 链接条目
       #   - 其余直接提交 -> commit 链接条目
-      #   - 过滤 release: 版本提交噪音
+      #   - 过滤 release/docs/ci/test/chore 噪音（含 `docs(rfc):` 这类带 scope 的写法）
       - name: Generate release notes
         shell: bash
         env:
@@ -148,10 +148,7 @@ jobs:
               --jq '.commits[]
                 | (.commit.message | split("\n")) as $lines
                 | $lines[0] as $subject
-                | select(($subject | startswith("release: ")) | not)
-                | select(($subject | startswith("docs: ")) | not)
-                | select(($subject | startswith("ci: ")) | not)
-                | select(($subject | startswith("test: ")) | not)
+                | select(($subject | test("^(release|docs|ci|test|chore)(\\([^)]*\\))?: ")) | not)
                 | (if ($subject | test("^Merge pull request #[0-9]+ ")) and (($lines | length) > 2)
                    then $lines[2] else $subject end) as $title
                 | select($title != "")

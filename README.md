@@ -40,6 +40,7 @@ Windows 任务栏系统监控小组件，实时显示 CPU、内存、网速信�
 - **自动更新**：启动时自动检查新版本，也可手动检查
 - **主题自适应**：自动跟随系统深色/浅色主题
 - **智能省电**：全屏应用、睡眠、锁屏、显示器关闭时自动暂停
+- **诊断日志**：默认关闭，出问题时可按下方说明手动开启，把现场故障写盘便于排查
 
 ## 使用说明
 
@@ -57,6 +58,20 @@ Windows 任务栏系统监控小组件，实时显示 CPU、内存、网速信�
 ### 命令行参数
 
 - `traffic-monitor.exe --quit`：退出已运行的实例
+
+### 诊断日志
+
+程序默认不写任何日志。遇到托盘图标消失、网速不刷新、更新卡住等问题需要排查时，可手动开启现场诊断日志（写入 `%LOCALAPPDATA%\Traffic Monitor\debug.log`）：
+
+```powershell
+# 开启
+reg add "HKCU\Software\Traffic Monitor" /v EnableDebugLog /t REG_DWORD /d 1 /f
+# 排查完关闭
+reg add "HKCU\Software\Traffic Monitor" /v EnableDebugLog /t REG_DWORD /d 0 /f
+```
+
+- 开关是当前用户注册表 DWORD 值（`1` 开，`0` 或缺失为关），**改完需重启程序生效**。
+- 日志超过 256 KB 时只保留尾部一半；连续 3 次写盘失败会自动停写（不改注册表值）。
 
 ### 智能省电
 
