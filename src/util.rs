@@ -351,11 +351,16 @@ fn append_debug_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // 先把整行格式化进 String，再单次 write_all 落盘：`writeln!` 会按格式串片段
+    // 拆成多次 WriteFile，与其它写者（UI 线程 / 更新工作线程 / 更新子进程，
+    // 同写 %LOCALAPPDATA% 下同一文件）并发时可能交错出半行。
+    // 单次写在 append 语义下不会被另一方的单次写切碎（跨进程仍可能整行插队）。
+    let record = format!("[{now}] {line}\n");
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(f, "[{now}] {line}")?;
+    f.write_all(record.as_bytes())?;
     Ok(())
 }
 
