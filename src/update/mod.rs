@@ -118,12 +118,11 @@ pub fn start_auto_check() {
 
     {
         let last = LAST_CHECK_TIME.lock().unwrap();
-        // let-chain 在 Rust 1.88 才稳定，本仓 MSRV 为 1.85。
-        if let Some(t) = *last {
-            if t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS {
-                UPDATE_IN_PROGRESS.store(false, Ordering::Release);
-                return;
-            }
+        if let Some(t) = *last
+            && t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS
+        {
+            UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+            return;
         }
     }
 

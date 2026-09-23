@@ -2,6 +2,8 @@
 
 Status: proposed
 
+> 实施补记（2026-09-23）：评审期间曾试过「MSRV 1.95 + windows-registry 0.6.1 → 0.100」一轮并整轮落地验证（编译、门禁、`package.ts dev`、CI 全绿；registry 0.100 对本仓仅有的 `CURRENT_USER` / `set_bytes` 两处用法逐字兼容），最终裁回本笔记原案——registry 换代对本仓消费面收益不足，主 crate `windows` 才是换代的大头而它尚未发布。期间核 sparse index 的取证保留：主 crate 0.100 截至 2026-09-23 仍未发布（semver 升序末行即 0.62.2，0.63 亦无），「明确不在本次范围」的主 crate 换代结论不变；若未来跟进，Dependabot 会以红 PR 形式提示。
+
 ## 问题
 
 `Cargo.toml:5` 声明 `rust-version = "1.85"`，但这份声明在本仓没有消费者：产物是安装包与绿色 exe（`README.md` 的下载段），不发 crates.io，README 也不承诺源码构建所需工具链；而 `AGENTS.md:79` 反而明文要求开发者与 CI 用最新 stable（「本地工具链落后时 clippy 可能通过而 CI 挂在新 lint 上；提交前若跨过 Rust 小版本，建议 `rustup update stable` 后复跑 clippy」）。数字与实际工作工具链脱节，有三个可观察后果。
