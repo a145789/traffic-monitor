@@ -1,6 +1,6 @@
 # Agent Note：把 MSRV 抬到 1.89，并同步 CI action 与依赖体检的自动化
 
-Status: proposed
+Status: implemented
 
 > 实施补记（2026-09-23）：评审期间曾试过「MSRV 1.95 + windows-registry 0.6.1 → 0.100」一轮并整轮落地验证（编译、门禁、`package.ts dev`、CI 全绿；registry 0.100 对本仓仅有的 `CURRENT_USER` / `set_bytes` 两处用法逐字兼容），最终裁回本笔记原案——registry 换代对本仓消费面收益不足，主 crate `windows` 才是换代的大头而它尚未发布。期间核 sparse index 的取证保留：主 crate 0.100 截至 2026-09-23 仍未发布（semver 升序末行即 0.62.2，0.63 亦无），「明确不在本次范围」的主 crate 换代结论不变；若未来跟进，Dependabot 会以红 PR 形式提示。
 

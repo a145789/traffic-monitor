@@ -1,6 +1,6 @@
 # Agent Note：为 let-chain 收尾，并把 1.88–1.89 能力对账的结论登记在案
 
-Status: proposed
+Status: implemented
 
 > 实施补记：01 号落地实测发现，`rust-version` 抬到 1.89 当天，stable clippy 的 `collapsible_if` 即对本笔记「问题」里的两处嵌套强制报错（该 lint 感知 MSRV，≥1.88 时解锁 let-chain 建议），01 号「门禁全绿」的验收无法在不动 `src/` 的前提下达成。故提案（1）的两处塌缩已随 01 号的 PR 落地——「风险二」的不合并建议让位于门禁硬约束；本笔记其余项（2）（3）仍待办，验收时（1）的三条 grep 直接对已落地代码核对。
 
