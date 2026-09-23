@@ -2,6 +2,8 @@
 
 Status: proposed
 
+> 实施补记：01 号落地实测发现，`rust-version` 抬到 1.89 当天，stable clippy 的 `collapsible_if` 即对本笔记「问题」里的两处嵌套强制报错（该 lint 感知 MSRV，≥1.88 时解锁 let-chain 建议），01 号「门禁全绿」的验收无法在不动 `src/` 的前提下达成。故提案（1）的两处塌缩已随 01 号的 PR 落地——「风险二」的不合并建议让位于门禁硬约束；本笔记其余项（2）（3）仍待办，验收时（1）的三条 grep 直接对已落地代码核对。
+
 ## 问题
 
 `src/main.rs:130` 与 `src/update/mod.rs:121` 两行注释把「为什么这里不写成 let-chain」写进了代码，唯一原因是 MSRV 1.85：`src/main.rs:131-132` 是 `if let Ok(h) = hwnd {` 套 `if !h.is_invalid() {`，`src/update/mod.rs:122-123` 是 `if let Some(t) = *last {` 套 `if t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS {`，两处外层 `if let` 都没有 else 分支（`src/update/mod.rs:124-126` 的 `return` 在内层块内）。同目录 `01-bump-msrv-1-89-and-ci.md` 一旦落地，这两行注释即成为假陈述——本仓正在清理的正是这类「与事实不符的注释」。
@@ -50,7 +52,7 @@ Status: proposed
 
 ## 验收标准
 
-`grep -rn 'let-chain' src/` 0 命中；`grep -n 'if let Ok(h) = hwnd && !h.is_invalid()' src/main.rs` 1 命中；`grep -n 'if let Some(t) = \*last && t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS' src/update/mod.rs` 1 命中。
+`grep -rn 'let-chain' src/` 0 命中；`src/main.rs` 的 `if let Ok(h) = hwnd$` 与 `&& !h.is_invalid()$` 各 1 命中，`src/update/mod.rs` 的 `if let Some(t) = \*last$` 与 `&& t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS$` 各 1 命中（rustfmt 将 let-chain 拆为多行，单行写法过不了 `cargo fmt -- --check`，验收按拆行后形态核对）。
 
 （2）采纳时：`grep -n '#\[allow' src/util.rs src/tray.rs` 0 命中，且 `grep -n '#\[expect' src/util.rs src/tray.rs` 2 命中；不采纳时不设验收项。
 
