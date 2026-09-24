@@ -1,6 +1,6 @@
 # Agent Note：让开发版如实说明「不参与升级安装」（收窄到只改文案 + 独立构建标记）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

@@ -1,6 +1,6 @@
 # Agent Note：把更新冷却改成「下次可检查时刻」，消除 Instant 下溢
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

@@ -1,6 +1,6 @@
 # Agent Note：加固发布工作流（draft 发布、去 clobber、tag 走 env、失败可恢复）
 
-Status: proposed
+Status: implemented
 
 本 note 只含**机械性**的发布面加固；README 的镜像披露拆到 10 篇（那是产品口径，需要所有者定稿，与 workflow 改动不是同一类工作）。
 
