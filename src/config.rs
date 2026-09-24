@@ -25,6 +25,15 @@ pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
 /// 是唯一能可靠接收 TaskbarCreated 广播并触发主窗口重建的常驻接收者。
 pub const WATCHDOG_CLASS: &str = "TrafficMonitorWatchdog\0";
 pub const MUTEX_NAME: &str = "TrafficMonitor_Mutex_Instance\0";
+/// 更新子进程专用互斥量名：同一会话内只允许一个 `--check-update` 子进程，
+/// 后来者输出 `BUSY` 协议行并静默退出。不带 `Global\` 前缀即会话级，与
+/// `MUTEX_NAME` 一致；跨会话并发的残留由缓存文件锁兜底（见 AGENTS.md 第 4 条）。
+pub const UPDATE_MUTEX_NAME: &str = "TrafficMonitor_Mutex_Update\0";
+/// 父身份绑定参数（父进程 PID 与其创建时刻 FILETIME 的十进制值）。
+/// 只传 PID 不足以承载：长时间开机的机器上 PID 必然被复用，子进程拿不到原始
+/// 创建时刻就无法判断 `OpenProcess` 打开的是不是自己的父进程。
+pub const PARENT_PID_ARG: &str = "--parent-pid";
+pub const PARENT_START_ARG: &str = "--parent-start";
 pub const REG_PATH_APP: &str = "Software\\Traffic Monitor";
 pub const REG_PATH_RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 pub const REG_PATH_PERSONALIZE: &str =

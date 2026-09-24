@@ -50,8 +50,8 @@ use crate::suspend::{
 };
 use crate::tray::{create_tray_icon, remove_tray_icon};
 use crate::update::{
-    defer_initial_auto_check, init_cleanup_temp, load_auto_update_enabled, start_auto_check,
-    subprocess_main,
+    acquire_update_mutex, defer_initial_auto_check, emit_protocol_line, init_cleanup_temp,
+    load_auto_update_enabled, start_auto_check, subprocess_main,
 };
 use crate::util::{
     AtomicHwnd, AtomicPowerNotify, diag, log_event, refresh_debug_log_flag,
@@ -80,7 +80,8 @@ thread_local! {
     static REBUILD_RETRY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// 启动参数一次性解析结果：`--quit` / `--check-update` / `--manual` / 更新拉起标记。
+/// 启动参数一次性解析结果：`--quit` / `--check-update` / `--manual` / 更新拉起标记
+/// / 父身份绑定参数（`--parent-pid` 后的 PID 与 `--parent-start` 后的 FILETIME）。
 ///
 /// 单一事实来源：`main()` 只扫描一次 `args_os`。优先级由 `main()` 开头的
 /// 检查顺序钉死（`--quit` 先于 `--check-update`），不再散落于多次线性扫描中。
@@ -90,15 +91,23 @@ struct CliArgs {
     check_update: bool,
     manual: bool,
     relaunched_by_update: bool,
+    /// 父进程 PID；值为 `Option`：缺失或非数字时保持 `None`，子进程据此退化为
+    /// 「无父可查」（恒视为父进程仍在），而不是按「父已退出」误杀手工调用。
+    parent_pid: Option<u32>,
+    /// 父进程创建时刻（`GetProcessTimes` 的 FILETIME）。只传 PID 不足以判定父身份：
+    /// 长时间开机的机器上 PID 会被复用，必须靠创建时刻复核。
+    parent_start: Option<u64>,
 }
 
 /// 一次遍历解析启动参数。`args_os` 不要求参数为合法 Unicode，
 /// 含非 UTF-8/非 UTF-16 可表示字符的无关参数只会被忽略，不再 panic。
-/// 比较为精确匹配：`--quit=1` 这类缀接形式判否，与旧 `==` 语义一致。
+/// 比较为精确匹配：`--quit=1` 这类缀接形式判否，与旧 `==` 语义一致；
+/// `--parent-pid` / `--parent-start` 取紧随其后的一个参数为值，值不合形状即当缺席。
 fn parse_cli_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliArgs {
     use std::ffi::OsStr;
     let mut cli = CliArgs::default();
-    for arg in args {
+    let mut args = args.into_iter().peekable();
+    while let Some(arg) = args.next() {
         let s = arg.as_os_str();
         if s == OsStr::new("--quit") {
             cli.quit = true;
@@ -108,9 +117,29 @@ fn parse_cli_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliArgs
             cli.manual = true;
         } else if s == OsStr::new(RELAUNCHED_BY_UPDATE_ARG) {
             cli.relaunched_by_update = true;
+        } else if s == OsStr::new(crate::config::PARENT_PID_ARG) {
+            cli.parent_pid = take_parent_value(&mut args);
+        } else if s == OsStr::new(crate::config::PARENT_START_ARG) {
+            cli.parent_start = take_parent_value(&mut args);
         }
     }
     cli
+}
+
+/// 取父身份参数紧随其后的十进制值。
+///
+/// 值不合形状（下一个参数本身是标志、非 UTF-8、或不是数字）一律按「参数缺席」处理，
+/// 子进程据此退化为「无父可查」而不是「父已退出」。标志形态的候选值**不消费**：
+/// 否则手打的 `--parent-pid --manual` 会把 `--manual` 吃掉，静默改变本次调用的语义。
+fn take_parent_value<T: std::str::FromStr>(
+    args: &mut std::iter::Peekable<impl Iterator<Item = std::ffi::OsString>>,
+) -> Option<T> {
+    match args.peek().and_then(|next| next.to_str()) {
+        Some(text) if !text.starts_with("--") => {}
+        _ => return None,
+    }
+    // 值已确认是 UTF-8 且非标志形态，消费掉再解析；解析失败说明参数确实无效。
+    args.next()?.to_str()?.parse().ok()
 }
 
 /// `--quit` 入口：把退出请求交给现存实例的看门狗窗口。
@@ -186,7 +215,26 @@ fn main() {
 
     // 必须在单例 Mutex 之前拦截 --check-update，否则子进程会被当作重复实例退出。
     if cli.check_update {
-        std::process::exit(subprocess_main(cli.manual));
+        // 调试日志开关要在第一处可能写日志的调用之前加载：互斥量创建失败只在这里留痕，
+        // 否则「更新总是 BUSY」在 debug.log 里查不到原因。subprocess_main 的既有步骤里
+        // 还会再加载一次，幂等，代价仅一次注册表读。
+        refresh_debug_log_flag();
+
+        // 跨进程更新互斥：同一会话内只允许一个更新子进程。位置同样必须在
+        // 单例 Mutex 之前——本路径刻意不持有单例锁，两者是不同作用域的锁。
+        // guard 须活到进程结束：它是「本进程是唯一更新者」的存活证明。
+        let Some(_update_mutex) = acquire_update_mutex() else {
+            // 另一处更新子进程仍在跑（或互斥量创建失败，见 acquire_update_mutex）：
+            // BUSY 是「有效动作但非成功完成」的协议行，父侧据此不把这次结果记成
+            // 一次成功检查（冷却不被推进到 1 小时），也刻意不向用户弹任何框。
+            let _ = emit_protocol_line("BUSY");
+            std::process::exit(0);
+        };
+        std::process::exit(subprocess_main(
+            cli.manual,
+            cli.parent_pid,
+            cli.parent_start,
+        ));
     }
 
     // guard 必须活到消息循环结束：它是单例互斥量的存活证明，提前 drop 会让
@@ -791,13 +839,15 @@ mod tests {
 
     #[test]
     fn cli_args_require_exact_match() {
-        // 缀接形式与旧 `==` 语义一致判否：精确匹配才算数。
+        // 缀接形式与旧 `==` 语义一致判否：精确匹配才算数（父身份参数连同其值一并判否）。
         let cli = parse_cli_args(
             [
                 "--quit=1",
                 "--check-update=1",
                 "--manual=1",
                 "--relaunched-by-update=1",
+                "--parent-pid=1",
+                "--parent-start=2",
             ]
             .into_iter()
             .map(std::ffi::OsString::from),
@@ -809,8 +859,65 @@ mod tests {
                 check_update: false,
                 manual: false,
                 relaunched_by_update: false,
+                parent_pid: None,
+                parent_start: None,
             }
         );
+    }
+
+    #[test]
+    fn cli_args_parse_parent_identity_pair() {
+        let cli = parse_cli_args(
+            [
+                "--check-update",
+                "--parent-pid",
+                "4242",
+                "--parent-start",
+                "133700000000000000",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        );
+        assert!(cli.check_update);
+        assert_eq!(cli.parent_pid, Some(4242));
+        assert_eq!(cli.parent_start, Some(133700000000000000));
+    }
+
+    #[test]
+    fn cli_args_degrade_when_parent_identity_is_incomplete_or_invalid() {
+        // 值缺失/非数字 ⇒ 保持 None（探针退化为「无父可查」），
+        // 绝不能把残缺参数当成「父已退出」：那会误杀手工 `--check-update --manual`。
+        let cli = parse_cli_args(
+            ["--parent-pid", "--parent-start", "abc", "--manual"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(cli.parent_pid, None);
+        assert_eq!(cli.parent_start, None);
+        assert!(cli.manual);
+
+        // 只有一个参数（另一半缺席）同样退化。
+        let cli = parse_cli_args(
+            ["--parent-start", "42"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(cli.parent_pid, None);
+        assert_eq!(cli.parent_start, Some(42));
+    }
+
+    #[test]
+    fn cli_args_do_not_swallow_a_following_flag_as_parent_value() {
+        // 残缺命令行（手打）：值位置的参数本身是标志时不得被吞掉，
+        // 否则 `--parent-pid --manual` 会静默把手动标记丢掉。
+        let cli = parse_cli_args(
+            ["--check-update", "--parent-pid", "--manual"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(cli.parent_pid, None, "标志形态的候选值必须按缺席处理");
+        assert!(cli.manual, "--manual 必须仍被解析为标志");
+        assert!(cli.check_update);
     }
 
     #[test]
