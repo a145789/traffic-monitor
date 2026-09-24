@@ -50,7 +50,18 @@ if (tag) {
 
 try {
   console.log("Building release...");
-  execSync("cargo build --release", { stdio: "inherit" });
+  // TRAFFIC_MONITOR_DEV_BUILD 是「开发版」判定的唯一来源（build.rs 注入 →
+  // src/config.rs 的 DEV_BUILD）：这一行不可删，删掉后 dev 包会在手动检查更新时
+  // 谎称「当前已是最新版本」。带 tag 的打包一律视为非发布构建，不带 tag 的常规
+  // 打包保持和 CI 一致：既注入标记，也要主动清掉外部环境里同名的变量，
+  // 否则 shell 里 export 过它的人会打出一个自称开发版的常规包。
+  const buildEnv = { ...process.env };
+  if (tag) {
+    buildEnv.TRAFFIC_MONITOR_DEV_BUILD = "1";
+  } else {
+    delete buildEnv.TRAFFIC_MONITOR_DEV_BUILD;
+  }
+  execSync("cargo build --release", { stdio: "inherit", env: buildEnv });
 
   if (!existsSync("Output")) {
     mkdirSync("Output");

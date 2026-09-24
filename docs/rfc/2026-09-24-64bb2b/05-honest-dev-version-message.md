@@ -40,7 +40,7 @@ Status: proposed
 ## 验收标准
 
 - `grep -rn "DEV_BUILD\|TRAFFIC_MONITOR_DEV_BUILD" src/ build.rs scripts/package.ts` 命中 ≥ 3 处（`build.rs` 注入、`src/config.rs` 常量、`scripts/package.ts` 传入）。
-- `grep -rn "开发版" src/update/mod.rs` 命中 1 处文案；`src/update/mod.rs:325-330` 的判定留在 `is_manual` 分支内（人工核对：自动检查路径不产生任何 `show_info`）。
+- `grep -rn "开发版" src/update/mod.rs` 命中 2 处：1 处是生产文案（`no_update_message` 返回的字面量），1 处是钉死该字面量的测试断言，两者必须逐字相同（**生产文案只有一处**；测试断言的那份是验收要求本身带来的，不构成第二处文案）；`src/update/mod.rs:325-330` 一带的判定留在 `is_manual` 分支内（人工核对：自动检查路径不产生任何 `show_info`）。
 - `grep -rn "is_dev_version" src/` 命中 0 处（旧口径的正则判定不得出现）。
 - 新增测试钉死 `no_update_message` 的四种组合：`(manual=true, dev=true)` ⇒ 开发版提示；`(manual=true, dev=false)` ⇒ 「已是最新」；`(manual=false, *)` ⇒ `None`（不提示）。
 - 既有拒绝矩阵测试（`src/update/version.rs:107-119`）保持不变并通过，证明没有放松远端 metadata 的严格解析。

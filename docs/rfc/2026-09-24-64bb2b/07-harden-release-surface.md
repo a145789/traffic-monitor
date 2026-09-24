@@ -22,7 +22,7 @@ Status: proposed
 
 ## 提案
 
-1. **Draft → 上传全部资产 → 校验 → Publish。** `release.yml:181-190` 的创建改为 `gh release create <tag> --draft --verify-tag --title ... --notes-file ...`（**不带** `--latest`）；`:191-195` 上传三个资产；新增一步校验：三个资产都存在、`sha256sum` 与 `version.txt` 内容一致、`version.txt` 首行等于 `Cargo.toml` 版本；最后 `gh release edit <tag> --draft=false --latest`。
+1. **Draft → 上传全部资产 → 校验 → Publish。** `release.yml:181-190` 的创建改为 `gh release create <tag> --draft --verify-tag --title ... --notes-file ...`（**不带** `--latest`）；`:191-195` 上传三个资产；新增一步校验：三个资产都存在、`sha256sum` 与 `version.txt` 内容一致、`version.txt` 首行等于 `Cargo.toml` 版本；最后分两步 publish：先 `gh release edit <tag> --draft=false`（gh 官方示例的发布 draft 用法），再 `gh release edit <tag> --latest`——**不要合并成一条** `--draft=false --latest`（理由见「风险」）。
 2. **默认路径去掉 `--clobber`，把「重建同一 tag」变成显式意图。** 新增 `workflow_dispatch` 输入（例如 `repair: true`）或在 workflow 里新增独立的 repair 入口，只有该入口才允许 `--clobber`；默认 `push tag` 路径下，同名资产已存在应当**失败**而不是静默覆盖。
 3. **失败恢复写清楚**（这是旧稿缺的一节）：某一轮失败会留下一个 draft + 部分资产。重跑时默认路径仍会因资产已存在而失败，因此实施时要加一步「按需清理」：读取 `gh release view <tag> --json assets`，只删除**本次将要重传的同名资产**（`gh release delete-asset <tag> <name> -y`）后重传，其余资产不动；这一步只在 `repair` 意图下执行，避免默认路径获得覆盖能力。
 4. **tag / 版本号全部经 `env:` 传入**，照抄 `release.yml:30-32` 的既有写法；`:121` 与 `:181-193` 的 `${{ }}` 内插一并清掉（`github.ref_name` 改由 `env: TAG: ${{ github.ref_name }}` 或既有的 `GITHUB_REF_NAME` 环境变量取得，后者连 `env:` 都不需要）。
@@ -47,7 +47,7 @@ Status: proposed
 
 ## 验收标准
 
-- `grep -n "gh release create" .github/workflows/release.yml` 命中行同时含 `--draft` 与 `--verify-tag`；`grep -n "release edit" .github/workflows/release.yml` 命中 1 处且含 `--draft=false` 与 `--latest`。
+- `grep -n "gh release create" .github/workflows/release.yml` 命中行同时含 `--draft` 与 `--verify-tag`；`grep -n "release edit" .github/workflows/release.yml` 命中 2 处：第 1 处含 `--draft=false`、第 2 处含 `--latest`（刻意拆两步，理由见「风险」；**不允许**改回同一条命令同时带两个标志）。
 - `grep -n "clobber" .github/workflows/release.yml` 命中 0 处，或仅出现在 `repair` 显式入口所覆盖的步骤内（人工核对：默认 push-tag 路径不带该参数）。
 - `grep -n '\${{ github.ref_name }}\|\${{ steps.version.outputs.VERSION }}' .github/workflows/release.yml` 只出现在 `env:` 段内，或已改用 `GITHUB_REF_NAME` 环境变量，`run:` 脚本体内 0 处。
 - 失败恢复可执行：人为让一次上传失败（例如临时把某个资产路径改错），确认留下的是 draft + 部分资产、`releases/latest/download/version.txt` 仍指向上一版本；再用 `repair` 入口重跑一次，确认能补齐三个资产并 publish。
@@ -57,6 +57,6 @@ Status: proposed
 ## 风险
 
 - Draft 流程会让「重跑修复资产」多一步手动 publish；若有人依赖「重推 tag 自动修复」，需要同步更新发布文档（`AGENTS.md` 的「安装包与发布」一节只描述了 `bun scripts/release.ts`，未描述 workflow 内部顺序，实施时确认是否要补一句）。
-- `gh` 版本的 `--draft`/`--verify-tag`/`release edit --draft=false --latest` 组合在 runner 上的实际行为需要实测（`ubuntu-latest`/`windows-latest` 预装的 `gh` 版本可能不同）；若 `release edit` 不接受同时设置这两个标志，退路是分两步：先 `--draft=false`，再 `--latest`。
+- `gh` 预装版本在 runner 上会漂移（`ubuntu-latest`/`windows-latest` 各自不同），所以 publish 只使用最保守的形状：**发布 draft 一条 `--draft=false`（gh 官方示例的用法），成为 latest 另一条 `--latest`**。不合并成一条 `--draft=false --latest`：REST 文档写明「Drafts and prereleases cannot be set as latest」，两者合进同一个 PATCH 时服务端按更新前还是更新后求值无法离线验证，而这一步错了会让 release 停在 draft；拆开后第二步执行时已不是 draft，`--latest` 必然合法。
 - 去掉 `--clobber` 后，**任何**因为资产名不同而残留的旧资产（例如历史命名）都会让重跑失败；`repair` 入口的清理范围因此必须精确到「本次要重传的同名资产」，不能写成「清空全部资产」。
 - 预发布试跑若在正式仓库执行且事后忘记删除 tag，会永久留下一个与代码无关的 tag；这一条只能靠流程纪律，本 note 无技术手段强制。
