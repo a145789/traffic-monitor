@@ -181,7 +181,7 @@ fn update_check_worker(is_manual: bool) {
         }
     }
 
-    // 只有「读到 EXIT_MAIN」且「成功通知 UI」同时成立，主进程才真的要退出。
+    // 只有「读到 EXIT_MAIN」且消息已成功入队，主进程才会继续执行退出交接。
     if !reset_update_progress_after_check(&outcome) {
         return;
     }
@@ -299,7 +299,7 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 /// stdout 单行协议：
 /// - `DONE`：子进程已处理完毕，主进程继续运行。
 /// - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
-///   收到后立即退出并释放 exe 映像句柄，子进程等单实例互斥量消失后才提权
+///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才提权
 ///   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 ///
 /// 退出码：0 = 检查流程成功完成，1 = 更新检查失败。手动检查失败时，错误提示

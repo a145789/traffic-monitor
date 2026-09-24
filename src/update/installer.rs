@@ -330,9 +330,9 @@ mod tests {
 
     // ===== 锁定句柄重验（TOCTOU 防护） =====
 
-    /// 唯一使用真实临时文件的用例：文件名含进程 ID，避免与并行用例冲突；
+    /// 本模块的两个缓存复用测试使用真实临时文件：文件名含进程 ID，避免与并行用例冲突；
     /// 首尾都删文件，不留残留。生产路径禁止 unwrap，此处为测试断言。
-    fn tamper_test_path(tag: &str) -> std::path::PathBuf {
+    fn cache_test_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "traffic-monitor-reuse-test-{}-{}.tmp",
             std::process::id(),
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_cached_reuse_accepts_matching_locked_content() {
-        let path = tamper_test_path("accept");
+        let path = cache_test_path("accept");
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"good-installer-payload").unwrap();
         let expected = {
@@ -356,10 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_reuse_rejects_tampered_locked_content() {
-        // 模拟“校验后替换文件内容”：先按好内容算出期望哈希，再用坏内容覆盖文件，
-        // 锁后重验必须拒绝构造（返回 None），否则 TOCTOU 缺口仍在。
-        let path = tamper_test_path("reject");
+    fn test_cached_reuse_rejects_tampered_content() {
+        // 模拟缓存文件在重新加锁前已被篡改：先按好内容算出期望哈希，再用坏内容覆盖文件，
+        // 锁定句柄重验必须拒绝构造（返回 None）。该用例不试图复现并发替换竞态。
+        let path = cache_test_path("reject");
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"good-installer-payload").unwrap();
         let expected_good = {

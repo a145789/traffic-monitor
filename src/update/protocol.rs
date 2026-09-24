@@ -3,7 +3,7 @@
 //! stdout 单行协议：
 //! - `DONE`：子进程已处理完毕，主进程继续运行。
 //! - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
-//!   收到后立即退出并释放 exe 映像句柄，子进程等单实例互斥量消失后才提权
+//!   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才提权
 //!   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 
 use std::io::{BufRead, BufReader, Write};
@@ -28,17 +28,17 @@ pub(super) struct SubprocessOutcome {
     pub(super) is_error: bool,
     /// 已在 stdout 中读到 EXIT_MAIN（协议层事实，不代表通知已送达）。
     pub(super) exit_signalled: bool,
-    /// EXIT_MAIN 已成功投递给看门狗（UI 侧接到通知）。转发失败时主进程不会退出，
+    /// EXIT_MAIN 已成功投递给看门狗（消息已入队，等待看门狗处理）。转发失败时主进程不会开始退出，
     /// worker 必须收尾复位进行中标志，否则后续检查被永久挡掉。
     pub(super) exit_forwarded: bool,
 }
 
 /// 主进程调用：re-exec 自身 `--check-update` 子进程，逐行解析其 stdout 协议。
 ///
-/// winhttp/bcrypt、MessageBox/IME 和 ShellExecute 相关 DLL 只会进入子进程；
-/// 主进程只解析 `DONE/EXIT_MAIN` 最终动作。读到 `EXIT_MAIN` 时立即转发给看门狗
-/// （再由它落到主窗口）而不等子进程退出——此时安装器尚未启动，主进程必须先行
-/// 退出释放 exe 映像，子进程才会继续执行提权安装。
+/// winhttp/bcrypt 以及更新确认、网页打开和安装器启动等更新专属动作在子进程执行；
+/// 主进程仍保留基础窗口/错误提示 API，只解析 `DONE/EXIT_MAIN` 最终动作。读到
+/// `EXIT_MAIN` 时立即转发给看门狗，由看门狗直接执行退出语义而不等子进程退出——
+/// 此时安装器尚未启动，主进程必须先行退出释放 exe 映像，子进程才会继续执行提权安装。
 ///
 /// 此处使用 `spawn()` + 手动按行读取，而非 `output()`，避免后者为并发读取
 /// stderr 创建一个使用默认 2MB 栈预留的隐藏线程。
@@ -107,7 +107,7 @@ pub(super) fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
     };
 
     if exit_signalled && !exit_forwarded {
-        log_event!("EXIT_MAIN 已读到但未送达看门狗，主进程不会退出");
+        log_event!("EXIT_MAIN 已读到但未送达看门狗，主进程不会开始退出");
     }
 
     SubprocessOutcome {
@@ -128,7 +128,7 @@ struct ScanOutcome {
     exit_signalled: bool,
     /// 读取是否失败（I/O 错误，含遇到无效 UTF-8 行）。
     read_failed: bool,
-    /// `EXIT_MAIN` 是否成功转发给看门狗（UI 侧接到通知）。
+    /// `EXIT_MAIN` 是否成功转发给看门狗（消息已入队，等待看门狗处理）。
     exit_forwarded: bool,
 }
 
@@ -191,12 +191,11 @@ pub(super) fn emit_protocol_line(line: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// 通知 UI 侧「主进程退出并清理托盘」。单动作协议，消息无载荷。
+/// 通知看门狗执行「主进程退出并清理托盘」。单动作协议，消息无载荷。
 ///
 /// 投递目标是看门狗窗口——全生命周期不重建的顶层窗口——由它直接执行收尾语义，
-/// 不再经主窗口转发（转发成功只代表消息入队，无法确认旧主窗口真的执行了）。
-/// 返回是否成功投递：看门狗已消失时 `PostMessageW` 返回错误，调用方据此知道通知
-/// 未送达，而不是把「消息丢了」当成「主进程即将退出」。
+/// 不再经主窗口转发。返回是否成功投递：看门狗已消失时 `PostMessageW` 返回错误，
+/// 调用方据此知道消息未入队，而不是把「消息丢了」当成「主进程即将退出」。
 fn post_update_action_to_watchdog() -> bool {
     let Some(hwnd) = crate::window::watchdog_hwnd() else {
         return false;
@@ -220,8 +219,8 @@ pub(super) fn reset_update_progress_after_check(outcome: &SubprocessOutcome) -> 
 
 /// 本次检查结束后是否必须复位进行中标志。
 ///
-/// 只有「读到 EXIT_MAIN」且「通知已送达 UI」同时成立才免复位：此时主进程随即退出，
-/// 复位反而与退出竞态。其余情况（含「读到 EXIT_MAIN 但通知未送达」）都必须复位：
+/// 只有「读到 EXIT_MAIN」且「通知已入队」同时成立才免复位：此时看门狗随后会处理退出请求，
+/// 复位反而与退出竞态。其余情况（含「读到 EXIT_MAIN 但消息未入队」）都必须复位：
 /// 主进程仍在运行，不复位会让后续一切自动/手动检查被 `swap(true)` 永久挡掉，
 /// 直到用户重启进程。
 fn should_reset_update_progress(exit_signalled: bool, exit_forwarded: bool) -> bool {
@@ -354,8 +353,8 @@ mod tests {
 
     #[test]
     fn test_scan_dead_target_still_signals_but_not_forwarded() {
-        // 目标窗口已失效（模拟 Explorer 重建后旧句柄）：协议层仍读到 EXIT_MAIN，
-        // 但必须上报未送达——否则 worker 会误以为主进程要退出而跳过复位。
+        // 看门狗已销毁或消息未能入队：协议层仍读到 EXIT_MAIN，
+        // 但必须上报未送达——否则 worker 会误以为主进程即将退出而跳过复位。
         let (exit_signalled, forwarded) = scan_with_dead_target(b"EXIT_MAIN\n");
         assert!(exit_signalled);
         assert!(!forwarded);
@@ -363,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_should_reset_update_progress_matrix() {
-        // 唯一免复位的情形：EXIT_MAIN 已读到且通知已送达（主进程即将退出）。
+        // 唯一免复位的情形：EXIT_MAIN 已读到且消息已入队，等待看门狗处理退出。
         assert!(!should_reset_update_progress(true, true));
         // 读到但未送达：主进程仍在运行，必须复位——否则检查被永久挡掉。
         assert!(should_reset_update_progress(true, false));

@@ -111,10 +111,8 @@ mod tests {
 
     #[test]
     fn test_normalize_large_traffic_long_interval_not_truncated_early() {
-        // 回归测试：万兆网 × 15s 退避 = 累计 ~18.75GB（超出 u32::MAX ≈ 4.29GB）。
-        // u128 中转后应正确反映每秒速率 ~1.25GB/s，而非被「先截后除」压到 ~286MB/s。
-        // 注意：1.25GB/s 已超 u32::MAX（~4.29GB/s 的 B/s 表达 = 4_294_967_295 B/s），
-        // 实际 18.75GB/15s = 1_342_177_280 B/s < u32::MAX，应精确命中。
+        // 回归测试：15 秒累计量约 18.7 GiB，超过 u32::MAX；归一化后的速率约 1.34 GB/s，
+        // 仍低于 u32::MAX。u128 中转可避免「先截后除」把结果压到约 286 MB/s。
         let eighteen_gb: u64 = 18 * 1024 * 1024 * 1024 + (750 * 1024 * 1024);
         let per_sec = normalize_bytes_per_sec(eighteen_gb, 15_000);
         assert_eq!(per_sec, (eighteen_gb * 1000 / 15_000) as u32);

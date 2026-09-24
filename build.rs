@@ -18,9 +18,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
 
-    // /DELAYLOAD 让 winhttp/bcrypt 系列不进入标准导入表，进程启动时不会加载它们。
-    // 配合 update.rs 的 re-exec 子进程方案：更新检查在子进程中进行，
-    // 子进程退出后 winhttp + schannel + ncrypt + bcrypt 全部随进程释放，主进程稳态零开销。
+    // /DELAYLOAD 让 winhttp/bcrypt 系列不进入标准导入表，主进程启动时不主动加载这些 DLL。
+    // 配合 update 模块的 re-exec 子进程方案：更新下载、校验和更新专属交互在子进程中进行；
+    // 子进程退出后由操作系统回收其 DLL 与内存。主进程仍保留窗口、托盘和基础错误提示 API。
     // 已验证：/DELAYLOAD 能穿透 windows-link 的 raw-dylib 链接机制。
     // /DELAYLOAD 是 MSVC link.exe 专属，MinGW (pc-windows-gnu) 不支持。
     let target = std::env::var("TARGET").unwrap_or_default();

@@ -33,7 +33,7 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 3. **单物理网卡流量选择（每周期独立择大）**
    - **设计决策**：[src/collector/network.rs](src/collector/network.rs) 中的网速采集**不累加**所有网卡流量。每个周期独立计算各个 LUID 的流量变化，并在排除了虚拟网卡（通过 `GetAdaptersAddresses` 黑名单关键字过滤）后，选取**当前周期流量最大的一张单一物理网卡**展示：单卡速率、不跨周期粘滞、不累加多卡，规避虚拟机、VPN 或回环网卡的流量干扰。双网卡同时活跃时显示逐秒择大的一张卡，这是既有产品语义（加粘滞会引入切换延迟感，见 RFC 04 决策项 5，裁定为澄清措辞、不加粘滞）。
 4. **更新功能完整进程隔离与 DLL 延迟加载**
-   - **设计决策**：为避免网络、加密、UI、输入法和 Shell 相关 DLL 常驻主进程，[build.rs](build.rs) 通过 `/DELAYLOAD` 延迟导入 `winhttp.dll` / `bcrypt.dll` / `bcryptprimitives.dll`；[src/update/protocol.rs](src/update/protocol.rs) 通过 re-exec 自身创建短生命周期子进程，由子进程完整执行 HTTP 下载、SHA-256 校验、更新弹窗、打开网页及提权启动安装器（安装器管线在 [src/update/installer.rs](src/update/installer.rs)：安装包缓存复用、流式下载校验、主进程退出等待）。子进程仅通过 stdout 单行协议（`DONE` / `EXIT_MAIN`）通知主进程继续运行或退出，其中 `EXIT_MAIN` 必须在子进程启动安装器**之前**发出，结束后由操作系统整体回收其 DLL 与内存。更新相关 `MessageBoxW` / `ShellExecuteW` / `ShellExecuteExW` 不得移回主进程。
+   - **设计决策**：为避免网络、加密相关 DLL 因更新代码常驻主进程，[build.rs](build.rs) 通过 `/DELAYLOAD` 延迟导入 `winhttp.dll` / `bcrypt.dll` / `bcryptprimitives.dll`；[src/update/protocol.rs](src/update/protocol.rs) 通过 re-exec 自身创建短生命周期子进程，由子进程完整执行 HTTP 下载、SHA-256 校验、更新确认弹窗、打开网页及提权启动安装器（安装器管线在 [src/update/installer.rs](src/update/installer.rs)：安装包缓存复用、流式下载校验、主进程退出等待）。主进程仍保留窗口、托盘和基础错误提示所需的 UI API；子进程退出后由操作系统回收其 DLL 与内存。更新流程专属的 `MessageBoxW` / `ShellExecuteW` / `ShellExecuteExW` 不得移回主进程。
    - **隐式约束**：`--check-update` 参数拦截**必须在 [src/main.rs](src/main.rs) 的单例 Mutex 锁之前**执行，否则子进程会被当作重复实例直接退出；手动检查必须额外传递 `--manual`，用于决定无更新或检查失败时是否提示。`EXIT_MAIN` 发出后，子进程必须轮询等待单实例互斥量消失（主进程完全退出）才允许 `ShellExecuteExW` 启动安装器，安装器内的 taskkill 仅是兜底而非主要退出机制；启动失败/UAC 取消时由子进程负责重新拉起主程序，并携带 `--relaunched-by-update` 参数推迟首个自动检查冷却周期（避免立刻再弹同一版本的确认框）。安装包是否可信的**唯一裁决是锁定句柄的重算哈希**（缓存复用与下载后重验共用同一只读共享锁句柄），禁止改回「按路径另开文件验证」——那会重新打开 TOCTOU 窗口。更新交接消息（`WM_USER_UPDATE_ACTION`）的落点是**看门狗窗口**：主窗口会在 Explorer 重建中被替换，快照它的句柄必然丢消息，`UPDATE_IN_PROGRESS` 将被永久占位挡死后续检查。主进程必须在首个窗口创建前调用 `ImmDisableIME(u32::MAX)`，且托盘菜单必须先以 `TPM_RETURNCMD` 取得命令、把前台权交还任务栏后再执行命令，否则更新弹窗关闭后的焦点回落会在主进程中初始化第三方 TSF/IME。`/DELAYLOAD` 配置不可从 build.rs 中删除，否则网络与加密 DLL 会回到标准导入表，进程隔离失去意义。
 5. **Explorer 重启与任务栏重建恢复机制**
    - **设计决策**：主窗口 `SetParent` 进任务栏后成为跨进程子窗口，explorer.exe 销毁任务栏时会被 OS 级联销毁；且 `TaskbarCreated` 广播（HWND_BROADCAST）只投递顶层窗口。因此主窗口自身**永远收不到**该消息，必须维持一个**永不嵌入、保持隐藏的顶层看门狗窗口**（[src/window.rs](src/window.rs) 的 `create_watchdog_window`，类名见 `WATCHDOG_CLASS`），由其窗口过程接收 `TaskbarCreated` 并调用 `rebuild_main_window()` 完整重建主窗口，同时把电源/会话通知、托盘图标、监测定时器逐一重绑到新 hwnd（网络采样由 WM_TIMER tick 携带的 hwnd 直接投递，无需重绑）。禁止把 TaskbarCreated 处理挂回主窗口过程，禁止让看门狗窗口参与嵌入或显示。看门狗同时是 `--quit` 退出请求（`WM_USER_QUIT_REQUEST`，`FindWindowW` 按 `WATCHDOG_CLASS` 检索——主窗口嵌入后是子窗口，顶层检索永远 miss）、更新交接与主题广播的稳定落点。
@@ -60,7 +60,7 @@ Windows 11 任务栏小组件，纯 Rust，无配置文件。嵌入任务栏系�
 ### 本地构建与调试
 
 ```bash
-cargo build --release 2>&1     # 构建并检查警告
+cargo build --release --locked 2>&1     # 构建并检查警告
 Start-Process "target\release\traffic-monitor.exe" -WindowStyle Hidden # 后台启动
 Stop-Process -Name "traffic-monitor" -Force # 强退旧进程
 ```

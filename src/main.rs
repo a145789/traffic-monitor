@@ -844,8 +844,8 @@ mod tests {
 
     #[test]
     fn stale_main_hwnd_is_rejected() {
-        // 模拟 Explorer 重建后残留的旧句柄：IsWindow 必须否决它，使退出与更新动作
-        // 落到看门狗兜底路径，而不是投给已销毁的窗口后静默丢失。
+        // 模拟 Explorer 重建后残留的旧句柄：IsWindow 必须否决它，使需要向当前主窗口
+        // 投递主题/重绘等动作的路径跳过失效目标，而不是把消息投给已销毁的窗口。
         CURRENT_MAIN_HWND.store_raw(0x0BAD_F00D);
         assert!(live_main_hwnd().is_none());
 

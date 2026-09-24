@@ -84,8 +84,8 @@ pub(super) fn compute_sha256_hex(data: &[u8]) -> Result<String, String> {
     hash.finish()
 }
 
-/// 对任意可读流做增量哈希（流式下载与锁定句柄重验共用）。
-/// 调用方负责累计字节上限；本函数只管喂数，不截断。
+/// 对任意可读流做增量哈希。当前生产路径在下载完成后对锁定句柄做增量重验；
+/// 下载阶段只负责流式写盘。调用方负责累计字节上限；本函数只管喂数，不截断。
 pub(super) fn compute_sha256_hex_reader(reader: &mut impl std::io::Read) -> Result<String, String> {
     let hash = Sha256::new()?;
     let mut buf = [0u8; HASH_READ_BUF_BYTES];
@@ -131,6 +131,7 @@ fn format_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update::cache::open_locked_installer;
 
     #[test]
     fn test_format_hex() {
@@ -185,10 +186,11 @@ mod tests {
         ));
         let data = b"locked-handle-hash-check-payload";
         std::fs::write(&path, data).unwrap();
-        let mut file = std::fs::File::open(&path).unwrap();
+        let mut file = open_locked_installer(&path).unwrap();
         let via_locked = compute_sha256_hex_locked(&mut file).unwrap();
         let mut cursor = std::io::Cursor::new(data.as_slice());
         assert_eq!(via_locked, compute_sha256_hex_reader(&mut cursor).unwrap());
+        drop(file);
         let _ = std::fs::remove_file(&path);
     }
 }
