@@ -464,14 +464,17 @@ mod tests {
 
         // 从未刷新（时间戳为 None）等价于旧表示的空缓存，必须触发重建。
         assert!(blacklist_needs_refresh(&(HashSet::new(), None), now));
-        assert!(blacklist_needs_refresh(
-            &(
-                HashSet::new(),
-                Some(now - std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS))
-            ),
-            now
-        ));
+        // 「刷新时间戳就是 now」不算陈旧。这一侧断言刻意放在下面的提前 return 之前，
+        // 否则开机不足 30 秒时整条用例只跑了一半就结束。
         assert!(!blacklist_needs_refresh(&(HashSet::new(), Some(now)), now));
+        // Instant 只可加不可回推：它以 QPC 为原点（自系统启动计数），开机不足
+        // BLACKLIST_REFRESH_SECS 秒时 `now - Duration` 会 panic（release 是
+        // panic=abort，直接终结进程）。此时构造不出「陈旧时间戳」，跳过这一侧。
+        let Some(stale) = now.checked_sub(std::time::Duration::from_secs(BLACKLIST_REFRESH_SECS))
+        else {
+            return;
+        };
+        assert!(blacklist_needs_refresh(&(HashSet::new(), Some(stale)), now));
     }
 
     #[test]

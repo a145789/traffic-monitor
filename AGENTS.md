@@ -90,6 +90,8 @@ bun scripts/package.ts         # 本地编译并构建打包（版本号取自 C
 bun scripts/package.ts dev     # 生成带 dev 后缀的时间戳补丁版本号并打包
 ```
 
+> **发布 workflow 是先 draft 后 publish**：资产齐备且 `version.txt` 校验通过前不 publish，所以失败重跑时 release 上会留下 draft + 部分资产。默认路径不具备覆盖能力（重跑会因同名资产已存在而直接失败），修复必须显式走 `gh workflow run release.yml --ref <tag> -f repair=true`——**`--ref` 不可省**（省略即落在默认分支，三方版本一致校验当场失败），且该 tag 必须已含加固版 workflow；repair 只删本次将要重传的同名资产，仅对 draft 生效。
+
 ---
 
 ## 架构与职责 (20 个源文件)

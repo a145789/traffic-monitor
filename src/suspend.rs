@@ -385,7 +385,7 @@ mod tests {
     fn auto_update_poll_interval_must_be_far_below_cooldown() {
         // sync_monitoring_timers 每次状态切换（息屏/锁屏/全屏/网络事件）都会销毁重建
         // 全部定时器并使倒计时归零。若轮询周期≈自动检查冷却时长，事件频繁的机器上
-        // 检查会被无限推迟；因此周期必须显著小于冷却，让 LAST_CHECK_TIME 冷却门
+        // 检查会被无限推迟；因此周期必须显著小于冷却，让 NEXT_CHECK_TIME 冷却门
         // 成为唯一权威。此处以 1/10 冷却为上界钉死该关系。
         assert!(u64::from(TIMER_INTERVAL_AUTO_UPDATE) <= AUTO_CHECK_COOLDOWN_SECS * 1000 / 10);
     }

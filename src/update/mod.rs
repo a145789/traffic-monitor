@@ -20,13 +20,13 @@ pub use cache::init_cleanup_temp;
 
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_YESNO, SW_SHOWNORMAL};
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, REG_PATH_APP,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD, REG_PATH_APP,
     UPDATE_FETCH_RETRY_DELAY_MS, UPDATE_WORKER_STACK_BYTES, VERSION, VERSION_METADATA_MAX_BYTES,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
@@ -68,7 +68,13 @@ const VERSION_PATH: &str = concat!(
 /// 后续自动检查遇到同一版本不再弹框，直到出现更新的版本。
 const REG_VALUE_SKIPPED_VERSION: &str = "SkippedUpdateVersion";
 
-static LAST_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+/// 下一次允许发起自动检查的时刻（deadline 语义，不是「上次检查时刻」）。
+///
+/// 唯一写方是 [`update_check_worker`] 与 [`defer_initial_auto_check`]，唯一读方是
+/// [`start_auto_check`] 的冷却门。用 deadline 而非「上次检查时刻」表达，是因为后者为了
+/// 表达更短的错误冷却必须「把时间戳往回推」，而 `Instant` 在 Windows 上以 QPC 为原点
+/// （自系统启动计数），开机初期回推会 panic（见 [`next_check_deadline`]）。
+static NEXT_CHECK_TIME: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn load_auto_update_enabled() -> bool {
     reg_read_dword(REG_PATH_APP, "EnableAutoUpdate")
@@ -117,9 +123,9 @@ pub fn start_auto_check() {
     }
 
     {
-        let last = LAST_CHECK_TIME.lock().unwrap();
-        if let Some(t) = *last
-            && t.elapsed().as_secs() < AUTO_CHECK_COOLDOWN_SECS
+        let next = NEXT_CHECK_TIME.lock().unwrap();
+        if let Some(t) = *next
+            && Instant::now() < t
         {
             UPDATE_IN_PROGRESS.store(false, Ordering::Release);
             return;
@@ -159,26 +165,32 @@ fn spawn_update_worker(is_manual: bool) {
     }
 }
 
-// 编译期契约：错误冷却不得大于正常冷却，否则下方差值 u64 下溢、release 回绕出
-// 巨大 Duration，随后 Instant - Duration panic → abort。
+// 编译期契约：错误冷却不得长于正常冷却，否则「失败后重试」反而比「成功后等待」更久，
+// 重试语义被反转。deadline 模型下它不再是 panic 防线（本模块已无任何 Instant 回推）。
 const _: () = assert!(AUTO_CHECK_ERROR_COOLDOWN_SECS <= AUTO_CHECK_COOLDOWN_SECS);
+
+/// 由「当前时刻 + 冷却时长」算出下次可检查时刻。
+///
+/// 一律只做加法（本仓的「禁止 Instant 回推」约束标记见 `collector::rate` 模块头）：
+/// Windows 上 `Instant` 以 QPC 为原点、QPC 自系统启动计数，而 `Instant - Duration` 在结果
+/// 不可表示时不是饱和而是 panic；release 是 `panic = "abort"`，会让整个常驻进程静默消失。
+/// deadline 模型从结构上消除了这条路径，无需 `checked_sub` 与兜底魔法数。
+fn next_check_deadline(now: Instant, is_error: bool) -> Instant {
+    let cooldown_secs = if is_error {
+        AUTO_CHECK_ERROR_COOLDOWN_SECS
+    } else {
+        AUTO_CHECK_COOLDOWN_SECS
+    };
+    now + Duration::from_secs(cooldown_secs)
+}
 
 fn update_check_worker(is_manual: bool) {
     let outcome = run_check_subprocess(is_manual);
 
     if !is_manual {
-        let mut last = LAST_CHECK_TIME.lock().unwrap();
-        if outcome.is_error {
-            // 错误时把时间戳提前，仅保留较短冷却（错误冷却时长），避免短时间内重复失败。
-            *last = Some(
-                Instant::now()
-                    - std::time::Duration::from_secs(
-                        AUTO_CHECK_COOLDOWN_SECS - AUTO_CHECK_ERROR_COOLDOWN_SECS,
-                    ),
-            );
-        } else {
-            *last = Some(Instant::now());
-        }
+        let mut next = NEXT_CHECK_TIME.lock().unwrap();
+        // 成功与失败都在检查完成后写入：deadline 一律从此刻起算，节奏与改造前一致。
+        *next = Some(next_check_deadline(Instant::now(), outcome.is_error));
     }
 
     // 只有「读到 EXIT_MAIN」且消息已成功入队，主进程才会继续执行退出交接。
@@ -190,11 +202,11 @@ fn update_check_worker(is_manual: bool) {
 
 /// 把启动期自动检查推迟一个冷却周期（relaunch 场景调用）。
 ///
-/// 将 LAST_CHECK_TIME 置为当前时刻，使启动与断网重连触发的自动检查都命中
-/// 冷却门；一个冷却周期后由定时器轮询恢复正常检查节奏。
+/// 将 NEXT_CHECK_TIME 置为「现在 + 一个正常冷却」，使启动与断网重连触发的自动检查
+/// 都命中冷却门；一个冷却周期后由定时器轮询恢复正常检查节奏。
 pub fn defer_initial_auto_check() {
-    let mut last = LAST_CHECK_TIME.lock().unwrap();
-    *last = Some(Instant::now());
+    let mut next = NEXT_CHECK_TIME.lock().unwrap();
+    *next = Some(Instant::now() + Duration::from_secs(AUTO_CHECK_COOLDOWN_SECS));
 }
 
 #[derive(Debug)]
@@ -209,9 +221,7 @@ fn do_update_check(is_manual: bool) -> CheckResult {
     let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     if response.is_err() {
         // 失败时增加 1 次重试，并等待片刻防止抖动
-        std::thread::sleep(std::time::Duration::from_millis(
-            UPDATE_FETCH_RETRY_DELAY_MS,
-        ));
+        std::thread::sleep(Duration::from_millis(UPDATE_FETCH_RETRY_DELAY_MS));
         response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     }
 
@@ -320,11 +330,28 @@ pub fn subprocess_main(is_manual: bool) -> i32 {
     i32::from(is_error)
 }
 
+/// 手动检查「无更新」时的提示文案；`None` 表示不提示（自动检查不弹框）。
+///
+/// `DEV_BUILD` 为真的构建不参与升级安装，其版本号带 `-<tag><ts>` 后缀、永远解析不出
+/// 版本三元组，因此 `NoUpdate` 是它的必然结果——此时说「已是最新版本」是可证伪的假话。
+/// 判定读的是本地 [`VERSION`]（即 `CARGO_PKG_VERSION`），与远端 metadata 无关；`NoUpdate`
+/// 的其它成因（远端更旧、远端解析失败）不受影响。
+fn no_update_message(is_manual: bool, dev_build: bool, version: &str) -> Option<String> {
+    if !is_manual {
+        return None;
+    }
+    Some(if dev_build {
+        "当前为开发版，不参与升级安装。".to_string()
+    } else {
+        format!("当前已是最新版本 (v{version})。")
+    })
+}
+
 fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAction {
     match result {
         CheckResult::NoUpdate => {
-            if is_manual {
-                show_info(&format!("当前已是最新版本 (v{VERSION})。"));
+            if let Some(msg) = no_update_message(is_manual, DEV_BUILD, VERSION) {
+                show_info(&msg);
             }
             UpdateAction::Done
         }
@@ -411,5 +438,55 @@ fn open_url(url: &str) {
             None,
             SW_SHOWNORMAL,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Instant 的原点不可控（Windows 上就是 QPC 的开机计数），无法在用例里构造「接近
+    // 时钟原点」的时刻，因此这里只钉 delta。下溢的消失由「本模块不存在 Instant 回推」
+    // 这一结构事实承担，不靠用例假装覆盖。
+    #[test]
+    fn next_check_deadline_delta_matches_cooldown() {
+        let now = Instant::now();
+        assert_eq!(
+            next_check_deadline(now, true),
+            now + Duration::from_secs(AUTO_CHECK_ERROR_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            next_check_deadline(now, false),
+            now + Duration::from_secs(AUTO_CHECK_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
+    fn next_check_deadline_is_strictly_in_the_future() {
+        let now = Instant::now();
+        assert!(next_check_deadline(now, true) > now);
+        assert!(next_check_deadline(now, false) > now);
+    }
+
+    // `NoUpdate` 是自动检查的常态，绝不能弹框：否则每小时一次。
+    #[test]
+    fn no_update_message_is_silent_for_auto_check() {
+        assert!(no_update_message(false, false, "1.6.0").is_none());
+        assert!(no_update_message(false, true, "1.6.0-devk3x9zq").is_none());
+    }
+
+    #[test]
+    fn no_update_message_is_honest_for_dev_build() {
+        let msg = no_update_message(true, true, "1.6.0-devk3x9zq").expect("手动检查应给出文案");
+        assert_eq!(msg, "当前为开发版，不参与升级安装。");
+    }
+
+    #[test]
+    fn no_update_message_reports_current_version_for_release_build() {
+        // 用字面 false 而不是 DEV_BUILD：单测必须与构建环境无关，环境里带了
+        // TRAFFIC_MONITOR_DEV_BUILD 不该让这条变红。「标记真的只由 dev 打包注入」由
+        // scripts/package.ts 的非 tag 分支显式清理 + 那次「带标记则该断言变红」的负例实测承担。
+        let msg = no_update_message(true, false, "1.6.0").expect("手动检查应给出文案");
+        assert_eq!(msg, "当前已是最新版本 (v1.6.0)。");
     }
 }

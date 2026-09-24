@@ -1,6 +1,6 @@
 # Agent Note：把更新冷却改成「下次可检查时刻」，消除 Instant 下溢
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -43,7 +43,9 @@ Rust 的 `Instant - Duration` 在结果不可表示时不是饱和而是 panic�
 
 ## 验收标准
 
-- **静态判据必须能穿透跨行表达式**：当前写法在 `src/update/mod.rs:174-175` 跨两行，单行 `grep -rn "Instant::now() *-" src/` 在**修复前也是 0 命中**，不构成判据。改用多行语义检索：`rg -U "Instant::now\(\)\s*[-+]?\s*Duration" src/` 命中 0 处，或等效地用 `Get-Content -Raw` + 多行正则检查；实现者需在修复前先跑一次证明它能命中（负例）再实施。
+- **静态判据必须能穿透跨行表达式**：当前写法在 `src/update/mod.rs:174-175` 跨两行，单行 `grep -rn "Instant::now() *-" src/` 在**修复前也是 0 命中**，不构成判据。改用多行语义检索：`Instant::now\(\)\s*-\s*((std|core)::time::)?Duration` 在**修复前命中 1 处**（`src/update/mod.rs:174`，负例成立）、修复后命中 0 处；等效地可用 `Get-Content -Raw` + 多行正则。
+  - 两个容易写错的细节（初稿的判据正是这么退化成假门禁的）：操作符与 `Duration` 之间隔着路径限定符 `std::time::`，模式写成 `[-+]?\s*Duration` 连负例都命中不到，于是修复前后都是 0 命中；把 `+` 也纳入判据会误伤合法的 deadline 加法（`src/update/installer.rs:171` 正是 `Instant::now() + Duration`），故只判减法。
+  - 该模式只锚定 `Instant::now() -`，覆盖不到「先存进变量再回推」，也覆盖不到减法与 `Duration` 之间插入其它表达式；它是回归护栏，不是全量形式化验证。
 - `grep -rn "NEXT_CHECK_TIME" src/` 覆盖定义 1 处 + 读写 3 处；`grep -rn "LAST_CHECK_TIME" src/` 命中 0 处（含 `src/config.rs:126` 与 `src/suspend.rs:388` 两处注释，一并改述为「下次可检查时刻」语义，避免注释与状态名漂移）。
 - `src/collector/network.rs` 内不再有会 panic 的 `Instant` 回推；该用例在 `checked_sub` 返回 `None` 时提前返回并留注释说明原因。
 - 新增单元测试（放在 `src/update/mod.rs` 的 `#[cfg(test)]`）钉死 `next_check_deadline`：错误情形得 `now + 300s`、正常情形得 `now + 3600s`，且两者都严格晚于 `now`。边界（原点附近的 `now`）**无法**用真实 `Instant` 构造，不要在测试里假装能构造——测试只钉 delta，下溢的消失由「减法不存在」这一结构事实承担。
@@ -53,5 +55,5 @@ Rust 的 `Instant - Duration` 在结果不可表示时不是饱和而是 panic�
 ## 风险
 
 - 语义差别是「把时间戳从 `now - 3300s` 改成 `now + 300s`」，**新旧都是子进程结束后的完成时刻**（`src/update/mod.rs:173-180` 两分支都在 `run_check_subprocess` 返回之后写入），所以不存在「从检查开始时刻改成完成时刻」这种节奏后移；正常路径的冷却窗口仍是完整的 3600 秒，与今天一致。这条当初在草案里写反了，实施者不要按「后移一个检查耗时」去调常量。
-- 本次改动无法在本机以回归测试形式证明「1.95 不再 panic」（工具链是 1.98.1，标准库 offset 已生效），只能靠「减法消失」这一结构性事实 + 纯函数测试承重；残留风险是将来有人在别处重新引入 `Instant - Duration`，`src/collector/network.rs:470` 正是活例。缓解：在 `src/state.rs` 或 `src/util.rs` 的时间工具旁留一行 `TODO(no-instant-rewind)` 说明该约束（不新增独立笔记、不加 lint）。
+- 本次改动无法在本机以回归测试形式证明「1.95 不再 panic」（本机工具链是 1.98.1，标准库 offset 已生效，且没有装 1.95 工具链），只能靠「减法消失」这一结构性事实 + 纯函数测试承重；残留风险是将来有人在别处重新引入 `Instant - Duration`，`src/collector/network.rs:470` 正是活例。缓解：在 `src/collector/rate.rs` 的模块头留一行 `TODO(no-instant-rewind)` 说明该约束——该模块是仓库里唯一成片做 `Instant` 差分的地方，将来在这里动时间运算的人会先看到它（不新增独立笔记、不加 lint）。
 - 若把判据写成单行 grep（草案原样），验收会在修复前与修复后都「通过」，形成一条永远为真的假门禁——实施者必须按上面「先跑负例」的方式落地。

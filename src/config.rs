@@ -9,6 +9,13 @@ use windows::Win32::UI::WindowsAndMessaging::WM_USER;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 本次构建是否为 `scripts/package.ts <tag>` 打出的开发版。
+///
+/// 真值源是构建期注入的环境变量（见 `build.rs`），不是版本号后缀：打包脚本接受任意
+/// tag，`x.y.z-<tag><ts>` 的后缀形状并不唯一对应「开发版」。常规与 CI 构建为 `false`；
+/// 开发版不参与升级安装，手动检查更新时必须如实说明（见 `update::no_update_message`）。
+pub const DEV_BUILD: bool = option_env!("TRAFFIC_MONITOR_DEV_BUILD").is_some();
+
 pub const APP_NAME: &str = "TrafficMonitor";
 /// 用户可见显示标题：MessageBox、托盘 tip、HTTP User-Agent 等字符串的统一来源。
 pub const APP_TITLE: &str = "Traffic Monitor";
@@ -123,7 +130,7 @@ pub const INSTALLER_CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// 自动更新的定时器轮询间隔。刻意远小于冷却时长：`sync_monitoring_timers` 在
 /// 息屏/锁屏/全屏等状态切换时会销毁重建全部定时器，若轮询周期≈冷却时长，
 /// 倒计时会被反复清零导致检查被无限推迟。因此定时器只做短周期轮询，
-/// 是否真正发起检查完全由 `LAST_CHECK_TIME` 冷却门唯一裁决。
+/// 是否真正发起检查完全由 `NEXT_CHECK_TIME` 冷却门唯一裁决。
 pub const TIMER_INTERVAL_AUTO_UPDATE: u32 = 60 * 1000;
 
 pub const COLOR_KEY: u32 = 0x00FF00FF;

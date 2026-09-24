@@ -1,4 +1,10 @@
 //! 速率归一化与"最大流量单网卡"选择：纯函数，无 I/O，全部可单测。
+//!
+//! TODO(no-instant-rewind): 本模块是仓库里唯一成片做 `Instant` 差分的地方，因此把这条
+//! 约束留在这里——**禁止用 `Instant - Duration` 表达「过去的时刻」**。Windows 上 `Instant`
+//! 以 QPC 为原点（自系统启动计数），开机初期回推会 panic，而 release 是 `panic = "abort"`，
+//! 整个常驻进程会静默消失。需要「更早的时刻」时改用 deadline 语义（存「下次该做什么的时刻」
+//! 而不是「上次做过什么」），或 `checked_sub` 后显式处理 `None`。活例见 `update::next_check_deadline`。
 
 use std::collections::HashMap;
 use std::time::Instant;

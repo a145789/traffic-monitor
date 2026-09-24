@@ -17,6 +17,14 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-env-changed=TRAFFIC_MONITOR_DEV_BUILD");
+
+    // 「本次构建是不是开发版」的唯一真值源：只有 scripts/package.ts 的 dev 打包路径注入
+    // 该变量，常规与 CI 构建都不带。不要改成嗅探版本号后缀——package.ts 接受任意 tag
+    // （dev / rc / foo 都会产出 x.y.z-<tag><ts>），后缀不构成可判定的约定。
+    if std::env::var_os("TRAFFIC_MONITOR_DEV_BUILD").is_some() {
+        println!("cargo:rustc-env=TRAFFIC_MONITOR_DEV_BUILD=1");
+    }
 
     // /DELAYLOAD 让 winhttp/bcrypt 系列不进入标准导入表，主进程启动时不主动加载这些 DLL。
     // 配合 update 模块的 re-exec 子进程方案：更新下载、校验和更新专属交互在子进程中进行；
