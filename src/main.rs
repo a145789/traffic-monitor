@@ -4,6 +4,8 @@ mod collector;
 mod config;
 mod ffi_guard;
 mod renderer;
+#[cfg(test)]
+mod smoke;
 mod state;
 mod suspend;
 mod tray;
@@ -16,6 +18,8 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+#[cfg(test)]
+use windows::Win32::System::Power::HPOWERNOTIFY;
 use windows::Win32::System::Power::{
     RegisterPowerSettingNotification, RegisterSuspendResumeNotification,
     UnregisterPowerSettingNotification, UnregisterSuspendResumeNotification,
@@ -89,6 +93,50 @@ static SESSION_NOTIFY_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 退出请求是否已受理。`--quit` 可因超时重试或多次调用重复到达，
 /// 退出序列（托盘清理 + `PostQuitMessage`）只应执行一次。
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 只读观测当前主窗口句柄（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+///
+/// 写方：启动路径与 `rebuild_main_window`（创建后存、重建时先取后存）；
+/// 读方：`live_main_hwnd`（附 `IsWindow` 校验后使用）与冒烟测试（断言重建换柄）。
+/// 收敛：重建间隙为 `None`，由看门狗退避重试收敛到新句柄。
+#[cfg(test)]
+pub(crate) fn current_main_hwnd() -> Option<HWND> {
+    CURRENT_MAIN_HWND.load()
+}
+
+/// 只读观测已注册会话通知的窗口句柄（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+///
+/// 写方：`register_session_notification`（成功才记位）、`unregister_session_notification`
+///（取走并清零）；读方：注销路径本身与冒烟测试（断言重建后重绑）。
+/// 收敛：注册失败不记位，重建路径在 `DestroyWindow` 旧窗口前配对注销。
+#[cfg(test)]
+pub(crate) fn session_notify_hwnd() -> Option<HWND> {
+    SESSION_NOTIFY_HWND.load()
+}
+
+/// 只读观测 legacy 显示器开关订阅句柄（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+///
+/// 写方：`register_monitor_power_on`（存）、`unregister_power_notifications` /
+/// `rearm_display_notify`（取）；读方：`ensure_power_notifications`（为空即补注册）
+/// 与冒烟测试。收敛：缺失由恢复调度器周期静默补齐。
+#[cfg(test)]
+pub(crate) fn power_notify_handle() -> Option<HPOWERNOTIFY> {
+    POWER_NOTIFY_HANDLE.load()
+}
+
+/// 只读观测控制台显示状态订阅句柄（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+/// 写读收敛与 [`power_notify_handle`] 同构（02 篇增订的第二个显示器订阅点）。
+#[cfg(test)]
+pub(crate) fn display_notify_handle() -> Option<HPOWERNOTIFY> {
+    DISPLAY_NOTIFY_HANDLE.load()
+}
+
+/// 只读观测休眠/唤醒定向订阅句柄（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+/// 写读收敛与 [`power_notify_handle`] 同构（02 篇补的定向生产者）。
+#[cfg(test)]
+pub(crate) fn suspend_notify_handle() -> Option<HPOWERNOTIFY> {
+    SUSPEND_NOTIFY_HANDLE.load()
+}
 
 thread_local! {
     /// 主窗口重建重试的当前间隔（毫秒）；0 表示不在重试序列中。
