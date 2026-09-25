@@ -309,16 +309,16 @@ pub fn embed_in_taskbar(hwnd: HWND) -> Result<(), String> {
     Ok(())
 }
 
-/// 把已嵌入窗口的物理尺寸重置为指定位图尺寸（DPI 资源重建失败的回滚入口）。
+/// 把窗口物理尺寸对齐到指定位图尺寸（**只改尺寸**：`SWP_NOMOVE`，位置与 Z 序不动）。
 ///
-/// 只在已嵌入时生效；位置分量不动（SWP_NOMOVE），跨屏后的合身位置与尺寸
-/// 由下个成功的 DPI 更新周期自愈。保证 BitBlt 源（位图）与目标（窗口）
-/// 尺寸一致，避免边缘露出色键底色。
-pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
-    if !EMBEDDED.load(Ordering::Acquire) {
-        return;
-    }
-    // SAFETY: hwnd 为当前主窗口；SWP_NOMOVE 保留现位置，仅改尺寸。
+/// 与 [`resize_embedded_window`] 的区别是**不检查** `EMBEDDED`：本函数不应用任何
+/// 任务栏客户区坐标（位置分量由 `SWP_NOMOVE` 保持不动），只提交宽高，因此对半嵌入
+/// 或未嵌入的窗口同样安全。它要修的正是「位图已按新 DPI 换掉、窗口还是旧尺寸」这一
+/// 错配——而嵌入门在那种状态（`embed_in_taskbar` 中途失败会把 `EMBEDDED` 清成 false）
+/// 恰好会拒绝回滚，于是错配只能拖到下一次成功嵌入。
+pub fn align_window_size_to(hwnd: HWND, width: i32, height: i32) {
+    // SAFETY: hwnd 是当前主窗口；SWP_NOMOVE 保留现位置，SWP_FRAMECHANGED 让样式变更
+    // 生效，SWP_NOZORDER 不动层级，均不涉及跨进程内存。
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -330,6 +330,18 @@ pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
             SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOZORDER,
         );
     }
+}
+
+/// 把已嵌入窗口的物理尺寸重置为指定位图尺寸（DPI 资源重建失败的回滚入口）。
+///
+/// 只在已嵌入时生效：未嵌入的窗口几何归嵌入序列所有。跨屏后的合身位置与尺寸
+/// 由恢复调度器的 DPI 事务或下个成功周期自愈。保证 BitBlt 源（位图）与目标（窗口）
+/// 尺寸一致，避免边缘露出色键底色。
+pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
+    if !EMBEDDED.load(Ordering::Acquire) {
+        return;
+    }
+    align_window_size_to(hwnd, width, height);
 }
 
 /// 嵌入自愈守卫，挂在常驻的全屏检测定时器上（每 2s）。

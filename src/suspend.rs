@@ -414,7 +414,11 @@ fn register_missing_timers(missing: MissingTimers) {
 /// 状态切换的全部调用点都必须走这里——直接调 [`sync_monitoring_timers`] 会把
 /// 「需要重试」这一信息丢在半路（旧实现逐个 `let _ =` 丢弃返回值正是这个问题）。
 /// 返回值仍然给出本次缺失集合，启动尾段据此判定「核心定时器是否都建起来了」。
+///
+/// 顺带确保看门狗上的恢复调度 tick 处于武装状态：这里是「监测定时器集合可能变全空」
+/// 的临界点（挂起/全屏分支），过了这一步可能就没有别的周期入口来补武装了。
 pub fn resync_monitoring_timers(hwnd: HWND) -> MissingTimers {
+    crate::ensure_recovery_timer();
     let missing = sync_monitoring_timers(hwnd);
     register_missing_timers(missing);
     missing

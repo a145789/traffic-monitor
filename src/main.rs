@@ -62,9 +62,9 @@ use crate::util::{
     set_low_memory_priority, show_error, trim_working_set,
 };
 use crate::window::{
-    create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_last_rect,
-    invalidate_taskbar_cache, reembed_if_lost, register_watchdog_class, register_window_class,
-    resize_embedded_window, update_taskbar_position,
+    align_window_size_to, create_main_window, create_watchdog_window, embed_in_taskbar,
+    invalidate_last_rect, invalidate_taskbar_cache, reembed_if_lost, register_watchdog_class,
+    register_window_class, resize_embedded_window, update_taskbar_position, watchdog_hwnd,
 };
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
@@ -95,8 +95,12 @@ thread_local! {
     /// 仅 UI 线程（看门狗过程与重建路径）读写。
     static REBUILD_RETRY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// 恢复调度 tick 的当前间隔（毫秒）；0 表示尚未武装。
-    /// 仅 UI 线程（看门狗过程）读写。
+    /// 仅 UI 线程（看门狗过程与恢复调度路径）读写。
     static RECOVERY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// 恢复调度 tick 的武装状态：`None` = 已武装；`Some(n)` = 未武装且已连续失败 n 次
+    /// （`Some(0)` = 本进程还没试过）。唯一写方是 [`set_recovery_interval`]，
+    /// 唯一读方是 [`ensure_recovery_timer`]。仅 UI 线程访问。
+    static RECOVERY_ARM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(Some(0)) };
 }
 
 /// 启动参数一次性解析结果：`--quit` / `--check-update` / `--manual` / 更新拉起标记
@@ -401,50 +405,73 @@ fn run_message_loop() {
     }
 }
 
-/// 注册全部电源/显示器订阅到指定窗口。失败非致命：分别退化为失去对应的省电触发。
+/// 注册休眠/唤醒定向订阅。句柄存入 [`SUSPEND_NOTIFY_HANDLE`] 供配对注销。
+///
+/// 用 user32 的 `RegisterSuspendResumeNotification`（Win8+）把 APM 事件定向投递到
+/// 本窗口：APM 事件本身是顶层广播，主窗口嵌入任务栏成为跨进程子窗口后收不到，
+/// 只有定向订阅才让休眠位在嵌入后仍有可达的生产者。
+fn register_suspend_resume(hwnd: HWND) -> Result<(), String> {
+    // SAFETY: hwnd 是当前主窗口句柄；注册只登记「把通知投递到该窗口」，不解引用
+    // 调用方内存；返回句柄存入具名原子供配对注销。
+    unsafe {
+        RegisterSuspendResumeNotification(HANDLE(hwnd.0), DEVICE_NOTIFY_WINDOW_HANDLE)
+            .map(|handle| SUSPEND_NOTIFY_HANDLE.store(handle))
+            .map_err(|e| format!("休眠/唤醒: {e:?}"))
+    }
+}
+
+/// 注册 legacy 显示器开关订阅（`GUID_MONITOR_POWER_ON`）。
+fn register_monitor_power_on(hwnd: HWND) -> Result<(), String> {
+    // SAFETY: 同 `register_suspend_resume`。
+    unsafe {
+        RegisterPowerSettingNotification(
+            HANDLE(hwnd.0),
+            &GUID_MONITOR_POWER_ON,
+            DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+        .map(|handle| POWER_NOTIFY_HANDLE.store(handle))
+        .map_err(|e| format!("显示器开关: {e:?}"))
+    }
+}
+
+/// 注册控制台显示状态订阅（`GUID_CONSOLE_DISPLAY_STATE`）。
+///
+/// 与 legacy 订阅点并存：S0 息屏只发这一个，而 legacy 是否仍投递属未验证行为；
+/// 两者写同一个 `SUSPEND_REASON_MONITOR` 位，重复事件被位集幂等吸收。
+fn register_console_display_state(hwnd: HWND) -> Result<(), String> {
+    // DEVICE_NOTIFY_WINDOW_HANDLE = 0；误用 SERVICE_HANDLE(1) 会把 HWND 当服务句柄，
+    // 返回 ERROR_SERVICE_NOT_IN_EXE (0x8007043B)。SAFETY: 同 `register_suspend_resume`。
+    unsafe {
+        RegisterPowerSettingNotification(
+            HANDLE(hwnd.0),
+            &GUID_CONSOLE_DISPLAY_STATE,
+            DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+        .map(|handle| DISPLAY_NOTIFY_HANDLE.store(handle))
+        .map_err(|e| format!("显示状态: {e:?}"))
+    }
+}
+
+/// 注册全部电源/显示器订阅到指定窗口（启动与 Explorer 重建路径）。失败非致命：
+/// 分别退化为失去对应的省电触发。
 ///
 /// 三项失败合并成**一条**提示：三项都失败时逐项弹框会变成连点三次模态框，而它们
 /// 是同一段启动/重建动作里的同一次失败序列。
 ///
-/// 三个订阅各有一份注册/注销配对，句柄分别存在三个具名原子里（见各自 static 注释）。
-/// 周期性路径上的重新订阅不走本函数（见 [`rearm_display_notify`]）：周期重试必须静默。
+/// 周期路径不调用本函数（会弹框），改用 [`ensure_power_notifications`]。
 fn register_power_notifications(hwnd: HWND) {
-    let mut failures: Vec<String> = Vec::new();
-
-    // SAFETY: hwnd 是当前主窗口句柄；三个注册 API 都只登记「把通知投递到该窗口」，
-    // 不解引用调用方内存；返回句柄存入具名原子供配对注销。
-    unsafe {
-        // DEVICE_NOTIFY_WINDOW_HANDLE = 0；误用 SERVICE_HANDLE(1) 会把 HWND 当服务句柄，
-        // 返回 ERROR_SERVICE_NOT_IN_EXE (0x8007043B)。休眠/唤醒订阅用的是 user32 的
-        // RegisterSuspendResumeNotification（Win8+），把 APM 事件定向投递到本窗口，
-        // 嵌入为跨进程子窗口后仍然可达（APM 事件本身是顶层广播，嵌入后收不到）。
-        match RegisterSuspendResumeNotification(HANDLE(hwnd.0), DEVICE_NOTIFY_WINDOW_HANDLE) {
-            Ok(handle) => SUSPEND_NOTIFY_HANDLE.store(handle),
-            Err(e) => failures.push(format!("休眠/唤醒: {e:?}")),
-        }
-        // legacy 显示器开关订阅 + 文档化的控制台显示状态订阅：两者都处理同一个
-        // MONITOR 挂起位，哪个真的投递由机器与电源模型决定（S0 息屏只发后者）。
-        match RegisterPowerSettingNotification(
-            HANDLE(hwnd.0),
-            &GUID_MONITOR_POWER_ON,
-            DEVICE_NOTIFY_WINDOW_HANDLE,
-        ) {
-            Ok(handle) => POWER_NOTIFY_HANDLE.store(handle),
-            Err(e) => failures.push(format!("显示器开关: {e:?}")),
-        }
-        match RegisterPowerSettingNotification(
-            HANDLE(hwnd.0),
-            &GUID_CONSOLE_DISPLAY_STATE,
-            DEVICE_NOTIFY_WINDOW_HANDLE,
-        ) {
-            Ok(handle) => DISPLAY_NOTIFY_HANDLE.store(handle),
-            Err(e) => failures.push(format!("显示状态: {e:?}")),
-        }
-    }
+    let failures: Vec<String> = [
+        register_suspend_resume(hwnd),
+        register_monitor_power_on(hwnd),
+        register_console_display_state(hwnd),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
 
     if !failures.is_empty() {
         show_error(&format!(
-            "注册电源/显示器通知失败（{} 项，失败项对应省电触发将不生效）: {}",
+            "注册电源/显示器通知失败（{} 项，失败项对应的省电触发将不生效）: {}",
             failures.len(),
             failures.join("; ")
         ));
@@ -477,43 +504,48 @@ fn unregister_power_notifications() {
     }
 }
 
-/// 静默重注册两个显示器开关订阅（恢复 tick 在 MONITOR 位按 TTL 清位后调用）。
+/// 静默补注册缺失的电源/显示器订阅（恢复调度器每个周期调用一次）。
 ///
-/// 语义是「保证下一次真实通知不会被漏收」：TTL 清位意味着本进程承认自己可能已经
-/// 漏掉了一次点亮通知，重订阅把这条通道重新武装一遍。失败只留 release 日志，
-/// 绝不弹框（周期路径）。
+/// **句柄本身就是「该项订阅是否还在」的唯一真值源**：为空 ⇔ 不在。订阅不在就再也
+/// 收不到对应通知——休眠位失去生产者、显示器开关再也不会置 `MONITOR` 位——省电语义
+/// 会静默失效到下一次 Explorer 重建或进程重启。因此必须按句柄在周期 tick 上补，
+/// 而不能只在「别的同源事件」里重注册：那些事件正是靠这条订阅才会到达。
+///
+/// 失败只留 release 日志，绝不弹框（周期路径）；下个周期继续补。
+fn ensure_power_notifications(hwnd: HWND) {
+    if SUSPEND_NOTIFY_HANDLE.load().is_none()
+        && let Err(e) = register_suspend_resume(hwnd)
+    {
+        log_event!("补注册休眠/唤醒订阅失败: {e}");
+    }
+    if POWER_NOTIFY_HANDLE.load().is_none()
+        && let Err(e) = register_monitor_power_on(hwnd)
+    {
+        log_event!("补注册显示器开关订阅失败: {e}");
+    }
+    if DISPLAY_NOTIFY_HANDLE.load().is_none()
+        && let Err(e) = register_console_display_state(hwnd)
+    {
+        log_event!("补注册显示状态订阅失败: {e}");
+    }
+}
+
+/// 清掉 MONITOR 挂起位后重新武装显示器订阅（恢复调度器在 TTL 清位那一轮调用）。
+///
+/// TTL 清位意味着本进程承认可能漏掉了一次点亮通知：先注销再重新订阅，把这条通道
+/// 重新武装一遍。**重新注册走 [`ensure_power_notifications`]**，因此即使这里注册
+/// 失败（句柄保持为空）也不会静默失效——下个恢复周期会继续补。
 fn rearm_display_notify(hwnd: HWND) {
-    if let Some(handle) = POWER_NOTIFY_HANDLE.take() {
-        // SAFETY: 句柄来自成功注册且只取走一次。
+    for handle in [POWER_NOTIFY_HANDLE.take(), DISPLAY_NOTIFY_HANDLE.take()]
+        .into_iter()
+        .flatten()
+    {
+        // SAFETY: 两个句柄各来自一次成功注册且只取走一次。
         unsafe {
             let _ = UnregisterPowerSettingNotification(handle);
         }
     }
-    if let Some(handle) = DISPLAY_NOTIFY_HANDLE.take() {
-        // SAFETY: 同上。
-        unsafe {
-            let _ = UnregisterPowerSettingNotification(handle);
-        }
-    }
-    // SAFETY: hwnd 为当前主窗口；两个注册与上面的注销各自配对。
-    unsafe {
-        match RegisterPowerSettingNotification(
-            HANDLE(hwnd.0),
-            &GUID_MONITOR_POWER_ON,
-            DEVICE_NOTIFY_WINDOW_HANDLE,
-        ) {
-            Ok(handle) => POWER_NOTIFY_HANDLE.store(handle),
-            Err(e) => log_event!("重新注册电源设置通知失败: {e:?}"),
-        }
-        match RegisterPowerSettingNotification(
-            HANDLE(hwnd.0),
-            &GUID_CONSOLE_DISPLAY_STATE,
-            DEVICE_NOTIFY_WINDOW_HANDLE,
-        ) {
-            Ok(handle) => DISPLAY_NOTIFY_HANDLE.store(handle),
-            Err(e) => log_event!("重新注册显示状态通知失败: {e:?}"),
-        }
-    }
+    ensure_power_notifications(hwnd);
 }
 
 /// 注册会话锁屏通知，并记录句柄供 [`unregister_session_notification`] 配对注销。
@@ -692,15 +724,23 @@ fn disarm_rebuild_retry(watchdog: HWND) {
 /// 挂起态的监测定时器集合（挂起分支必须保持全空，销毁与恢复对称）。
 ///
 /// 与 `arm_rebuild_retry` 同范式：`SetTimer` 复用同一 ID 会重设倒计时，因此连续
-/// 失败无需先 `KillTimer`。创建失败只留痕，不做「失败即立刻重试」——那会把持续
-/// 失败放大成高频轮询。
+/// 失败无需先 `KillTimer`。创建失败**不能**只留痕了事——没有 WM_TIMER 就再也没有
+/// 机会调用本函数，一次瞬态失败会永久摘掉整条恢复路径；因此这里只登记失败状态，
+/// 重试交给 [`ensure_recovery_timer`]（挂到仍然活着的周期 tick 上）。
 fn set_recovery_interval(watchdog: HWND, interval: u32) {
     RECOVERY_INTERVAL_MS.with(|c| c.set(interval));
     // SAFETY: watchdog 是看门狗窗口句柄，与调用方同属 UI 线程；不使用回调函数。
-    unsafe {
-        if SetTimer(Some(watchdog), TIMER_ID_RECOVERY, interval, None) == 0 {
-            diag!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败");
-            log_event!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败");
+    let armed = unsafe { SetTimer(Some(watchdog), TIMER_ID_RECOVERY, interval, None) != 0 };
+    let failures = RECOVERY_ARM.with(|c| c.get()).unwrap_or(0);
+    if armed {
+        RECOVERY_ARM.with(|c| c.set(None));
+    } else {
+        RECOVERY_ARM.with(|c| c.set(Some(failures.saturating_add(1))));
+        // 只在失败序列首次留痕：`ensure_recovery_timer` 会在每个周期 tick 上重试，
+        // 持续失败不得把日志刷成噪声。
+        if failures == 0 {
+            diag!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败，将在下个周期 tick 重试");
+            log_event!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败，将在下个周期 tick 重试");
         }
     }
 }
@@ -710,8 +750,29 @@ fn arm_recovery_timer(watchdog: HWND) {
     set_recovery_interval(watchdog, TIMER_INTERVAL_RECOVERY);
 }
 
-/// 退出在即：撤销恢复调度 tick，避免退出序列被处理前再跑一轮恢复动作。
+/// 恢复调度的自愈武装（幂等）：未武装时才重试一次。
+///
+/// 恢复路径的存续不能取决于启动期那一次 `SetTimer` 是否成功（失败后没有任何
+/// WM_TIMER 能再调用 [`set_recovery_interval`]）。因此把「重新武装」挂到仍然存在的
+/// 周期入口上：主窗口的监测 tick（[`handle_timer`]）与状态切换
+/// （`suspend::resync_monitoring_timers`，那是「监测定时器集合可能全空」的临界点）。
+/// 只要还有任一个入口在跑，恢复调度就会被重新武装起来。
+///
+/// **已武装时必须直接返回**：`SetTimer` 复用同一 ID 会重设倒计时，每个 tick 都武装
+/// 一次会让恢复周期永远到不了。
+pub(crate) fn ensure_recovery_timer() {
+    if RECOVERY_ARM.with(|c| c.get()).is_none() {
+        return;
+    }
+    if let Some(watchdog) = watchdog_hwnd() {
+        arm_recovery_timer(watchdog);
+    }
+}
+
+/// 退出在即：撤销恢复调度 tick，并标记为已武装以免退出序列被处理前被周期 tick
+/// 重新武装。
 fn disarm_recovery_timer(watchdog: HWND) {
+    RECOVERY_ARM.with(|c| c.set(None));
     unsafe {
         KillTimer(Some(watchdog), TIMER_ID_RECOVERY).ok();
     }
@@ -755,31 +816,45 @@ fn run_recovery() -> bool {
     }
 
     if heal_stale_suspend(hwnd) & SUSPEND_REASON_MONITOR != 0 {
-        // TTL 清位等价于本进程承认「可能漏掉了一次点亮通知」：重新武装显示器订阅，
-        // 保证下一次真实通知不会被漏收。
+        // TTL 清位等价于本进程承认「可能漏掉了一次点亮通知」：先撤销再重新订阅。
         rearm_display_notify(hwnd);
+    } else {
+        // 订阅句柄是「是否已注册」的真值源：缺失就静默补，绝不等下一次同源事件
+        // （那正需要这条订阅才可能到达）。本项失败**不**计入退避：补注册要尽快
+        // 恢复，不能让退避把下个周期推到 10 分钟后。
+        ensure_power_notifications(hwnd);
     }
 
     all_ok
 }
 
-/// DPI 恢复事务（四步顺序不可拆）。
+/// DPI 恢复事务（四步顺序不可拆，第 2 步内部再分「先对齐尺寸、再提交完整几何」）。
 ///
 /// 1. 重试 `Renderer::update_dpi`（只换位图/字体，不动窗口几何）；
-/// 2. 提交窗口几何——重跑完整嵌入序列，位置与尺寸都按新 DPI 重算（比只改尺寸更
-///    彻底：跨屏后位置同样会变，且顺带修复嵌入漂移，不引入第二套几何提交路径）；
+/// 2. **先无条件把窗口尺寸对齐到新位图**（`align_window_size_to`，只改尺寸），
+///    再重跑嵌入序列提交位置与分层属性——这一步不能省也不能挪到失败分支里：
+///    `update_dpi` 一旦成功，位图就已经是新尺寸，而接下来的嵌入序列可能在任何一步
+///    瞬态失败，且它中途失败会把 `EMBEDDED` 清成 false，使带嵌入门回滚的
+///    `rollback_window_to_bitmap` 拒绝动作。先对齐尺寸把「新位图 + 旧窗口」这一错配
+///    的窗口期压到零，剩下没提交的只是位置与可见性，由本事务或 `reembed_if_lost` 重试；
 /// 3. 失效位置缓存，避免刚提交的几何被旧缓存判为「已到位」；
 /// 4. 前三步全部成功才清 `DPI_DIRTY` 并整幅重绘。
 ///
 /// 任一步失败即保持脏位，由下一个恢复周期重试。`rollback_window_to_bitmap` 仍是
-/// 失败当时的即时兜底（窗口尺寸与位图必须始终一致），只是不再承担自愈责任。
+/// `WM_DPICHANGED` / 启动路径失败当时的即时兜底（那时位图未换、窗口尺寸必须跟着旧位图）。
 fn recover_dpi(hwnd: HWND) -> bool {
     let mut dpi_updated = false;
-    renderer::with_renderer(|r| dpi_updated = r.update_dpi(hwnd));
+    let mut bitmap_size = (0, 0);
+    renderer::with_renderer(|r| {
+        dpi_updated = r.update_dpi(hwnd);
+        bitmap_size = r.bitmap_size();
+    });
     if !dpi_updated {
         diag!("DPI 恢复: 重建位图/字体失败，保持脏位等待下一轮");
         return false;
     }
+
+    align_window_size_to(hwnd, bitmap_size.0, bitmap_size.1);
 
     if let Err(e) = embed_in_taskbar(hwnd) {
         diag!("DPI 恢复: 提交窗口几何失败: {e}");
@@ -879,6 +954,9 @@ pub extern "system" fn watchdog_wnd_proc(
         }
 
         WM_TIMER if wparam.0 == TIMER_ID_REBUILD_RETRY => {
+            // 重建间隙里主窗口不存在，本 tick 可能是唯一还活着的周期入口：顺带补齐
+            // 恢复调度的武装状态。
+            ensure_recovery_timer();
             rebuild_main_window(hwnd);
             LRESULT(0)
         }
@@ -907,6 +985,9 @@ pub extern "system" fn watchdog_wnd_proc(
 }
 
 fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    // 只要主窗口还有任何一个周期 tick 在跑，就顺带把恢复调度 tick 的武装状态补齐
+    // （已武装时是空操作）。没有它，启动期一次 `SetTimer` 失败会永久摘掉整条恢复路径。
+    ensure_recovery_timer();
     match wparam.0 {
         TIMER_ID_INIT_TRIM => {
             trim_working_set();
