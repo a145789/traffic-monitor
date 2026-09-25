@@ -204,7 +204,25 @@ pub fn invalidate_taskbar_cache() {
     TASKBAR_HWND.clear();
 }
 
+/// 任务栏是否为横向布局（宽度不小于高度，即屏幕底部的横条）。
+///
+/// 本判据是 `calc_widget_rect` 位置推导的**前置前提**：那套推导只对底部横向任务栏
+/// 成立。竖排（屏幕左/右侧）任务栏的矩形高度远大于宽度，此时 `rc_tray.left` 与
+/// `rc_taskbar.left` 几乎相等，算出的 x 退化为约 `-(面板宽 + gap)`，y 又拿整屏高度取
+/// 中点；窗口整体落在父窗口客户区之外被裁掉，而 `SetWindowPos` 对子窗口的负坐标**不会
+/// 失败**，事后断言只查 `GetParent`（父子关系确实已改）——于是嵌入序列会照常走完并
+/// 把 `EMBEDDED` 置真，留下一个谎报为真的半嵌入状态。
+///
+/// 纯判定，便于单测；唯一生产消费者是 `calc_widget_rect`。
+fn is_horizontal_taskbar(rect: RECT) -> bool {
+    rect.bottom - rect.top <= rect.right - rect.left
+}
+
 /// 计算小组件在任务栏上的目标矩形 (x, y, w, h)；仅 window.rs 内部消费。
+///
+/// 竖排任务栏返回 `None`：横条面板在竖排任务栏上没有合法放置位置，显式失败优于留下
+/// 几何无效却标记已嵌入的状态。`None` 走既有失败路径——首轮嵌入提示一次，其后由
+/// `reembed_if_lost` 每 2 秒静默重试，用户把任务栏移回底部后自行恢复。
 fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     let h_taskbar = get_taskbar_hwnd()?;
     // SAFETY: "TrayNotifyWnd" 为系统托盘子窗口类名。
@@ -215,6 +233,11 @@ fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     unsafe {
         GetWindowRect(h_tray, &mut rc_tray).ok()?;
         GetWindowRect(h_taskbar, &mut rc_taskbar).ok()?;
+    }
+
+    // 竖排任务栏：几何推导不成立，拒绝嵌入（见 is_horizontal_taskbar 的说明）。
+    if !is_horizontal_taskbar(rc_taskbar) {
+        return None;
     }
 
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
@@ -438,10 +461,32 @@ pub fn update_taskbar_position(hwnd: HWND) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! 只覆盖纯判定：`position_flags` 的标志选择与位置缓存的失效。真实窗口行为不在本模块单测范围内。
+    //! 只覆盖纯判定：`position_flags` 的标志选择、位置缓存的失效，以及任务栏方向判据。
+    //! 真实窗口行为不在本模块单测范围内。
 
-    use super::{LAST_RECT, invalidate_last_rect, position_flags};
+    use super::{LAST_RECT, invalidate_last_rect, is_horizontal_taskbar, position_flags};
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE, SWP_NOZORDER};
+
+    #[test]
+    fn test_calc_widget_rect_rejects_vertical_taskbar() {
+        // 竖排任务栏（屏幕左/右侧）：高度远大于宽度，几何推导不成立，必须拒绝。
+        let vertical = RECT {
+            left: 0,
+            top: 0,
+            right: 40,
+            bottom: 1080,
+        };
+        assert!(!is_horizontal_taskbar(vertical));
+        // 横向任务栏（屏幕底部）：宽度远大于高度，必须继续放行——判据不能误伤正常布局。
+        let horizontal = RECT {
+            left: 0,
+            top: 1040,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(is_horizontal_taskbar(horizontal));
+    }
 
     #[test]
     fn dpi_dirty_position_keeps_window_size() {
