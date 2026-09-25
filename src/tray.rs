@@ -104,6 +104,15 @@ pub fn remove_tray_icon() {
     });
 }
 
+/// 只读观测托盘图标当前绑定的窗口（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+///
+/// `Some(hwnd)` ⟺ 图标存在且回调落点是该窗口；重建前后对比它即验证托盘迁移
+/// （旧绑定残留到已销毁窗口 vs 新绑定的区分，见冒烟用例）。
+#[cfg(test)]
+pub(crate) fn tray_owner() -> Option<HWND> {
+    TRAY_DATA.with(|t| t.borrow().as_ref().map(|nid| nid.hWnd))
+}
+
 /// 菜单项定义。`text` 为 NUL 结尾 UTF-16（`to_wide` 产出），由调用方持有至菜单关闭。
 enum MenuEntry {
     Item { id: u32, text: Vec<u16>, state: u32 },

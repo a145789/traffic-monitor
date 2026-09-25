@@ -1,7 +1,9 @@
 //! Windows 窗口过程与重建冒烟（opt-in，需真实 Explorer/任务栏）。
 //!
-//! 只覆盖能自动化的部分：建窗与嵌入、重建路径、定时器收敛与挂起对称、
-//! `WM_DPICHANGED` 最低断言。渲染像素比对、真实跨屏 DPI、故障注入不做自动化。
+//! 只覆盖能自动化的部分：建窗与嵌入、重建路径（含旧绑定的迁移断言）、
+//! 定时器收敛与挂起对称、DPI 脏位由恢复事务清位。渲染像素比对、真实跨屏 DPI、
+//! 故障注入不做自动化。残留缺口（已如实记录）：电源句柄值域不透明，
+//! “注销先于 DestroyWindow 的顺序”只由代码评审覆盖，详见重建用例内注释。
 //!
 //! 运行（必须串行，全局状态跨用例共享）：
 //! `cargo test --locked -- --ignored --test-threads=1`
@@ -131,15 +133,53 @@ fn rebuild_rebinds_new_main_window() {
     let fx = Fixture::setup();
     // 重建内含嵌入，失败会弹框：先确认任务栏存在，让缺环境 loud 失败在断言处。
     require_taskbar();
-    let before = super::current_main_hwnd().expect("fixture 应已登记主窗口");
+    let old = super::current_main_hwnd().expect("fixture 应已登记主窗口");
+    // 与生产一致的旧绑定（main 启动尾段同顺序）：电源订阅 → 嵌入 → 托盘/定时器 → 会话通知。
+    // 没有这一步，重建内的 unregister_*/remove_tray_icon 对旧窗口全是空操作，
+    // 用例只能证明“新建成功”，不能证明“旧资源正确交接”。
+    super::register_power_notifications(old);
+    crate::window::embed_in_taskbar(old).expect("旧窗口嵌入失败：请确认 explorer.exe 正在运行");
+    assert!(
+        super::bind_display_and_timers(old),
+        "旧绑定尾段核心定时器须建起"
+    );
+    super::register_session_notification(old);
+    assert_eq!(
+        super::session_notify_hwnd(),
+        Some(old),
+        "旧窗口会话通知须已登记"
+    );
+    assert!(super::power_notify_handle().is_some(), "旧窗口订阅须已登记");
+    assert!(
+        super::display_notify_handle().is_some(),
+        "旧窗口订阅须已登记"
+    );
+    assert!(
+        super::suspend_notify_handle().is_some(),
+        "旧窗口订阅须已登记"
+    );
+    assert_eq!(crate::tray::tray_owner(), Some(old), "旧窗口托盘须已绑定");
+    assert!(
+        !crate::state::DPI_DIRTY.load(Ordering::Acquire),
+        "旧绑定成功后脏位须为干净"
+    );
     // 刻意绕过 TaskbarCreated 路由，只测重建函数本身（路由依赖真实广播，属人工验收）。
     super::rebuild_main_window(fx.watchdog());
-    let after = super::current_main_hwnd().expect("重建后 CURRENT_MAIN_HWND 必须换成新句柄");
-    assert_ne!(before.0, after.0, "重建必须换句柄，旧句柄不得复用");
+    let new = super::current_main_hwnd().expect("重建后 CURRENT_MAIN_HWND 必须换成新句柄");
+    assert_ne!(old.0, new.0, "重建必须换句柄，旧句柄不得复用");
     assert!(crate::window::is_embedded(), "重建后 EMBEDDED 必须为真");
-    assert!(
-        super::session_notify_hwnd().is_some(),
-        "重建后会话通知必须重绑"
+    // 迁移断言：值域是窗口句柄本身的状态必须精确落到新柄（残留旧柄即失败）；
+    // 电源句柄值域不透明（OS 会回收复用数值），只断言重建后在册——
+    // “注销先于 DestroyWindow 的顺序”仍由代码评审覆盖。
+    assert_eq!(
+        super::session_notify_hwnd(),
+        Some(new),
+        "会话通知必须从旧柄迁移到新柄"
+    );
+    assert_eq!(
+        crate::tray::tray_owner(),
+        Some(new),
+        "托盘绑定必须从旧柄迁移到新柄"
     );
     assert!(
         super::power_notify_handle().is_some(),
@@ -153,12 +193,16 @@ fn rebuild_rebinds_new_main_window() {
         super::suspend_notify_handle().is_some(),
         "重建后休眠定向订阅必须重绑"
     );
-    // SAFETY: after 为重建刚登记的新主窗口；GetParent 只查询父子关系。
-    let parent = unsafe { GetParent(after) }.ok();
+    // SAFETY: new 为重建刚登记的新主窗口；GetParent 只查询父子关系。
+    let parent = unsafe { GetParent(new) }.ok();
     assert_eq!(
         parent,
         crate::window::get_taskbar_hwnd(),
         "重建后新窗口父级必须等于当前任务栏"
+    );
+    assert!(
+        crate::suspend::retry_missing_timers(new),
+        "重建后须无缺失定时器残留"
     );
     // 托盘无残留由 fixture 的 Drop 负责（remove_tray_icon），此处不断言系统托盘状态。
 }
@@ -183,19 +227,28 @@ fn timers_converge_across_suspend_resume() {
 
 #[test]
 #[ignore]
-fn dpichanged_handler_never_panics_and_clears_dirty() {
+fn dpi_dirty_cleared_by_recovery_transaction() {
     let fx = Fixture::setup();
     // 处理器用 GetDpiForWindow 取当前 DPI，手工发消息不会改变它：
-    // 本用例只证明“不 panic 且脏位最终被清”，不验证跨屏尺寸变化；
+    // 消息分支只更新资源并重嵌入，从不清脏位（清位点唯一归恢复事务所有）；
     // 真正的跨屏 DPI 行为见本文件头部人工清单。
     require_taskbar();
+    // 前置脏位：模拟一次已失败的 DPI 更新。干净初值会让末尾断言空洞
+    // （成功分支根本不碰该位），预置是本用例承重的必要条件。
+    crate::state::DPI_DIRTY.store(true, Ordering::Release);
     // SAFETY: fx.main 为本线程有效窗口；WM_DPICHANGED 分支忽略 wparam/lparam，
     // 不解引用任何指针；SendMessageW 同步投递、无悬垂。
     unsafe {
         SendMessageW(fx.main(), WM_DPICHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
     }
     assert!(
+        crate::state::DPI_DIRTY.load(Ordering::Acquire),
+        "消息分支成功时不得清位：清位权只归恢复事务"
+    );
+    // 驱动真正的清位 owner（恢复调度器的 DPI 事务），断言它收敛并清位。
+    assert!(super::recover_dpi(fx.main()), "同 DPI 下恢复事务须成功");
+    assert!(
         !crate::state::DPI_DIRTY.load(Ordering::Acquire),
-        "同 DPI 重发 WM_DPICHANGED 后脏位必须最终被清"
+        "恢复事务成功后脏位必须被清"
     );
 }

@@ -26,15 +26,15 @@ Status: proposed
 **Fixture 契约（必须先立，否则用例之间必然互相污染）**：
 
 - 一个串行的 RAII fixture：`setup()` 依次 `ImmDisableIME(u32::MAX)`（生产在 `src/main.rs:203-207` 要求它在首个顶层窗口之前，测试进程也必须遵守，否则测试进程本身会成为「未禁 IME 就建窗」的反例并加载第三方 TSF）、`register_window_class()`、`register_watchdog_class()`、`Renderer::new()` + `renderer::set_renderer`、建看门狗窗口与主窗口；`Drop` 里按生产同样的顺序清理：先 `unregister_session_notification()`（生产纪律：注销先于 `DestroyWindow`）、`unregister_power_notifications()`（02 篇后此处覆盖全部三项电源/休眠订阅，不再逐个调 Win32 注销）、`remove_tray_icon()`、`DestroyWindow` 两个窗口、`renderer::take_renderer()`。
-- 需要的 `pub(crate)` 只读 accessor：`EMBEDDED`、`CURRENT_MAIN_HWND`、`SESSION_NOTIFY_HWND` 与电源三句柄（02 篇把单句柄拆成 `POWER_NOTIFY_HANDLE` / `DISPLAY_NOTIFY_HANDLE` / `SUSPEND_NOTIFY_HANDLE` 三个具名原子，重建断言须覆盖三者才算钉住定向订阅的重绑；每处只加一个 getter，不暴露写入口，符合 AGENTS.md 第 10 条「唯一真值源」）。
+- 需要的 `pub(crate)` 只读 accessor：`EMBEDDED`、`CURRENT_MAIN_HWND`、`SESSION_NOTIFY_HWND`、电源三句柄与托盘绑定（02 篇把单句柄拆成 `POWER_NOTIFY_HANDLE` / `DISPLAY_NOTIFY_HANDLE` / `SUSPEND_NOTIFY_HANDLE` 三个具名原子，重建断言须覆盖三者才算钉住定向订阅的重绑；托盘 `tray_owner` 用于断言回调落点从旧柄迁移到新柄；每处只加一个 getter，不暴露写入口，符合 AGENTS.md 第 10 条「唯一真值源」）。
 - 预处理条件（如「系统里没有 Explorer / 任务栏」）不满足时**显式 panic 并给出可操作的失败信息**（例如「本机无 Explorer，跳过前请先启动 explorer.exe」），不使用提前 `return` 的假 skip；该套件本身就是 opt-in 的 `#[ignore]`，失败比假绿更有价值。
 
 **自动化用例（标 `#[ignore]`）**：
 
 1. 建窗与嵌入：`create_watchdog_window()` + `create_main_window()` 成功后 `get_taskbar_hwnd()` 非空；`embed_in_taskbar(hwnd)` 返回 `Ok`，且 `GetParent(hwnd)` 等于 `get_taskbar_hwnd()`（这条同时是 04 篇后置断言的回归保护）。
-2. 重建路径：直接调 `rebuild_main_window(watchdog)`（**刻意绕过** `TaskbarCreated` 路由，只测重建函数本身；路由依赖真实广播，属人工验收），断言 `CURRENT_MAIN_HWND` 已换成新句柄、`EMBEDDED` 为真、`SESSION_NOTIFY_HWND` 与三项电源/休眠订阅句柄非空，且用例结束时托盘无残留（`remove_tray_icon()` 由 fixture 负责）。
+2. 重建路径：直接调 `rebuild_main_window(watchdog)`（**刻意绕过** `TaskbarCreated` 路由，只测重建函数本身；路由依赖真实广播，属人工验收）。重建前先按生产尾段同顺序给旧窗口建立真实绑定（电源订阅→嵌入→托盘/定时器→会话通知），否则重建内的注销路径全是空操作；重建后断言 `CURRENT_MAIN_HWND` 已换成新句柄、`EMBEDDED` 为真、会话通知与托盘绑定精确迁移到新柄（残留旧柄即失败）、三项电源/休眠订阅句柄在册、定时器无缺失残留，且用例结束时托盘无残留（`remove_tray_icon()` 由 fixture 负责）。
 3. 定时器收敛与挂起对称：`sync_monitoring_timers(hwnd)` 返回的缺失集合为空；`suspend_system(hwnd, SUSPEND_REASON_SESSION)` → `resume_system(hwnd, SUSPEND_REASON_SESSION)` 各一次后再调仍为空（对应 `src/suspend.rs:169-216` 的对称性与 04 篇的返回值改造）。
-4. `WM_DPICHANGED` 消息处理（**最低断言，明确其局限**）：`SendMessageW(hwnd, WM_DPICHANGED, ...)` 后进程不 panic、`DPI_DIRTY` 最终被清。必须写清：处理器用 `GetDpiForWindow`（`src/renderer.rs:439`）取当前 DPI，手工发消息**不会**改变它，所以这条用例**不验证**跨屏尺寸变化；真正的跨屏 DPI 行为留在人工清单里。若实施时发现这条用例只能证明「不 panic」，宁可删掉它，也不要把它写成「已覆盖 DPI」。
+4. DPI 脏位由恢复事务清位（**明确其边界**）：先预置 `DPI_DIRTY = true`（干净初值会让断言空洞——消息成功分支根本不碰该位），`SendMessageW(hwnd, WM_DPICHANGED, ...)` 后进程不 panic 且脏位仍在（消息分支只更新资源并重嵌入，清位权只归恢复事务），再驱动真正的清位 owner `recover_dpi` 并断言其成功且脏位被清。必须写清：处理器用 `GetDpiForWindow`（`src/renderer.rs:439`）取当前 DPI，手工发消息**不会**改变它，所以这条用例**不验证**跨屏尺寸变化；真正的跨屏 DPI 行为留在人工清单里（本次选择加强而非删除：预置脏位 + 驱动真实恢复事务后，用例已能证明清位语义）。
 
 **人工清单（发布前过一遍，写进同一个文件顶部注释或随 04 篇的验收）**：合盖睡眠→唤醒后网络数值在 1–2 秒内、CPU/内存在一个 5 秒周期内恢复更新（`src/config.rs:63-65`，且 `src/suspend.rs:59-62` 的恢复边沿只重建基线，首轮不会显示虚高速率）；跨两个不同缩放比显示器的拖动；断开网络后手动检查更新的失败提示；更新确认框点「是」后主程序退出、安装器正常启动；安装器 UAC 取消后主程序被重新拉起；09 篇的「漏收解锁」故障注入。
 
@@ -42,7 +42,7 @@ Status: proposed
 
 - **不拆分 lib target、不新建 `tests/` 目录**（bin-only 结构是既定事实，改造它属于架构变更）。
 - **不把冒烟用例纳入 `check.yml` 的必跑门禁**：它对环境（真实 Explorer、真实任务栏、交互式桌面）有依赖，先作为 opt-in 的手动套件，稳定性数据积累后再定。
-- **不为可测性改控制流**；只为各只读状态加一个 `pub(crate)` getter（`EMBEDDED`、`CURRENT_MAIN_HWND`、`SESSION_NOTIFY_HWND`、三项电源/休眠句柄共 6 个，这是上一稿“4 个”按 02 篇拆分后的数量修正）。
+- **不为可测性改控制流**；只为各只读状态加一个 `pub(crate)` getter（`EMBEDDED`、`CURRENT_MAIN_HWND`、`SESSION_NOTIFY_HWND`、三项电源/休眠句柄、托盘绑定共 7 个；“4 个”是 02 篇拆分与托盘迁移断言加入前的数量）。
 - **不覆盖渲染像素级比对**（GDI 位图比对在不同 DPI/主题下噪声太大）。
 - **不做 `WM_DPICHANGED` 的「真实跨屏」自动化**：需要在测试进程里改变窗口所在显示器，成本与稳定性都不成立。
 - **不做故障注入的自动化**（把后置断言改成恒假之类的动作只作为一次性失效验证，不进代码库）。
@@ -59,7 +59,7 @@ Status: proposed
 - `grep -rn "#\[ignore\]" src/` 命中 ≥ 4 处（或按最终用例数一致）；命令必须带串行开关：`AGENTS.md` 新增的那一行含 `cargo test --locked -- --ignored --test-threads=1`。
 - 默认门禁输出**按实际数字核对**：新增 N 个 `#[ignore]` 后 `cargo test --locked` 输出为 `107 passed; N ignored`（不是 `0 ignored`），且既有 107 条全部仍然通过。
 - `cargo test --locked -- --ignored --test-threads=1` 在有 Explorer 的交互式桌面上全绿；没有 Explorer 时**显式失败**并打印「请先启动 explorer.exe」这类可操作信息（不允许静默 passed）。
-- 失效验证（必须做一次，这是本 note 唯一能证明「测试真的承重」的手段）：临时把 `embed_in_taskbar` 的后置断言改成恒假 → 用例 1 必须变红；临时删掉 `DPI_DIRTY` 的置位或清位 → 用例 4 必须变红；验证完恢复代码，并在 PR 描述里记录这两次观察。
+- 失效验证（必须做一次，这是本 note 唯一能证明「测试真的承重」的手段）：临时把 `embed_in_taskbar` 的后置断言改成恒假 → 用例 1 必须变红；临时删掉 `recover_dpi` 的清位 → 用例 4 必须变红；临时删掉重建内的会话重绑 → 用例 2 必须变红（`None`）；临时连注销带重绑一起删 → 用例 2 必须变红（残留旧柄，旧 `is_some` 断言会漏过后者）；验证完恢复代码，并在 PR 描述里记录这些观察。残留缺口：电源句柄值域不透明，“注销先于 `DestroyWindow` 的顺序”删除后用例仍绿，只由代码评审覆盖。
 - `grep -rn "pub(crate) fn.*embedded\|embedded()" src/window.rs` 等 accessor 存在（人工核对：只加 getter，没有暴露写入口）。
 - `cargo clippy --all-targets --locked -- -D warnings` 与 `cargo fmt -- --check` 全绿（`--all-targets` 会带上新增的 test 目标）。
 - `AGENTS.md` 的「构建与发布」小节新增一行手动命令说明（按该文档自己的更新指南，属「非直觉的验证发布命令」）。
