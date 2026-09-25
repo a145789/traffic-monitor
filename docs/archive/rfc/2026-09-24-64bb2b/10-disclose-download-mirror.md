@@ -1,6 +1,6 @@
 # Agent Note：在 README 披露更新下载会回落到第三方镜像
 
-Status: proposed
+Status: implemented
 
 本 note 是 07 篇拆出来的产品口径部分。它不改任何行为，只补一句对用户的披露；改动本身只有一行 README，但**措辞需要项目所有者定稿**。
 
