@@ -90,6 +90,14 @@ reg add "HKCU\Software\Traffic Monitor" /v EnableDebugLog /t REG_DWORD /d 0 /f
 
 通过 Windows 设置 → 应用 → 找到 Traffic Monitor → 卸载
 
+### 关于更新下载与第三方镜像
+
+更新检查的**版本元数据**（版本号与安装包 SHA-256 摘要）始终只从 `github.com` 获取，不经过任何第三方。
+
+下载安装包时优先直连 `github.com`；若直连下载失败，会**自动回落到第三方镜像 `ghproxy.cn`**（该镜像只中转安装包字节流，不参与元数据）。这段回落当前**没有开关，不可关闭**。
+
+无论从哪个来源下载，安装包在启动安装前都会在本机重新计算 SHA-256 并与 `github.com` 给出的摘要比对，不匹配即删除重下；由于摘要只来自官方源，镜像无法伪造出可安装的安装包。
+
 ### 绿色版
 
 直接删除 `traffic-monitor.exe` 文件即可
