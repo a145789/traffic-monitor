@@ -1,6 +1,6 @@
 # Agent Note：给更新子进程定归属（父身份绑定 + 可取消下载 + 跨进程互斥）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -20,7 +20,7 @@ Status: proposed
 
 1. **父身份绑定到「进程 + 创建时刻」，并只等待那个句柄。** 父进程 spawn 时传 `--parent-pid <n> --parent-start <FILETIME>`（父侧用 `GetProcessTimes` 取自身创建时间）；子进程启动早期 `OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid)`，用 `GetProcessTimes` 复核创建时刻**完全相等**，然后持有该句柄到进程结束，之后的所有存活检查都用 `WaitForSingleObject(handle, 0)`。只传 PID 不足以承载这个机制：长时间开机的机器上 PID 必然被复用，子进程没有原始创建时刻可比，`OpenProcess` 会拿到另一个进程的句柄并误判「父还在」。`--parent-pid` 缺席时（手工调试）自检退化为空操作，不影响 `--check-update --manual` 的独立可用性。
 2. **检查点与动作规则写死为两条**（不是「弹框前查一次」就够）：
-   - R1 父已消失、且本次检查尚未走到「用户确认安装」⇒ 静默退出：不下载、不弹框、不启动安装器（发出协议行之前退出，父侧读到 `read_failed`，自然按失败处理）。
+   - R1 父已消失、且本次检查尚未走到「用户确认安装」⇒ 静默退出：不下载、不弹框、不启动安装器（发出协议行之前退出，父侧读到空流，`saw_valid_action` 为假，自然按失败处理）。
    - R2 用户**已在模态框里点了「是」** ⇒ 无论父进程是否还在都继续交接：这是用户明确表达过的意图，不再依赖 `EXIT_MAIN` 的送达。若此时父进程仍在而 `EXIT_MAIN` 写失败，则视为硬错误、**不得**启动安装器（否则父进程不会释放 exe 映像，必然撞上文件占用）；父已消失而写失败则继续（没有需要通知的对象）。
    - 检查点落点：进入下载前一次、`fetch_to_file` 的每个分块处（谓词）、以及**每个 `show_info` / `show_yes_no` 返回之后**——模态框可能在父进程退出期间一直开着，返回后才做决定，这是 R1/R2 的分界。
 3. **`emit_protocol_line` 返回 `Result`**，`EXIT_MAIN` 的写入结果参与上面的 R2 分支判断；`DONE` 的写入失败只记日志（无人在等）。
@@ -48,7 +48,7 @@ Status: proposed
 ## 验收标准
 
 - `grep -rn "parent-pid\|parent_pid\|parent-start\|parent_start" src/` 命中 ≥ 4 处（父侧构造两参数、子侧解析两参数）；子进程侧存在 `GetProcessTimes` 与 `WaitForSingleObject` 的使用（人工核对：复核创建时刻 + 只等句柄，不接受「只 `OpenProcess` 就算」）。
-- `grep -rn "CreateMutexW" src/` 命中 2 处（单例 + 更新互斥），且更新互斥在 `src/main.rs:187` 的 `--check-update` 分支内、而非其后。
+- `grep -rn "CreateMutexW" src/` 只认**调用点** 2 处（单例锁、更新互斥；行数会连带 import 与 SAFETY 注释，不按行数判定），且更新互斥的申请在 `src/main.rs` 的 `--check-update` 分支内、而非其后。
 - `grep -rn "BUSY" src/` 覆盖三处：子进程输出、`parse_update_action` 的解析分支、父侧「不推进正常冷却」的判定；`grep -rn "FetchFileError::Cancelled\|FetchFailure::Cancelled" src/` 命中 ≥ 2 处（产生处 + 分类处）。
 - 协议测试（`src/update/protocol.rs:230-387`，用 `Cursor` 喂字符串）需要**扩充**而不是保持：新增 `BUSY` 行被识别为「有效动作但非成功完成」，并补一条「`Cancelled` 不得被分类成 `Download`」的判定测试。
 - 手动场景 A：托盘菜单触发检查 → 下载中途用托盘退出主程序 → 任务管理器内无 `--check-update` 残留进程，且 30 秒内不出现任何更新弹框。
@@ -59,6 +59,7 @@ Status: proposed
 ## 风险
 
 - 检查与动作之间的竞态窗口仍然存在：`WaitForSingleObject` 报「还在」之后父进程可能立刻退出，随后子进程才弹框。窗口从「整个下载期」缩到「检查与弹框之间」，量级从分钟降到毫秒；彻底闭合需要把弹框改成可取消的自绘窗口（已列入「不在本次范围」）。
+- 元数据抓取（`fetch_url`）**不带**取消谓词：检查点只覆盖安装包下载的每个数据块，这一次 4KiB 请求从建连到收完之间不可中断（`HttpGet::open` 同理），父进程若在该窗口内退出，「静默放弃」最坏要等这次抓取走完自身超时；该阶段无弹框、无写盘、不启动安装器，因此用户可见后果只是多一次无人消费的元数据请求，但这个延迟窗口确实存在，要在抓取之间保证不再有无人要的重试（失败重试前必须复判一次 R1）。彻底消除得把谓词一路透传到 `fetch_url` 的消费闭包，收益仅限收包阶段（建连阶段仍不可中断）。
 - `--parent-pid`/`--parent-start` 属于公开 CLI 面，需在 `parse_cli_args`（`src/main.rs` 的测试已覆盖精确匹配语义，`src/main.rs:792-799`）里一并处理，避免被当成未知参数；参数缺失时必须按「无父可查」走退化路径，而不是按「父已退出」误杀手工调用。
 - 会话级更新互斥无法阻止两个不同用户会话同时更新：它们会通过缓存锁的 `FetchFailure::Local("创建安装包文件失败")` 之一失败（现状即如此），本 note 不改变该结论，也不把互斥名升为 `Global\`（那会让异会话的更新互相阻塞到超时）。
 - `BUSY` 是协议面的新增值，若旧版父进程（升级中途、新旧混跑）读到未知行会落入 `saw_valid_action == false` 并被当作失败——这是可接受的失败方向（退到错误冷却），但实施时要确认 `src/update/protocol.rs` 的扫描器不会因为未知行而提前中断读取。

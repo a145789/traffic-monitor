@@ -46,6 +46,7 @@ pub(super) enum InstallerLaunch {
 ///
 /// 背景：旧流程仅下载失败回落，哈希/创建/锁定失败直接返回；若把本地校验失败也
 /// 回落，持续的本地磁盘故障会为空耗整包流量再失败一次。
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum FetchFailure {
     /// 抓取段失败（建连/发送/接收/状态码/查询/读取/超限），可回落代理。
     /// 写盘/哈希失败由 `http` 归为 `FetchFileError::Local`，经调用方转为本枚举的
@@ -53,6 +54,21 @@ pub(super) enum FetchFailure {
     Download(String),
     /// 本地失败（创建、流式写盘、锁定、锁柄重验），直接返回不再回落。
     Local(String),
+    /// 取消（父进程已消失、本次动作已无人要）：既不是网络失败也不是本地失败，
+    /// 不回落代理、不重试，调用方静默放弃。
+    Cancelled,
+}
+
+/// 抓取段失败 → 单源归类的唯一实现。
+///
+/// 抽成纯函数是为了让「取消不得被归成 Download」这条判定可被单测钉死：
+/// 归错会让调用方在父进程已消失时再整整下一遍 256 MiB 的代理包。
+fn classify_fetch_error(error: FetchFileError) -> FetchFailure {
+    match error {
+        FetchFileError::Download(msg) => FetchFailure::Download(msg),
+        FetchFileError::Local(msg) => FetchFailure::Local(msg),
+        FetchFileError::Cancelled => FetchFailure::Cancelled,
+    }
 }
 
 /// 缓存复用：先加只读共享锁，再对锁定句柄哈希——同一句柄验证与持有。
@@ -84,12 +100,14 @@ pub(super) fn try_reuse_cached_installer(
 /// 不按路径另开文件；失败路径尽力删文件（删除结果忽略，
 /// 外部占用下可能残留，由下次缓存哈希不匹配触发重下）。
 /// 错误已带中文 `op`（抓取/哈希/写入/锁定），调用方按 `FetchFailure` 决定回落。
+/// `should_continue` 透传给 `http::fetch_to_file`，用于逐块取消（父进程存活判定）。
 pub(super) fn fetch_verified_installer(
     temp_path: &std::path::Path,
     host: &str,
     url_path: &str,
     expected_hash_hex: &str,
     version: &str,
+    should_continue: &impl Fn() -> bool,
 ) -> Result<VerifiedInstaller, FetchFailure> {
     if let Some(parent) = temp_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -118,15 +136,19 @@ pub(super) fn fetch_verified_installer(
             }
         }
     };
-    if let Err(e) = fetch_to_file(host, url_path, INSTALLER_MAX_BYTES, &mut write_lock) {
+    if let Err(e) = fetch_to_file(
+        host,
+        url_path,
+        INSTALLER_MAX_BYTES,
+        &mut write_lock,
+        should_continue,
+    ) {
         // 先释放写锁再删，否则 Windows 下删除被占用文件会失败而残留。
         drop(write_lock);
         let _ = std::fs::remove_file(temp_path);
-        // 错误来源由产生处分类，不匹配文案：Download 回落代理，Local 直接返回。
-        return Err(match e {
-            FetchFileError::Download(e) => FetchFailure::Download(e),
-            FetchFileError::Local(e) => FetchFailure::Local(e),
-        });
+        // 错误来源由产生处分类，不匹配文案：Download 回落代理，Local 直接返回，
+        // Cancelled 静默放弃（见 classify_fetch_error）。
+        return Err(classify_fetch_error(e));
     }
     // 降级为只读共享锁：映像加载器以 FILE_SHARE_READ|FILE_SHARE_DELETE 打开，
     // 不容纳并存句柄的写访问权，持写句柄启动必失败 32。先关写再开只读，
@@ -306,6 +328,26 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== classify_fetch_error =====
+
+    #[test]
+    fn test_cancelled_is_not_classified_as_download() {
+        // 取消必须独立于下载失败：被归成 Download 会让调用方回落第三方代理，
+        // 在父进程已消失、本次动作已无人要的情况下再下整整一个安装包。
+        assert_eq!(
+            classify_fetch_error(FetchFileError::Cancelled),
+            FetchFailure::Cancelled
+        );
+        assert_eq!(
+            classify_fetch_error(FetchFileError::Download("建立网络连接失败".to_string())),
+            FetchFailure::Download("建立网络连接失败".to_string())
+        );
+        assert_eq!(
+            classify_fetch_error(FetchFileError::Local("写入安装包文件失败".to_string())),
+            FetchFailure::Local("写入安装包文件失败".to_string())
+        );
+    }
 
     // ===== is_transient_launch_error =====
 

@@ -1,7 +1,9 @@
 //! WinHTTP 抓取与友好的中文错误映射。
 //!
 //! 元数据仍走 `fetch_url`（整包内存，上限仅 4KiB）；安装包走 `fetch_to_file`
-//!（固定缓冲复用，边读边写，上限 `INSTALLER_MAX_BYTES`）。
+//!（固定缓冲复用，边读边写，上限 `INSTALLER_MAX_BYTES`），后者另接受一个由调用方
+//! 注入的取消谓词并在每个数据块判一次：取消走独立的 `FetchFileError::Cancelled`，
+//! 不与下载失败同义（否则会触发一次完整的第三方代理重下）。
 
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::Networking::WinHttp::*;
@@ -245,6 +247,8 @@ pub(super) fn fetch_url(
         // 本路径无本地故障来源（收集闭包只做 Vec 写入），此臂仅为穷尽匹配；
         // 若将来在此引入 Local，必须同步改 fetch_url 的返回类型或调用方分支。
         FetchFileError::Download(msg) | FetchFileError::Local(msg) => msg,
+        // 本路径不注入取消谓词（元数据仅 4KiB、单次请求），此臂同样只为穷尽匹配。
+        FetchFileError::Cancelled => "下载已取消".to_string(),
     };
     let conn = HttpGet::open(host, path).map_err(map_err)?;
     let mut response = Vec::new();
@@ -269,25 +273,36 @@ pub(super) fn fetch_url(
 ///（`installer::fetch_verified_installer`），下载期不做第二份比对。
 /// 失败返回结构化错误：抓取段（建连/发送/接收/状态码/查询/读取/超限）为
 /// `Download`（可回落代理），写入段为 `Local`（磁盘本地故障，不回落，
-/// 避免空耗整包流量）。文案均带中文 `op`，调用方按变体映射到回落决策，
+/// 避免空耗整包流量），取消为独立变体 [`FetchFileError::Cancelled`]（不得回落、
+/// 不得重试）。文案均带中文 `op`，调用方按变体映射到回落决策，
 /// 不要匹配文案猜来源。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FetchFileError {
     Download(String),
     Local(String),
+    /// 取消谓词在下发数据块时不成立。**不得与下载失败同义**：把「父进程已消失、
+    /// 本次动作已无人要」归成 `Download` 会触发一次完整的第三方代理重下。
+    Cancelled,
 }
 
+/// `should_continue` 由调用方注入（父进程存活判定），每个数据块判一次：
+/// 块大小固定为 [`HTTP_READ_CHUNK_BYTES`]，检查粒度即此；谓词返回 false 时
+/// 立即以 `Cancelled` 收尾，不再做任何网络或磁盘动作。
 pub(super) fn fetch_to_file(
     host: &str,
     path: &str,
     max_response_bytes: usize,
     file: &mut std::fs::File,
+    should_continue: impl Fn() -> bool,
 ) -> Result<(), FetchFileError> {
     use std::io::Write;
 
     let conn = HttpGet::open(host, path)?;
     {
         let consume = |data: &[u8]| -> Result<(), FetchFileError> {
+            if !should_continue() {
+                return Err(FetchFileError::Cancelled);
+            }
             file.write_all(data)
                 .map_err(|e| FetchFileError::Local(format!("写入安装包文件失败: {e}")))?;
             Ok(())

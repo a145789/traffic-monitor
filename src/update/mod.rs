@@ -42,9 +42,10 @@ use installer::{
     FetchFailure, InstallerLaunch, VerifiedInstaller, fetch_verified_installer, launch_installer,
     relaunch_main_app, try_reuse_cached_installer, wait_main_instance_gone,
 };
-use protocol::{
-    UpdateAction, emit_protocol_line, reset_update_progress_after_check, run_check_subprocess,
-};
+use protocol::{UpdateContext, reset_update_progress_after_check, run_check_subprocess};
+/// 子进程侧协议出口：`--check-update` 分支（`main.rs`）需要自己申请跨进程更新互斥
+/// 并用 `BUSY` 收尾，故这两项提到 `update` 模块边界之外可见。
+pub(crate) use protocol::{acquire_update_mutex, emit_protocol_line};
 use version::{compare_versions, parse_update_metadata};
 
 /// 仓库唯一来源：所有 GitHub 路径与 URL 均从这里派生，更换仓库只需改这一处。
@@ -187,10 +188,25 @@ fn next_check_deadline(now: Instant, is_error: bool) -> Instant {
 fn update_check_worker(is_manual: bool) {
     let outcome = run_check_subprocess(is_manual);
 
+    if outcome.busy {
+        // 另一处更新进程占用了更新互斥量，本次一个请求都没发出去。
+        //
+        // 刻意不给用户任何提示（这是取舍，不是遗漏）：① 协议面要求这种占用静默收尾，
+        // 验收场景 B 的手工 `--check-update --manual` 必须立即静默退出；② 更新相关提示
+        // 不得回流常驻主进程（AGENTS.md 第 4 条，会常驻网络/UI DLL）；③ 若改由子进程弹框，
+        // 父进程的更新工作线程会一直阻塞在 `child.wait()` 直到框被点掉，且框可能在主界面
+        // 消失后成为孤儿框——正是本 RFC 要收的问题。只留日志，供「更新一直不动」时排查。
+        log_event!("本次更新检查因另一处更新进程占用而跳过（BUSY）");
+    }
+
     if !is_manual {
         let mut next = NEXT_CHECK_TIME.lock().unwrap();
         // 成功与失败都在检查完成后写入：deadline 一律从此刻起算，节奏与改造前一致。
-        *next = Some(next_check_deadline(Instant::now(), outcome.is_error));
+        // BUSY 不是一次成功检查（见 should_use_error_cooldown），不得写成正常冷却。
+        *next = Some(next_check_deadline(
+            Instant::now(),
+            should_use_error_cooldown(outcome.is_error, outcome.busy),
+        ));
     }
 
     // 只有「读到 EXIT_MAIN」且消息已成功入队，主进程才会继续执行退出交接。
@@ -198,6 +214,15 @@ fn update_check_worker(is_manual: bool) {
         return;
     }
     compact_and_trim();
+}
+
+/// 本次检查结果是否按「失败」记账（错误冷却），而不是一小时的正常冷却。
+///
+/// `BUSY`（另一处更新子进程仍在跑）不是一次成功的检查：本次没有产出任何结论，
+/// 写成正常冷却就等于把「没执行」记成「已经检查过」，整整一小时不再重试。
+/// 父进程消失导致的 R1 静默放弃以非零退出码表达，已经落在 `is_error` 里。
+fn should_use_error_cooldown(is_error: bool, busy: bool) -> bool {
+    is_error || busy
 }
 
 /// 把启动期自动检查推迟一个冷却周期（relaunch 场景调用）。
@@ -215,13 +240,33 @@ enum CheckResult {
     PortableFound(String),
     InstalledReady(VerifiedInstaller),
     Error(String),
+    /// R1：父进程已消失、且用户尚未确认安装 ⇒ 静默放弃（不下载、不弹框、不启安装器）。
+    /// 与 `Error` 分开：它既不该弹错误框，也不该回落代理或重试。
+    Abandoned,
 }
 
-fn do_update_check(is_manual: bool) -> CheckResult {
+fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
+    // 元数据抓取前的第一次 R1 检查：父进程若已消失，后面每一步都是无人要的动作。
+    if ctx.abandoned() {
+        log_event!("父进程已退出且用户未确认安装，放弃本次更新检查");
+        return CheckResult::Abandoned;
+    }
+
+    // 已知限制：元数据抓取本身**不带**取消谓词——检查点只覆盖安装包下载的每个数据块，
+    // 这一次 4KiB 请求从建连到收完之间不可中断（`HttpGet::open` 同理），因此父进程若在
+    // 该窗口内退出，「静默放弃」最坏要等这次抓取走完自身超时；该阶段无弹框、无写盘、
+    // 不启动安装器，用户可见后果只是多一次无人消费的元数据请求。这里保证的是：
+    // 抓取之间不再发起无人要的重试（见下面的重试前复判）。
     let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     if response.is_err() {
         // 失败时增加 1 次重试，并等待片刻防止抖动
         std::thread::sleep(Duration::from_millis(UPDATE_FETCH_RETRY_DELAY_MS));
+        // 复判 R1：这 500ms 的等待里父进程可能已退出，规则要求父已消失就不再发起任何
+        // 网络动作——不能因为「已经决定要重试」而把一个无人要的请求发出去。
+        if ctx.abandoned() {
+            log_event!("父进程已退出且用户未确认安装，放弃本次更新检查");
+            return CheckResult::Abandoned;
+        }
         response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     }
 
@@ -263,6 +308,13 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 
     let temp_path = get_temp_installer_path();
 
+    // 下载/复用前的第二次 R1 检查：元数据抓取带一次 500ms 重试，其间父进程可能已退出；
+    // 命中后连缓存复用（可能要对 256MiB 缓存重算哈希）也不必再做。
+    if ctx.abandoned() {
+        log_event!("父进程已退出且用户未确认安装，放弃本次更新检查");
+        return CheckResult::Abandoned;
+    }
+
     // 缓存复用：先加锁再对锁定句柄哈希（见 try_reuse_cached_installer），
     // 同一句柄验证与持有，不按路径另开文件。缺失/占用/不匹配都落到重下。
     if let Some(verified) =
@@ -270,6 +322,9 @@ fn do_update_check(is_manual: bool) -> CheckResult {
     {
         return CheckResult::InstalledReady(verified);
     }
+
+    // 取消谓词：每读到一个数据块判一次（块大小 HTTP_READ_CHUNK_BYTES，见 http 模块头）。
+    let still_wanted = || !ctx.abandoned();
 
     // 主源下载失败才回落代理；校验/锁定等本地失败直接返回，不多下整包。
     // 流式写入全程不经过整包 Vec（见 fetch_verified_installer）。
@@ -279,6 +334,7 @@ fn do_update_check(is_manual: bool) -> CheckResult {
         &download_path,
         &expected_hash_hex,
         &latest_version,
+        &still_wanted,
     ) {
         Ok(verified) => CheckResult::InstalledReady(verified),
         Err(FetchFailure::Download(e)) => {
@@ -289,6 +345,7 @@ fn do_update_check(is_manual: bool) -> CheckResult {
                 &proxy_path,
                 &expected_hash_hex,
                 &latest_version,
+                &still_wanted,
             ) {
                 Ok(verified) => CheckResult::InstalledReady(verified),
                 Err(FetchFailure::Download(pe)) => {
@@ -298,9 +355,13 @@ fn do_update_check(is_manual: bool) -> CheckResult {
                 Err(FetchFailure::Local(pe)) => {
                     CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
                 }
+                // 两段都只在父进程消失时取消：静默放弃，不报「代理源失败」的假错误。
+                Err(FetchFailure::Cancelled) => CheckResult::Abandoned,
             }
         }
         Err(FetchFailure::Local(e)) => CheckResult::Error(e),
+        // 取消不是失败：不再回落代理、不再重试。
+        Err(FetchFailure::Cancelled) => CheckResult::Abandoned,
     }
 }
 
@@ -311,23 +372,47 @@ fn do_update_check(is_manual: bool) -> CheckResult {
 /// - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
 ///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才提权
 ///   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
+/// - 无协议行：R1 静默放弃（父进程已消失且用户未确认），退出码非零。
 ///
-/// 退出码：0 = 检查流程成功完成，1 = 更新检查失败。手动检查失败时，错误提示
-/// 已由子进程显示；退出码只供主进程决定自动检查的重试冷却时间。
-pub fn subprocess_main(is_manual: bool) -> i32 {
+/// 退出码：0 = 检查流程成功完成（含 `EXIT_MAIN` 交接），1 = 检查失败或 R1 静默放弃。
+/// 手动检查失败时错误提示已由子进程显示；退出码只供主进程决定自动检查的重试冷却时间。
+///
+/// 父身份由 `parent_pid` / `parent_start` 两参数给出（见 [`UpdateContext`]）；
+/// 任一缺失即退化为「无父可查」，`--check-update --manual` 的独立可用性不受影响。
+pub fn subprocess_main(is_manual: bool, parent_pid: Option<u32>, parent_start: Option<u64>) -> i32 {
     // EcoQoS/低内存优先级只加给本短生命周期子进程，不拖慢常驻监控主进程。
     configure_background_process();
     refresh_debug_log_flag();
 
-    let result = do_update_check(is_manual);
-    let is_error = matches!(result, CheckResult::Error(_));
-    let action = complete_update_interaction(result, is_manual);
+    let mut ctx = UpdateContext::new(parent_pid, parent_start);
 
-    // EXIT_MAIN 已在启动安装器之前输出完毕；其余路径统一以 DONE 收尾。
-    if action == UpdateAction::Done {
-        emit_protocol_line("DONE");
+    let result = do_update_check(is_manual, &ctx);
+    let is_error = matches!(result, CheckResult::Error(_));
+    match complete_update_interaction(result, is_manual, &mut ctx) {
+        // EXIT_MAIN 已在启动安装器之前输出完毕；其余路径统一以 DONE 收尾。
+        SubprocessEnd::Done => {
+            if let Err(e) = emit_protocol_line("DONE") {
+                // 无人在等这条行（父进程要么已收尾，要么已消失）：只留日志。
+                log_event!("协议行 DONE 写出失败: {e}");
+            }
+            i32::from(is_error)
+        }
+        SubprocessEnd::ExitMain => 0,
+        // R1 静默放弃：不输出任何协议行。父侧只会看到非零退出码，自然按失败记账
+        // （错误冷却），不会把「没执行」记成「已检查过」。
+        SubprocessEnd::Abandoned => 1,
     }
-    i32::from(is_error)
+}
+
+/// 子进程本次检查的收尾方式（与协议行 `UpdateAction` 分开：R1 不产出协议行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubprocessEnd {
+    /// 输出 `DONE`：检查流程结束，主进程继续运行。
+    Done,
+    /// 已输出 `EXIT_MAIN`：安装交接开始，主进程将按约定退出。
+    ExitMain,
+    /// R1 静默放弃：不输出协议行，退出码非零。
+    Abandoned,
 }
 
 /// 手动检查「无更新」时的提示文案；`None` 表示不提示（自动检查不弹框）。
@@ -347,65 +432,124 @@ fn no_update_message(is_manual: bool, dev_build: bool, version: &str) -> Option<
     })
 }
 
-fn complete_update_interaction(result: CheckResult, is_manual: bool) -> UpdateAction {
+/// 用户交互与外部动作；返回本次检查的收尾方式。
+///
+/// 每个模态框（`show_info` / `show_yes_no`）返回之后都要再判一次 R1：模态框可能
+/// 一直开到父进程退出，决定必须在框关闭之后做（见 [`UpdateContext::abandoned`]）。
+/// 用户点「是」的那一刻起进入 R2，此后父进程是否还在都不再撤销交接。
+fn complete_update_interaction(
+    result: CheckResult,
+    is_manual: bool,
+    ctx: &mut UpdateContext,
+) -> SubprocessEnd {
     match result {
+        CheckResult::Abandoned => SubprocessEnd::Abandoned,
         CheckResult::NoUpdate => {
+            if ctx.abandoned() {
+                return SubprocessEnd::Abandoned;
+            }
             if let Some(msg) = no_update_message(is_manual, DEV_BUILD, VERSION) {
                 show_info(&msg);
+                if ctx.abandoned() {
+                    return SubprocessEnd::Abandoned;
+                }
             }
-            UpdateAction::Done
+            SubprocessEnd::Done
         }
         CheckResult::PortableFound(version) => {
+            if ctx.abandoned() {
+                return SubprocessEnd::Abandoned;
+            }
             let msg = format!("发现新版本 v{version}。\n是否打开网页下载免安装版？");
             if show_yes_no(&msg) {
+                // 用户已明确表达意图：后续动作不再因父进程消失而撤销（R2）。
+                ctx.mark_user_confirmed();
                 open_url(RELEASE_PAGE_URL);
             } else {
                 record_skipped_version(&version);
             }
-            UpdateAction::Done
+            if ctx.abandoned() {
+                return SubprocessEnd::Abandoned;
+            }
+            SubprocessEnd::Done
         }
         CheckResult::InstalledReady(verified) => {
+            // 弹安装确认框之前再判一次：父已消失就不把一个无人接管的问题抛给用户。
+            if ctx.abandoned() {
+                return SubprocessEnd::Abandoned;
+            }
             let msg = format!(
                 "新版本 v{} 已准备就绪。\n是否立即关闭程序并安装？",
                 verified.version
             );
             if !show_yes_no(&msg) {
                 record_skipped_version(&verified.version);
-                return UpdateAction::Done;
+                // 与其余模态框返回点一致：父进程若已消失，本次结果已无人消费（R1）。
+                if ctx.abandoned() {
+                    return SubprocessEnd::Abandoned;
+                }
+                return SubprocessEnd::Done;
             }
+            // R2 分界：用户已在模态框里点「是」，此后父进程是否还在都不再撤销交接。
+            ctx.mark_user_confirmed();
 
             // 关键顺序：先发 EXIT_MAIN 让主进程退出让出 exe 映像，等单实例
             // 互斥量消失后再启动安装器；安装器的 taskkill 仅负责清理残存进程。
-            emit_protocol_line("EXIT_MAIN");
-            log_event!("已发出 EXIT_MAIN，等待主进程退出");
+            if let Err(e) = emit_protocol_line("EXIT_MAIN") {
+                if ctx.parent_alive() {
+                    // 父进程仍在却收不到交接：它不会退出、也不会释放 exe 映像，
+                    // 此时启动安装器必然撞上文件占用——按硬错误收尾，不启安装器。
+                    //
+                    // 这里刻意不复判 R1：用户已在上面点过「是」，`user_confirmed` 为真，
+                    // `ctx.abandoned()` 在此恒为假（R2 的定义就是不因父进程消失而撤销
+                    // 用户刚表达的意图），补一条只等于写死代码。该框是本此交接失败的唯一
+                    // 可见提示，不能删；它是 R2 路径的错误提示，不受 R1「不弹框」约束。
+                    log_event!("EXIT_MAIN 写出失败 ({e})，主进程仍在，取消本次安装");
+                    show_error(&format!("无法通知主程序退出，已取消安装: {e}"));
+                    return SubprocessEnd::Done;
+                }
+                // 父进程已消失：没有需要通知的对象，继续完成用户已确认的安装。
+                log_event!("EXIT_MAIN 写出失败 ({e})，但主进程已退出，继续安装");
+            } else {
+                log_event!("已发出 EXIT_MAIN，等待主进程退出");
+            }
             wait_main_instance_gone();
 
             match launch_installer(verified) {
                 InstallerLaunch::Started => {
                     log_event!("安装器已启动");
-                    UpdateAction::ExitMain
+                    SubprocessEnd::ExitMain
                 }
                 InstallerLaunch::Cancelled => {
                     // 主进程已按约定退出（如 UAC 被取消），重新拉起应用，
                     // 避免任务栏小组件凭空消失。
                     log_event!("安装器启动被取消，重新拉起主程序");
                     relaunch_main_app();
-                    UpdateAction::ExitMain
+                    SubprocessEnd::ExitMain
                 }
                 InstallerLaunch::Failed(code) => {
                     log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
                     show_error(&format!("启动安装程序失败 (错误码: {code})"));
                     relaunch_main_app();
-                    UpdateAction::ExitMain
+                    SubprocessEnd::ExitMain
                 }
             }
         }
         CheckResult::Error(message) => {
             log_event!("更新检查失败: {message}");
+            // R1 必须先于任何弹框：父进程已消失时这次失败结果无人消费，
+            // 不能出现「主界面已经关掉，却还冒出『检查更新失败』」的模态框。
+            if ctx.abandoned() {
+                return SubprocessEnd::Abandoned;
+            }
             if is_manual {
                 show_error(&format!("检查更新失败: {message}"));
+                // 模态框返回后再判一次：框可能一直开到父进程退出。
+                if ctx.abandoned() {
+                    return SubprocessEnd::Abandoned;
+                }
             }
-            UpdateAction::Done
+            SubprocessEnd::Done
         }
     }
 }
@@ -466,6 +610,16 @@ mod tests {
         let now = Instant::now();
         assert!(next_check_deadline(now, true) > now);
         assert!(next_check_deadline(now, false) > now);
+    }
+
+    #[test]
+    fn busy_result_must_not_take_the_normal_cooldown() {
+        // BUSY 是「另一处更新子进程占用、本次没跑」，不是一次成功的检查：
+        // 按正常冷却记账就等于把「没执行」记成「已检查过」，整整一小时不再重试。
+        assert!(should_use_error_cooldown(false, true));
+        // 真失败仍按失败记账；只有正常结束才走一小时正常冷却。
+        assert!(should_use_error_cooldown(true, false));
+        assert!(!should_use_error_cooldown(false, false));
     }
 
     // `NoUpdate` 是自动检查的常态，绝不能弹框：否则每小时一次。
