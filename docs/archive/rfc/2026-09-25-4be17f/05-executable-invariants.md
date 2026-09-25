@@ -1,6 +1,6 @@
 # Agent Note：把「主进程不加载网络 DLL」与 unsafe 注释要求变成可执行断言
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
