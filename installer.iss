@@ -24,6 +24,9 @@ UsedUserAreasWarning=no
 
 [Files]
 Source: "target\release\traffic-monitor.exe"; DestDir: "{app}"; Flags: ignoreversion
+; 兜底强杀筛选器：dontcopy = 不随安装复制到 {app}，只在 ForceKillRemnant 里用
+; ExtractTemporaryFile 释放到 {tmp} 后以 -File 调用（见 [Code] 的 ForceKillRemnant）。
+Source: "installer\kill-remnant.ps1"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\Traffic Monitor"; Filename: "{app}\traffic-monitor.exe"
@@ -58,6 +61,9 @@ const
   GracefulWaitTimeoutMs = 5000;
   // 兜底强杀的最大轮次；每轮重新枚举残留进程并复查单例互斥量。
   ForceKillMaxAttempts = 3;
+  // 兜底强杀筛选器的包内文件名：由 [Files] 的 dontcopy 项提供，
+  // ForceKillRemnant 用 ExtractTemporaryFile 释放到 {tmp} 后以 -File 调用。
+  KillRemnantScript = 'kill-remnant.ps1';
 
 function InitializeSetup(): Boolean;
 begin
@@ -109,22 +115,27 @@ begin
   Result := not CheckForMutexes('TrafficMonitor_Mutex_Instance');
 end;
 
-// 超时兜底：按进程名定位残留实例并逐 PID 强制终止，最多重复 ForceKillMaxAttempts 轮。
-// 两处收窄缺一不可：不用映像名全杀以免误伤同名进程，
-// 且以命令行排除更新子进程（--check-update）——它正是发出 EXIT_MAIN 后
-// 等待主进程退出的协调者；刻意不用 /T 树杀，避免连带其子进程。
-// 每轮后复查互斥量即为终止结果检查；若最终仍有残留则直接返回，
-// 交由安装器原生文件占用提示处理，本过程不弹框。
+// 超时兜底：调用外置筛选器（installer\kill-remnant.ps1）终止残留实例，最多重复
+// ForceKillMaxAttempts 轮。按进程名筛选仍覆盖全机器所有同名进程，真正的收窄来自
+// 脚本里的三个必要条件：可执行文件完整路径等于本次升级的 {app}、进程会话等于安装器
+// 所在会话、命令行取得到且不含 --check-update（同目录的更新协调者 re-exec 必须留下）。
+// 本过程只做「少杀」，不做跨会话清理——异会话残留退回安装器原生文件占用提示。
+// 刻意不用 /T 树杀，避免连带其子进程。
+// 脚本路径与 -Expected 只作为参数传给 -File，不拼进 PowerShell 源码，避免引号、
+// %FOO%、中文、8.3 短路径的多层转义。每轮后复查互斥量即为终止结果检查；
+// 若最终仍有残留则直接返回，交由安装器原生文件占用提示处理，本过程不弹框。
 procedure ForceKillRemnant;
 var
   Attempt: Integer;
   ResultCode: Integer;
   KillCmd: String;
 begin
+  // dontcopy 的文件不随安装复制：必须先释放到 {tmp} 才能以 -File 调用。
+  ExtractTemporaryFile(KillRemnantScript);
   KillCmd :=
-    '/C powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process ' +
-    '| Where-Object { $_.Name -eq ''traffic-monitor.exe'' -and $_.CommandLine -notlike ''*--check-update*'' } ' +
-    '| ForEach-Object { taskkill /F /PID $_.ProcessId }"';
+    '/C powershell -NoProfile -ExecutionPolicy Bypass -File "' +
+    ExpandConstant('{tmp}\' + KillRemnantScript) + '" -Expected ' +
+    AddQuotes(ExpandConstant('{app}\traffic-monitor.exe'));
   for Attempt := 1 to ForceKillMaxAttempts do
   begin
     SetInstallStatus('旧版本无响应，正在结束残留进程…');

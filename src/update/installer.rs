@@ -401,4 +401,120 @@ mod tests {
         assert!(reused.is_none(), "锁定句柄哈希不一致时必须拒绝复用");
         let _ = std::fs::remove_file(&path);
     }
+
+    // ===== 安装器兜底强杀筛选器（installer/kill-remnant.ps1） =====
+
+    /// PowerShell 单引号字符串字面量：内部单引号翻倍。路径可能含空格与中文。
+    fn ps_single_quote(raw: &str) -> String {
+        format!("'{}'", raw.replace('\'', "''"))
+    }
+
+    /// JSON 字符串字面量转义（只用 ASCII 构造数据，故只需处理反斜杠与引号）。
+    fn json_escape(raw: &str) -> String {
+        raw.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    /// 以安装器所用的同一可执行体（`powershell`，即 Windows PowerShell 5.1）执行一段
+    /// 命令，返回 stdout 原始字节：断言只看 ASCII 数字，不依赖控制台代码页。
+    fn powershell_stdout(args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass"])
+            .args(args)
+            .output()
+            .expect("必须能启动 powershell：安装器的兜底强杀同样依赖它");
+        assert!(
+            output.status.success(),
+            "powershell 退出码非 0：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn contains_ascii(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    }
+
+    /// 确定性筛选器验收：脚本不参与 cargo 构建，用构造记录直接跑 `-Processes` + `-DryRun`，
+    /// 钉死「目标路径 + 当前会话 + 非更新协调者」三项收窄。旧实现在安装器内联 PowerShell，
+    /// 没有任何一次真实执行的验收；本用例取代它，且不依赖「真的进入强杀分支」。
+    ///
+    /// 构造记录覆盖 6 个边界：(a) 三条全中 ⇒ 必须列出；(b) 命令行含 `--check-update`、
+    /// (c) 异会话、(d) 命令行取不到、(e) 另一目录的同名 exe、(f) 可执行文件路径取不到
+    /// ⇒ 都必须不列出。(f) 是 `提案` 3 明列的 `ExecutablePath` 为 `$null` 边界。
+    /// 缺口（未实测，见提交说明）：`-DryRun` 之外的真杀路径与真实跨会话/跨目录进程
+    /// 需要真机安装才能验证，本用例只钉死筛选判据。
+    #[test]
+    fn test_kill_remnant_selector_scope() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("installer")
+            .join("kill-remnant.ps1");
+        assert!(
+            script.is_file(),
+            "兜底强杀筛选器必须存在：{}",
+            script.display()
+        );
+
+        // 脚本用 (Get-Process -Id $PID).SessionId 取自身会话，构造记录必须以同一会话号
+        // 喂入才算「同会话」；(c) 用 session + 1 构造异会话记录。
+        let session: i64 = String::from_utf8_lossy(&powershell_stdout(&[
+            "-Command",
+            "(Get-Process -Id $PID).SessionId",
+        ]))
+        .trim()
+        .parse()
+        .expect("必须能取到当前会话号");
+
+        let target = r"C:\verify-target\traffic-monitor.exe";
+        let other_dir = r"C:\verify-other\traffic-monitor.exe";
+        // 只用 ASCII 数字与 ASCII 路径构造记录，断言因此与输出编码无关。
+        let records = format!(
+            concat!(
+                r#"[{{"ProcessId":424242,"ExecutablePath":"{0}","CommandLine":"\"{0}\"","SessionId":{2}}}"#,
+                r#",{{"ProcessId":434343,"ExecutablePath":"{0}","CommandLine":"\"{0}\" --check-update","SessionId":{2}}}"#,
+                r#",{{"ProcessId":444444,"ExecutablePath":"{0}","CommandLine":"\"{0}\"","SessionId":{3}}}"#,
+                r#",{{"ProcessId":454545,"ExecutablePath":"{0}","CommandLine":null,"SessionId":{2}}}"#,
+                r#",{{"ProcessId":464646,"ExecutablePath":"{1}","CommandLine":"\"{1}\"","SessionId":{2}}}"#,
+                r#",{{"ProcessId":474747,"ExecutablePath":null,"CommandLine":"x","SessionId":{2}}}]"#
+            ),
+            json_escape(target),
+            json_escape(other_dir),
+            session,
+            session + 1
+        );
+
+        let records_path = std::env::temp_dir().join(format!(
+            "traffic-monitor-kill-remnant-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&records_path, records.as_bytes()).expect("写构造记录失败");
+        let command = format!(
+            "& {} -Expected {} -Processes (Get-Content -Raw {} | ConvertFrom-Json) -DryRun",
+            ps_single_quote(&script.to_string_lossy()),
+            ps_single_quote(target),
+            ps_single_quote(&records_path.to_string_lossy())
+        );
+        let stdout = powershell_stdout(&["-Command", &command]);
+        let _ = std::fs::remove_file(&records_path);
+
+        let listed = |pid: u32| contains_ascii(&stdout, &pid.to_string());
+        assert!(
+            listed(424242),
+            "目标路径 + 当前会话 + 普通命令行必须被列出 (a)：{}",
+            String::from_utf8_lossy(&stdout)
+        );
+        for (pid, why) in [
+            (
+                434343,
+                "更新协调者（命令行含 --check-update）不得被列出 (b)",
+            ),
+            (444444, "异会话的同路径进程不得被列出 (c)"),
+            (454545, "命令行取不到时不得被列出 (d)"),
+            (464646, "另一目录的同名 exe 不得被列出 (e)"),
+            (474747, "可执行文件路径取不到时不得被列出 (f)"),
+        ] {
+            assert!(!listed(pid), "{why}");
+        }
+    }
 }
