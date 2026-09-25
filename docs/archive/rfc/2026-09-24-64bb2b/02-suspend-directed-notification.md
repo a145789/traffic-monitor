@@ -1,6 +1,6 @@
 # Agent Note：把休眠与显示器状态通知改成定向订阅（让挂起位有真实生产者）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

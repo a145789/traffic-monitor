@@ -1,6 +1,6 @@
 # Agent Note：闭合三条恢复路径的失败环（嵌入后置断言 / DPI 事务 / 缺失定时器补建）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

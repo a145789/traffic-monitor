@@ -1,6 +1,6 @@
 # Agent Note：给挂起位补按原因自证的自愈（不设统一超时、不无条件清零）
 
-Status: proposed
+Status: implemented
 
 **前置依赖：04 篇的看门狗恢复调度器**（本 note 的检查必须挂在一个「挂起时仍存在」的 tick 上）。04 未合时本 note 不可实施。
 
