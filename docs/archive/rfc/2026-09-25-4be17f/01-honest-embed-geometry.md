@@ -1,6 +1,6 @@
 # Agent Note：任务栏竖排时拒绝嵌入，不再留下几何无效却标记已嵌入的状态
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -55,7 +55,7 @@ Status: proposed
 
 弱测试自查：把判据实现替换为恒 `true`（等价于恢复当前行为），上述用例必须变红。
 
-默认门禁数量不变：`cargo test --locked` 输出 `108 passed; 0 failed; 4 ignored`，其中 `window::tests::dpi_dirty_position_keeps_window_size` 与 `window::tests::invalidate_last_rect_clears_committed_cache` 必须仍通过。
+默认门禁数量不变：`cargo test --locked` 输出 `110 passed; 0 failed; 4 ignored`（实施前基线为 `109 passed`，新增本用例后 +1），其中 `window::tests::dpi_dirty_position_keeps_window_size` 与 `window::tests::invalidate_last_rect_clears_committed_cache` 必须仍通过。
 
 四条门禁按 `AGENTS.md` 逐条执行：`cargo fmt -- --check`、`cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings`。
 
