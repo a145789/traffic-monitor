@@ -22,7 +22,8 @@ struct WinHttpHandles {
 
 impl Drop for WinHttpHandles {
     fn drop(&mut self) {
-        // SAFETY: 句柄来自成功的 WinHTTP API 调用，均为有效指针。
+        // SAFETY: 三个字段非空即为已移入本结构体的 WinHttpOpen/Connect/OpenRequest 成功句柄，
+        // 本结构体是唯一持有者；Drop 只执行一次，空指针跳过，非空者各以 WinHttpCloseHandle 配对释放一次。
         unsafe {
             if !self.h_request.is_null() {
                 let _ = WinHttpCloseHandle(self.h_request);

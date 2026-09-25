@@ -12,7 +12,8 @@ struct BcryptHandles {
 
 impl Drop for BcryptHandles {
     fn drop(&mut self) {
-        // SAFETY: 句柄来自成功的 BCrypt API 调用，均有效。
+        // SAFETY: h_hash/h_alg 非默认值即为已移入本结构体的 BCryptCreateHash/BCryptOpenAlgorithmProvider
+        // 成功句柄，本结构体是唯一持有者；Drop 只执行一次，默认值跳过，非默认值各以配对 API 释放一次。
         unsafe {
             if self.h_hash != BCRYPT_HASH_HANDLE::default() {
                 let _ = BCryptDestroyHash(self.h_hash);

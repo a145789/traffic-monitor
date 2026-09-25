@@ -716,7 +716,16 @@ mod tests {
         // UPDATE_MUTEX_NAME，用同一个名字会让本用例偶发假红。
         let name = format!("TrafficMonitor_Mutex_Test_{}\0", std::process::id());
 
+        // MutexGuard 释放计数的唯一并发构造点就是本用例（生产侧单例/更新锁无单测覆盖，
+        // ffi_guard 内无互斥量用例），以下断言精确，不受并行测试干扰。
+        // 计数只证明 Drop 恰好执行一次；OS 层面的真正释放由末尾“释放后可重取”证明。
+        let drops_before = crate::ffi_guard::MUTEX_GUARD_DROPS.load(Ordering::SeqCst);
         let first = acquire_named_mutex(&name).expect("首次申请应成功");
+        assert_eq!(
+            crate::ffi_guard::MUTEX_GUARD_DROPS.load(Ordering::SeqCst),
+            drops_before,
+            "持有期间不得发生释放"
+        );
         assert!(
             acquire_named_mutex(&name).is_none(),
             "同名互斥量已存在时必须报占用（这就是 BUSY 的来源）"
@@ -724,6 +733,11 @@ mod tests {
 
         // 最后一个句柄关闭即销毁命名对象，同一名字可再次独占。
         drop(first);
+        assert_eq!(
+            crate::ffi_guard::MUTEX_GUARD_DROPS.load(Ordering::SeqCst),
+            drops_before + 1,
+            "MutexGuard::drop 必须恰好执行一次"
+        );
         assert!(acquire_named_mutex(&name).is_some(), "释放后应可重新取得");
     }
 }

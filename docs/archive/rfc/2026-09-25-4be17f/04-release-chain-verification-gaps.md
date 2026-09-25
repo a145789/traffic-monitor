@@ -1,6 +1,6 @@
 # Agent Note：补齐发版链路的验证缺口，让门禁验的就是被发布的那棵树
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

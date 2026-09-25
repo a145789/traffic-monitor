@@ -34,6 +34,48 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      - name: Check release imports (no winhttp/bcrypt in standard imports)
+        # Pinned to pwsh: Windows PowerShell 5.1 has no `?.` operator and mangles
+        # non-ASCII inline text, so this step uses pwsh and stays ASCII-only.
+        shell: pwsh
+        run: |
+          $exe = "target/release/traffic-monitor.exe"
+          if (-not (Test-Path $exe)) { Write-Error "release binary not found: $exe"; exit 1 }
+          $cmd = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          $dumpbin = $null
+          if ($cmd) { $dumpbin = $cmd.Source }
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $dumpbin) { Write-Error "dumpbin.exe not found"; exit 1 }
+          Write-Output "dumpbin: $dumpbin"
+          $output = & $dumpbin /IMPORTS $exe 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Error "dumpbin failed with exit code $LASTEXITCODE"; exit 1 }
+          $stdHeader = "Section contains the following imports:"
+          $delayHeader = "Section contains the following delay load imports:"
+          $stdIdx = $output.IndexOf($stdHeader)
+          $delayIdx = $output.IndexOf($delayHeader)
+          if ($stdIdx -lt 0 -or $delayIdx -lt 0 -or $stdIdx -gt $delayIdx) {
+            Write-Error "dumpbin output has no standard/delay import tables; the negative assertion would be vacuous"
+            exit 1
+          }
+          $standard = $output.Substring($stdIdx, $delayIdx - $stdIdx)
+          $delay = $output.Substring($delayIdx)
+          if ($standard -match "(?i)winhttp\.dll|bcrypt\.dll|bcryptprimitives\.dll") {
+            Write-Error "standard import table must not contain winhttp/bcrypt (/DELAYLOAD broken)"
+            Write-Output $standard
+            exit 1
+          }
+          foreach ($dll in @("winhttp.dll", "bcrypt.dll", "bcryptprimitives.dll")) {
+            if ($delay -notmatch [regex]::Escape($dll)) {
+              Write-Error "delay-load table is missing ${dll}: /DELAYLOAD entry lost"
+              exit 1
+            }
+          }
+          Write-Output "standard table clean and all three DLLs are delay-loaded"
+
   # MSRV 对账：Cargo.toml 声明 rust-version = "1.95"，此处用 1.95 工具链跑
   # cargo check --locked，与最新 stable 并行。若红，在同一 PR 内决定
   # 「升 rust-version」还是「改代码」，不允许声明与 CI 静默脱节。

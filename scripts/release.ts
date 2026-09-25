@@ -24,6 +24,21 @@ if (currentBranch !== "main") {
   process.exit(1);
 }
 
+// 远端一致性校验：本地 main 与 origin/main 必须完全一致，否则拒绝发版。
+// 只查 ahead 不够：落后远端时 rev-list 同样为 0，脚本会跑完门禁、改完版本建完
+// commit/tag 后才在 push 时失败，正好落进“已改写版本后失败不要重跑”的状态。
+// 该检查位于四道门禁之前，失败时远端无任何副作用。
+// 发版需要推送，此处引入网络依赖是有意的。
+console.log("Checking local main is in sync with remote...");
+execSync("git fetch origin main", { stdio: "inherit" });
+const ahead = execSync("git rev-list --count origin/main..main", { encoding: "utf-8" }).trim();
+const behind = execSync("git rev-list --count main..origin/main", { encoding: "utf-8" }).trim();
+if (ahead !== "0" || behind !== "0") {
+  console.error(`Error: local main and origin/main are not in sync (ahead=${ahead}, behind=${behind}).`);
+  console.error("Run `git pull --ff-only origin main` (or push local commits) before releasing.");
+  process.exit(1);
+}
+
 // Check git status
 console.log("Checking git status...");
 const gitStatus = execSync("git status --porcelain", { encoding: "utf-8" }).trim();
@@ -102,6 +117,14 @@ writeFileSync("installer.iss", iss);
 // Update Cargo.lock to reflect the new version
 console.log("Updating Cargo.lock...");
 execSync("cargo update --workspace", { stdio: "inherit" });
+
+// 改锁后重验：前置门禁验的是改锁前的依赖图，被发布的 commit 用的是改锁后的。
+// 此处只重跑 build、不重跑 test：`cargo update -w/--workspace` 只更新工作区包
+// （本次即根包版本元数据同步），第三方版本保持 pin，前置 test 结论依然有效；
+// 即使锁移动了第三方代码，release 工作流也会在 tag 提交上跑全量测试兜底。
+// （是否同时补 cargo test 的取舍见 PR 描述。）
+console.log("Verifying post-lock build...");
+execSync("cargo build --release --locked", { stdio: "inherit" });
 
 // Git commit
 console.log("Creating git commit...");
