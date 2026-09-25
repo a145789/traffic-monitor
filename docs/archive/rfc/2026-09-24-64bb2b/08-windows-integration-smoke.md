@@ -1,6 +1,6 @@
 # Agent Note：补一条 Windows 窗口过程与重建冒烟（只覆盖能自动化的部分）
 
-Status: proposed
+Status: implemented
 
 **前置依赖：04 篇（定时器缺失集合与 DPI 事务）、02 篇（休眠订阅的配对注销）**。在这两篇合入前，本 note 的用例无法断言它们引入的状态。
 
