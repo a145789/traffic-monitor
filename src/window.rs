@@ -31,6 +31,16 @@ static WATCHDOG_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 的状态下继续重试。新建主窗口必然未嵌入，同样先清位。
 static EMBEDDED: AtomicBool = AtomicBool::new(false);
 
+/// 只读观测 `EMBEDDED`（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
+///
+/// 写方：`create_main_window`（新建即清位）、`embed_in_taskbar`（先清、五步全成功后置位）；
+/// 读方：`reembed_if_lost`、`update_taskbar_position`、`resize_embedded_window` 与冒烟测试。
+/// 收敛：任何嵌入失败都保持 false，由周期守卫静默重试到成功为止。
+#[cfg(test)]
+pub(crate) fn is_embedded() -> bool {
+    EMBEDDED.load(Ordering::Acquire)
+}
+
 thread_local! {
     /// 上一次成功提交的**完整**目标矩形（含宽高）。只在 `SetWindowPos` 成功且
     /// 尺寸当真生效时提交（见 `update_taskbar_position`）；`invalidate_last_rect`

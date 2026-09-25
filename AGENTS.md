@@ -66,6 +66,8 @@ cargo build --release --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
+Windows 集成冒烟（opt-in，需真实 Explorer/任务栏，不进必跑门禁）：`cargo test --locked -- --ignored --test-threads=1`（必须串行，全局窗口状态跨用例共享）。
+
 - 依赖解析与 release 验证必须使用仓库已提交的同一解析结果：三条 Cargo 门禁均带 `--locked`，不得让本地命令顺手改写 `Cargo.lock`。
 - 修改 `Cargo.toml` 的依赖或根包版本时，相应 `Cargo.lock` 变化必须同提交；`scripts/package.ts` 的临时 dev 版本改写与恢复是隔离流程，不得提交其中间状态。
 - `Cargo.toml` 的 `rust-version` 是 MSRV 唯一来源，CI 的 MSRV job 必须与它对账；使用更高版本语言/API 前先通过该 MSRV 验证。
