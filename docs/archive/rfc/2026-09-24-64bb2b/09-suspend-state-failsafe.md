@@ -1,6 +1,6 @@
 # Agent Note：给挂起位补按原因自证的自愈（不设统一超时、不无条件清零）
 
-Status: proposed
+Status: implemented
 
 **前置依赖：04 篇的看门狗恢复调度器**（本 note 的检查必须挂在一个「挂起时仍存在」的 tick 上）。04 未合时本 note 不可实施。
 
@@ -58,3 +58,12 @@ Status: proposed
 - `MONITOR` 位在 12 小时窗口内仍可能冻结；且一旦探针不可用（`SESSION` 降级路径），窗口同样存在。这两个窗口是**已知残留**，不是「已验证不存在」。
 - `WTSQuerySessionInformationW` 的锁屏探针在「快速用户切换」「RDP 断开但会话保留」等形态下的返回值语义需要实测确认（`WTSSessionInfoEx` 报的是会话锁状态，不是连接状态）；若实测发现 RDP 断连时误报 UNLOCK，则 `SESSION` 也必须退回 TTL，本 note 的探针部分应重新评审。
 - 若 04 篇的恢复调度器最终没有落在看门狗上（例如实施时改挂主窗口），本 note 立刻失去承接 tick，会退化成旧稿那个「最坏情形恰好吃不上」的方案——所以两篇的先后顺序不能颠倒，实施时不得各自为政。
+
+## 实施记录
+
+- **WTS 探针无需降级**：`windows` 0.62.2 导出 `WTSSessionInfoEx`、`WTSINFOEXW`、`WTS_SESSIONSTATE_UNLOCK`，因此 `SESSION` 走文档化探针而不是按位 TTL。探针不可用（查询失败、缓冲小于 `WTSINFOEXW`、`Level != 1`）时**保持位不变**，「不猜」由 `probe_session_unlocked` 返回 `None` 表达。
+- **探针读数已实测（本机 Win11，未解锁的交互式会话）**：`WTSQuerySessionInformationW(WTS_CURRENT_SESSION, WTSSessionInfoEx)` 返回 `bytesReturned = 232`，恰等于 `sizeof(WTSINFOEXW)`（`Level` 4 字节 + 对齐填充 4 字节 + `WTSINFOEX_LEVEL1_W` 224 字节），因此实现里的「缓冲大小 ≥ `sizeof(WTSINFOEXW)`」门槛在真实数据上成立；`Level` 由系统填为 1（调用方无需预置）；`SessionFlags` 读到 `WTS_SESSIONSTATE_UNLOCK`。即大小门槛、Level 门槛与标志解释三处都对着真实数据核过。**未实测**：`SessionFlags` 为 LOCK 的那一侧——制造它需要在用户的实时会话里锁屏，未做。
+- **TTL 只作用于 MONITOR**：`SUSPEND_MONITOR_TTL_SECS = 12h`（`config.rs`），起点存在 thread_local 的 `SUSPEND_SINCE: Cell<Option<Instant>>`，只在 `suspend_system` / `resume_system` 的 MONITOR 分支读写（首次置位才记时，重复置位不推后 TTL），并用 `grep -rn "SUSPEND_SINCE" src/` 可核对它没有渗进 `SYSTEM` / `SESSION` 路径。
+- **承接 tick 是 04 篇在看门狗上的 `TIMER_ID_RECOVERY`**（不再另建定时器）；`heal_stale_suspend` 只调用既有 `resume_system`，把自己清掉的位集返回给调用方，由调用方在 MONITOR 位被清时重新订阅显示器通知。**该次重新订阅失败不再等于静默失效**（评审提出、已改）：订阅句柄是「是否还在」的真值源，恢复调度器每个周期都会静默补注册，因此 TTL 清位那一轮注册失败也能在下一个周期收敛。判定逻辑抽成纯函数 `should_resume_for_reason(reason, probe)` 并单测三原因 × 各探针取值。
+- **未实测**：`WTS_SESSION_UNLOCK` 分支注释掉的故障注入、锁屏 30 秒后解锁的恢复周期验证、以及 RDP 断开/快速用户切换下的探针语义——本机已有实例占用会话级单例互斥量，新构建无法并存运行，故障注入需要在用户的实时会话里跑。
+- **行号漂移**：本篇「问题」节的 `src/main.rs` 行号写于更早版本（当前 `WM_POWERBROADCAST` 分支在 1020 行附近）；`src/suspend.rs` / `src/state.rs` 的引用与实施前基本一致（`state.rs` 因新增字段整体后移）。验收以「验收标准」的 grep 判据与行为为准。

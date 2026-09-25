@@ -1,6 +1,6 @@
 # Agent Note：闭合三条恢复路径的失败环（嵌入后置断言 / DPI 事务 / 缺失定时器补建）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -68,3 +68,14 @@ Status: proposed
 - 恢复调度器在每个周期都调用 `create_missing_timers`，若某个定时器因 hwnd 失效而持续失败，会形成每 60 秒一次的失败重试；靠调度器自身的间隔翻倍退避收敛，不要把它做成「失败即立刻重试」。
 - 「DPI 事务第 2 步选 `resize_embedded_window` 还是 `embed_in_taskbar`」有实测差异：前者不重新计算任务栏几何，可能在新 DPI 下留下位置偏差；后者更彻底但会重复 `SetLayeredWindowAttributes`。实施时必须实机跨屏确认，不能只看编译通过。
 - `LAST_RECT` 提到模块作用域后，多窗口场景（重建期间新旧句柄并存）会共享同一份缓存；`rebuild_main_window` 路径需在创建新窗口后显式失效（`src/main.rs:426-480`），否则新窗口会继承旧句柄的矩形而跳过首次定位。
+
+## 实施记录
+
+- **DPI 事务第 2 步选定 `embed_in_taskbar`**，不用 `resize_embedded_window`：跨屏后位置与尺寸都要按新 DPI 重算，重跑嵌入序列顺带修复嵌入漂移，且不引入第二条「提交窗口几何」的路径。失败即保持脏位，由下个恢复周期重试；`rollback_window_to_bitmap` 保留为失败当时的即时兜底。
+- **第 2 步内部再分两小步：先无条件对齐尺寸，再提交完整几何**（评审提出、已改）。`update_dpi` 一旦成功，位图就已经是新尺寸，而嵌入序列可能在任何一步瞬态失败、且中途失败会把 `EMBEDDED` 清成 false，使带嵌入门回滚的 `rollback_window_to_bitmap` **拒绝动作**——原实现会因此留下「新位图 + 旧窗口」直到下一次成功嵌入，正是「任一步失败都必须保持资源与窗口尺寸匹配」的反例。现在先用只改尺寸、不检查嵌入状态的 `window::align_window_size_to` 对齐，错配窗口期被压到零，剩下没提交的只是位置与可见性。
+- **恢复调度 tick 自身的武装也必须可重试**（评审提出、已改）：启动期一次 `SetTimer` 失败后没有任何 `WM_TIMER` 能再调用武装函数，原实现会把整条恢复路径永久摘掉。现在武装状态由 `RECOVERY_ARM` 记录，未武装时由仍然活着的周期入口重试（主窗口的监测 tick、看门狗的重建重试 tick，以及状态切换临界点的 `resync_monitoring_timers`）；已武装时直接返回，避免 `SetTimer` 复用同一 ID 反复重设倒计时而让恢复周期永远到不了。
+- **恢复调度器落在看门狗上**：`TIMER_ID_RECOVERY`，基础间隔 60s、失败翻倍至 10min（成功即回落到基础间隔），退场时随看门狗一起撤销。它做三件事：DPI 事务、只增不删地补建缺失定时器、按原因清陈旧挂起位（09 篇）。看门狗不参与挂起，因此这个 tick 在任何状态下都存在，`timer_plan` 的挂起分支保持全空。
+- **定时器同步返回值**从 `bool` 改为 `MissingTimers` 位掩码；新增 `resync_monitoring_timers`（状态切换统一入口，失败即登记缺失集合）与 `retry_missing_timers`（只补「计划要求 + 上次失败」的交集，**不调用任何 `KillTimer`**）。补建清单由纯函数 `missing_timer_plan` 判定并单测。
+- **实测（本机 Win11，用 P/Invoke 复刻嵌入序列的探针，非应用本体）**：`SetParent(hwnd, Shell_TrayWnd)` 之后若窗口仍是 `WS_POPUP`，`GetParent` 返回 NULL；把 `GWL_STYLE` 覆盖为 `WS_CHILD | WS_VISIBLE` 之后 `GetParent` 才返回任务栏句柄（与 `SetParent` 的目标相等）。这条实测确认了后置断言在真实任务栏上成立，同时说明它**必须**放在五步序列末尾——紧跟 `SetParent` 断言会把成功嵌入误判为失败。
+- **未实测**：跨两个不同缩放比显示器的拖动、Explorer 重启后恢复 tick 的实际收敛、以及定时器补建路径的实机触发（本机已有实例占用会话级单例互斥量，新构建无法并存运行）。这四项仍是人工清单。
+- **行号漂移**：本篇「问题」节的 `src/main.rs` 行号写于更早版本（当前 `WM_DPICHANGED` 分支在 1000 行附近、`rebuild_main_window` 在 583 行附近）；`src/suspend.rs` / `src/window.rs` 的引用基本与实施前一致（`window.rs` 的 `SetParent` 差 1 行）。验收以「验收标准」的 grep 判据与行为为准。

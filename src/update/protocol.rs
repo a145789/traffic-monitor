@@ -6,9 +6,11 @@
 //!   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 //! - `BUSY`：另一处更新子进程已持有更新互斥量，本次未执行任何检查。是「有效动作」
 //!   但**不是**成功完成：父侧据此不推进一小时的正常冷却（见 `should_use_error_cooldown`）。
+//!
 //! 父身份绑定（[`ParentProbe`]）：父进程 spawn 时传 `--parent-pid <n> --parent-start <FILETIME>`，
 //! 子进程用 `OpenProcess` + `GetProcessTimes` 复核创建时刻后持有句柄，之后所有存活检查
 //! 都走该句柄的 `WaitForSingleObject`——只传 PID 在 PID 被复用时会误判「父还在」。
+//!
 //! R1/R2 动作规则（[`UpdateContext`]）：R1 = 父已消失且用户尚未确认安装 ⇒ 静默放弃
 //! （不下载、不弹框、不启动安装器、不输出协议行）；R2 = 用户已在模态框点「是」⇒ 无论父
 //! 是否还在都继续交接，但此时父仍在而 `EXIT_MAIN` 写失败按硬错误处理，不得启动安装器。

@@ -1,6 +1,6 @@
 # Agent Note：把休眠与显示器状态通知改成定向订阅（让挂起位有真实生产者）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -49,3 +49,12 @@ Status: proposed
 - `RegisterSuspendResumeNotification` 在跨进程子窗口上的实机行为尚未验证（Windows 的定向通知以窗口句柄投递，理论上不受父子关系影响，但本仓库的嵌入是跨进程 `SetParent`，属未验证组合）。若实测仍收不到，退路是让看门狗接收后转发给 `live_main_hwnd()`；本 note 的「明确不在本次范围」已写明该退路的正确形态（转发而非直接处理）。
 - 补上定向订阅后，启动期与嵌入失败期主窗口会**同时**通过广播臂与定向臂各收到一次 APM 事件；位集幂等（`src/state.rs:26-46`）且 `suspend_system` 的 `previous == 0` 守卫（`src/suspend.rs:51-53`）使重复调用不重复 trim，代价只是一次多余的 `sync_monitoring_timers`，可接受。
 - 换/增 `GUID_CONSOLE_DISPLAY_STATE` 会改变置位时机：部分机器在启动时会先收到一次「显示器已开」的初始通知，若在该通知与初始 `SUSPEND_REASONS == 0` 状态之间处理不当，可能产生一次无意义的恢复调用（幂等、无观测代价），但实现时不要把它写成「复位位集」。
+
+## 实施记录
+
+- **显示器订阅取「并存」而非「替换」**：`GUID_MONITOR_POWER_ON` 与 `GUID_CONSOLE_DISPLAY_STATE` 各用一个具名原子（`POWER_NOTIFY_HANDLE` / `DISPLAY_NOTIFY_HANDLE`），两个都在 `handle_power_broadcast` 里被识别、都写同一个 `SUSPEND_REASON_MONITOR` 位。理由：本机没有制造 S0 息屏做投递实测的条件（见下），「替换」等于把现有的显示器省电覆盖押在「legacy 是否仍投递」这个未验证行为上；并存的代价只是在两个订阅点都投递时多做一次幂等的定时器同步。
+- **休眠/唤醒定向订阅**收在 `register_power_notifications`（句柄 `SUSPEND_NOTIFY_HANDLE`），注销收在 `unregister_power_notifications`，与 `unregister_session_notification()` 同批次、在 `DestroyWindow` **之前**调用（main 收尾与 `rebuild_main_window` 各一处），重建路径对新 hwnd 重绑三项订阅。
+- 三项订阅失败**合并成一条**提示（同一段启动/重建动作里的同一次失败序列），避免逐项弹框连点三次。`PBT_POWERSETTINGCHANGE`（定向）与 APM 事件（顶层广播）的区别已写进 `wnd_proc` 的 `WM_POWERBROADCAST` 分支注释，并写明处理器必须留在主窗口侧的真实理由是定时器住在主 hwnd 上。
+- **订阅缺失必须能在周期 tick 上补**（评审提出、已改）：三项订阅的句柄本身就是「该项订阅是否还在」的唯一真值源，恢复调度器每个周期按句柄静默补注册（`ensure_power_notifications`）。只把重注册挂在「MONITOR 位 TTL 清位」那一条路径上是不够的——TTL 清位本身要等一个显示器通知，而订阅一旦丢失就再也不会有显示器通知到达，一次瞬态注册失败会把省电语义静默拖到进程重启。补注册失败只留 release 日志、不弹框，且**不计入恢复调度的退避**（补注册要尽快恢复，不能让退避把它推到 10 分钟后）。
+- **行号漂移**：本篇「问题」节引用的 `src/main.rs` 行号写于更短的 main.rs 版本（当前 `WM_POWERBROADCAST` 分支在 1020 行附近，`register_power_notify` 已并入 `register_power_notifications`）；`src/suspend.rs` / `src/window.rs` 的引用与实施前一致。验收以「验收标准」的 grep 判据与行为为准。
+- **未实测**：`RegisterSuspendResumeNotification` 在跨进程子窗口上的投递，以及两个显示器订阅点哪个在 S0 息屏时真的投递，均未实机验证——本机已有实例占用会话级单例互斥量，同版本新构建无法并存运行，强行为之要在用户的实时桌面上放第二个面板。

@@ -5,9 +5,9 @@ use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT, SetLastErro
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetParent,
     GetWindowLongPtrW, GetWindowRect, HWND_TOP, IsWindow, LWA_COLORKEY, RegisterClassExW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
@@ -15,6 +15,7 @@ use windows::core::{PCWSTR, w};
 use crate::config::{
     COLOR_KEY, DISPLAY_HEIGHT, DISPLAY_WIDTH, GAP, WATCHDOG_CLASS, WINDOW_CLASS, WINDOW_TITLE,
 };
+use crate::state::DPI_DIRTY;
 use crate::util::{AtomicHwnd, diag, dpi_scaled, log_event, module_instance};
 
 static TASKBAR_HWND: AtomicHwnd = AtomicHwnd::new();
@@ -29,6 +30,26 @@ static WATCHDOG_HWND: AtomicHwnd = AtomicHwnd::new();
 /// 使 `reembed_if_lost` 能在半嵌入（父窗口已换但样式/分层未生效，窗口不可见）
 /// 的状态下继续重试。新建主窗口必然未嵌入，同样先清位。
 static EMBEDDED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// 上一次成功提交的**完整**目标矩形（含宽高）。只在 `SetWindowPos` 成功且
+    /// 尺寸当真生效时提交（见 `update_taskbar_position`）；`invalidate_last_rect`
+    /// 无条件失效。
+    ///
+    /// 提到模块作用域而不是函数内局部：嵌入成功与 DPI 事务都需要主动失效它，
+    /// 否则「矩形 == 缓存」会让下个 tick 直接跳过定位，把未生效的几何记成已生效。
+    /// 仅 UI 线程访问，故用 `Cell` 而非原子。
+    static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// 失效任务栏位置缓存。
+///
+/// 调用点即「几何提交路径」：`embed_in_taskbar` 成功（整套几何按当前 DPI 重新算过）
+/// 与 DPI 恢复事务第 3 步（尺寸由事务第 2 步提交）。不失效的后果是缓存里那份
+/// 未生效的矩形被当成「已到位」，窗口永久停在旧尺寸而位图已是新 DPI 版式。
+pub fn invalidate_last_rect() {
+    LAST_RECT.with(|c| c.set(None));
+}
 
 fn register_class(class_name: &str, proc: WNDPROC, err: &str) -> Result<(), String> {
     // 类名常量已含尾 NUL，直接编码后原样保留；指针仅在本次注册调用期间使用。
@@ -271,20 +292,33 @@ pub fn embed_in_taskbar(hwnd: HWND) -> Result<(), String> {
             .map_err(|e| format!("设置分层窗口属性失败: {e:?}"))?;
     }
 
+    // 后置断言：`SetParent` 的返回值有歧义（NULL 既可能是前一个父窗口也可能表示
+    // 失败，且 Win32 不保证失败时 set last error，见上方注释），唯一可信的判据是
+    // 事后查询真实父子关系。不成立则保持 `EMBEDDED` 为 false，交给 `reembed_if_lost`
+    // 的周期重试——绝不留下「父窗口没换却记为已嵌入」的假活状态。
+    // SAFETY: hwnd 是刚走完五步序列的窗口句柄；GetParent 只查询父子关系，
+    // 对跨进程父窗口同样有效，不引用任何调用方内存。
+    if unsafe { GetParent(hwnd) }.ok() != Some(h_taskbar) {
+        return Err("SetParent 后 GetParent 与任务栏不一致".to_string());
+    }
+
+    // 几何已按当前 DPI 整体重算并提交：失效位置缓存，让下个 tick 重新比对而不是
+    // 因「矩形 == 缓存」跳过（多一次 SetWindowPos 属无害冗余）。
+    invalidate_last_rect();
     EMBEDDED.store(true, Ordering::Release);
     Ok(())
 }
 
-/// 把已嵌入窗口的物理尺寸重置为指定位图尺寸（DPI 资源重建失败的回滚入口）。
+/// 把窗口物理尺寸对齐到指定位图尺寸（**只改尺寸**：`SWP_NOMOVE`，位置与 Z 序不动）。
 ///
-/// 只在已嵌入时生效；位置分量不动（SWP_NOMOVE），跨屏后的合身位置与尺寸
-/// 由下个成功的 DPI 更新周期自愈。保证 BitBlt 源（位图）与目标（窗口）
-/// 尺寸一致，避免边缘露出色键底色。
-pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
-    if !EMBEDDED.load(Ordering::Acquire) {
-        return;
-    }
-    // SAFETY: hwnd 为当前主窗口；SWP_NOMOVE 保留现位置，仅改尺寸。
+/// 与 [`resize_embedded_window`] 的区别是**不检查** `EMBEDDED`：本函数不应用任何
+/// 任务栏客户区坐标（位置分量由 `SWP_NOMOVE` 保持不动），只提交宽高，因此对半嵌入
+/// 或未嵌入的窗口同样安全。它要修的正是「位图已按新 DPI 换掉、窗口还是旧尺寸」这一
+/// 错配——而嵌入门在那种状态（`embed_in_taskbar` 中途失败会把 `EMBEDDED` 清成 false）
+/// 恰好会拒绝回滚，于是错配只能拖到下一次成功嵌入。
+pub fn align_window_size_to(hwnd: HWND, width: i32, height: i32) {
+    // SAFETY: hwnd 是当前主窗口；SWP_NOMOVE 保留现位置，SWP_FRAMECHANGED 让样式变更
+    // 生效，SWP_NOZORDER 不动层级，均不涉及跨进程内存。
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -296,6 +330,18 @@ pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
             SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOZORDER,
         );
     }
+}
+
+/// 把已嵌入窗口的物理尺寸重置为指定位图尺寸（DPI 资源重建失败的回滚入口）。
+///
+/// 只在已嵌入时生效：未嵌入的窗口几何归嵌入序列所有。跨屏后的合身位置与尺寸
+/// 由恢复调度器的 DPI 事务或下个成功周期自愈。保证 BitBlt 源（位图）与目标（窗口）
+/// 尺寸一致，避免边缘露出色键底色。
+pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
+    if !EMBEDDED.load(Ordering::Acquire) {
+        return;
+    }
+    align_window_size_to(hwnd, width, height);
 }
 
 /// 嵌入自愈守卫，挂在常驻的全屏检测定时器上（每 2s）。
@@ -331,11 +377,17 @@ fn parent_is_current_taskbar(hwnd: HWND) -> bool {
     }
 }
 
-pub fn update_taskbar_position(hwnd: HWND) -> bool {
-    thread_local! {
-        static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
-    }
+/// 任务栏定位的 `SetWindowPos` 标志集合（纯判定，便于单测）。
+///
+/// `dpi_dirty` 期间追加 `SWP_NOSIZE`：此时渲染器位图尺寸与实际 DPI 已经错位，
+/// 尺寸的提交权归 DPI 恢复事务（`main::recover_dpi`）；若定位路径也改尺寸，事务
+/// 失败后的回滚会在下个 tick 被再次推翻，窗口尺寸将停在位图尺寸不匹配的一方。
+fn position_flags(dpi_dirty: bool) -> SET_WINDOW_POS_FLAGS {
+    let base = SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER;
+    if dpi_dirty { base | SWP_NOSIZE } else { base }
+}
 
+pub fn update_taskbar_position(hwnd: HWND) -> bool {
     // 未嵌入时禁止按任务栏几何移动：calc_widget_rect 给出的是相对任务栏客户区的
     // 坐标，对顶层窗口会被 SetWindowPos 当作屏幕坐标，反而把面板钉到无关位置。
     if !EMBEDDED.load(Ordering::Acquire) {
@@ -347,15 +399,11 @@ pub fn update_taskbar_position(hwnd: HWND) -> bool {
     };
 
     let target = (display_x, display_y, display_width, display_height);
+    let dpi_dirty = DPI_DIRTY.load(Ordering::Acquire);
     if LAST_RECT.with(|lp| lp.get()) == Some(target) {
         return false;
     }
 
-    // 缓存只在移动成功后提交：SetWindowPos 瞬时失败（如 Explorer 重启竞态）时
-    // 下个周期会重试，而不是因“矩形==缓存”被永久跳过。
-    // 刻意不让 embed_in_taskbar 提交本缓存：LAST_RECT 藏在函数体内，
-    // 跨函数读写须先提到模块作用域；嵌入成功后多一次 SetWindowPos 属无害冗余，
-    // 为它付结构成本不划算（见 RFC 04 明确不在本次范围）。
     let moved = unsafe {
         SetWindowPos(
             hwnd,
@@ -364,12 +412,41 @@ pub fn update_taskbar_position(hwnd: HWND) -> bool {
             display_y,
             display_width,
             display_height,
-            SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER,
+            position_flags(dpi_dirty),
         )
         .is_ok()
     };
-    if moved {
+    // 缓存只在「移动成功且本次真的提交了完整几何」时写入：SetWindowPos 瞬时失败
+    // （如 Explorer 重启竞态）时下个周期会重试，而不是因「矩形 == 缓存」被永久跳过；
+    // 脏位期间的调用带 `SWP_NOSIZE`，尺寸分量并未生效，提交缓存等于把未生效的尺寸
+    // 记成已生效。
+    if moved && !dpi_dirty {
         LAST_RECT.with(|lp| lp.set(Some(target)));
     }
     moved
+}
+
+#[cfg(test)]
+mod tests {
+    //! 只覆盖纯判定：`position_flags` 的标志选择与位置缓存的失效。真实窗口行为不在本模块单测范围内。
+
+    use super::{LAST_RECT, invalidate_last_rect, position_flags};
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE, SWP_NOZORDER};
+
+    #[test]
+    fn dpi_dirty_position_keeps_window_size() {
+        // 脏位期间只改位置：尺寸由 DPI 事务提交，定位路径不得越权改尺寸。
+        assert!(position_flags(true).contains(SWP_NOSIZE));
+        assert!(!position_flags(false).contains(SWP_NOSIZE));
+        // 两个分支都必须保持「不改 Z 序」，否则面板会被拉到任务栏图标之上/之下。
+        assert!(position_flags(true).contains(SWP_NOZORDER));
+        assert!(position_flags(false).contains(SWP_NOZORDER));
+    }
+
+    #[test]
+    fn invalidate_last_rect_clears_committed_cache() {
+        LAST_RECT.with(|c| c.set(Some((1, 2, 3, 4))));
+        invalidate_last_rect();
+        assert_eq!(LAST_RECT.with(|c| c.get()), None);
+    }
 }

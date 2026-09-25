@@ -125,7 +125,7 @@ impl AtomicHwnd {
 
 /// `HPOWERNOTIFY` 的原子存储：与 [`AtomicHwnd`] 同构单列。
 ///
-/// 内值为 `isize`，无需指针转换；内存序契约与 `AtomicHwnd` 一致
+/// 内值为 `isize`，无需指针转换。内存序契约与 [`AtomicHwnd`] 一致
 /// （`store`/`clear` 用 Release，`load` 用 Acquire，`take` 用 AcqRel）。
 pub struct AtomicPowerNotify(std::sync::atomic::AtomicIsize);
 
@@ -138,6 +138,9 @@ impl AtomicPowerNotify {
         self.0.store(handle.0, std::sync::atomic::Ordering::Release);
     }
 
+    /// 只读查询「该项订阅是否仍然在册」。唯一消费者是恢复调度器的补注册路径：
+    /// 句柄为空 ⇔ 那条订阅不在，而订阅不在就再也收不到对应通知，必须在周期 tick 上
+    /// 补回来，不能等下一次同源事件（它永远不会来）。
     pub fn load(&self) -> Option<HPOWERNOTIFY> {
         let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {

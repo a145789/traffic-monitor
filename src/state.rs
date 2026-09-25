@@ -31,6 +31,12 @@ impl SuspendReasons {
         self.0.load(Ordering::Acquire) != 0
     }
 
+    /// 单个原因位是否置位。恢复调度器按原因逐个自证/探测时用（比裸位集快照更窄，
+    /// 位协议仍只由本类型封装）。
+    pub fn is_set(&self, reason: u32) -> bool {
+        self.0.load(Ordering::Acquire) & reason != 0
+    }
+
     /// 置位一个暂停原因，返回置位前的位集（供调用方判断是否为首次暂停）。
     pub fn suspend(&self, reason: u32) -> u32 {
         self.0.fetch_or(reason, Ordering::AcqRel)
@@ -48,6 +54,20 @@ pub static SUSPEND_REASONS: SuspendReasons = SuspendReasons::new();
 /// 本组件所在显示器上，前台窗口是否全屏（非系统全局全屏）。
 /// 读写：Acquire / Release（定时器与全屏检测）。
 pub static MONITOR_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+/// DPI 资源重建失败后置位：窗口几何与渲染器位图/字体可能不一致，须由恢复调度器
+/// 的 DPI 事务重试（见 `main::recover_dpi`）。
+///
+/// 唯一真值源，归属明确：
+/// - 置位（2 处）：`WM_DPICHANGED` 的失败分支、`bind_display_and_timers` 的启动/
+///   重建失败分支。
+/// - 清位（1 处）：DPI 事务四步全部成功之后，`recover_dpi` 内。
+/// - 读（2 处）：`recover_dpi` 的入口门、`window::update_taskbar_position` 的
+///   标志选择（脏位期间只改位置、不改尺寸、不提交位置缓存）。
+///
+/// 读写：Release / Acquire。写读虽同在 UI 线程（主窗口过程与看门狗过程同属一个
+/// 消息循环线程），但两者经消息循环可见，保持与 `MONITOR_FULLSCREEN` 一致的内存序。
+pub static DPI_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// 允许自动检查更新。读写：Relaxed（非关键段开关，同进程）。
 pub static ENABLE_AUTO_UPDATE: AtomicBool = AtomicBool::new(true);
