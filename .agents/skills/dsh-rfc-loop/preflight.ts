@@ -179,13 +179,15 @@ if (!existsSync(rfcRoot)) {
   try {
     const mdFiles = walkFiles(rfcRoot, (name) => name.toLowerCase().endsWith(".md")).sort();
     for (const file of mdFiles) {
+      const rel = relFromRoot(file);
+      // 只认 docs/rfc/<会话目录>/ 下的笔记；README.md 等根说明文件不是待办
+      if (!/^docs\/rfc\/[^/]+\/.+\.md$/i.test(rel)) continue;
       const text = readFileSync(file, "utf8");
       const proposed = text
         .split(/\r?\n/)
         .some((line) => /^Status:\s*proposed\b/i.test(line.trim()));
       if (!proposed) continue;
 
-      const rel = relFromRoot(file);
       todos.push(rel);
 
       const session = basename(dirname(file));
