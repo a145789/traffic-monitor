@@ -1,6 +1,6 @@
 # Agent Note：任务栏竖排时拒绝嵌入，不再留下几何无效却标记已嵌入的状态
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
