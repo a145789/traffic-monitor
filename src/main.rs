@@ -226,8 +226,15 @@ fn main() {
         let Some(_update_mutex) = acquire_update_mutex() else {
             // 另一处更新子进程仍在跑（或互斥量创建失败，见 acquire_update_mutex）：
             // BUSY 是「有效动作但非成功完成」的协议行，父侧据此不把这次结果记成
-            // 一次成功检查（冷却不被推进到 1 小时），也刻意不向用户弹任何框。
+            // 一次成功检查（冷却不被推进到 1 小时）。
+            //
+            // 写入结果**刻意**忽略：与 EXIT_MAIN 必须把写入结果传播给 R2 分支不同，
+            // 这条行发不出去时父进程多半也已消失，没有需要通知的对象。
             let _ = emit_protocol_line("BUSY");
+            // 同样刻意不给用户任何提示（完整取舍见 update::update_check_worker 处的注释）：
+            // 手工 `--check-update --manual` 必须立即静默退出（RFC 验收场景 B），
+            // 自动检查必须静默，而改由本子进程替主进程弹框会把父进程的更新工作线程
+            // 阻塞到框被点掉，框本身还可能在主界面消失后成为孤儿框。
             std::process::exit(0);
         };
         std::process::exit(subprocess_main(

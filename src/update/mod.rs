@@ -189,9 +189,13 @@ fn update_check_worker(is_manual: bool) {
     let outcome = run_check_subprocess(is_manual);
 
     if outcome.busy {
-        // 另一处更新进程占用了更新互斥量，本次一个请求都没发出去。刻意不给用户任何提示：
-        // 协议面要求这种占用静默收尾，而 AGENTS.md 第 4 条又禁止把更新相关提示回流主进程
-        // （会常驻网络/UI DLL），因此这里只留日志，供「更新一直不动」时排查。
+        // 另一处更新进程占用了更新互斥量，本次一个请求都没发出去。
+        //
+        // 刻意不给用户任何提示（这是取舍，不是遗漏）：① 协议面要求这种占用静默收尾，
+        // 验收场景 B 的手工 `--check-update --manual` 必须立即静默退出；② 更新相关提示
+        // 不得回流常驻主进程（AGENTS.md 第 4 条，会常驻网络/UI DLL）；③ 若改由子进程弹框，
+        // 父进程的更新工作线程会一直阻塞在 `child.wait()` 直到框被点掉，且框可能在主界面
+        // 消失后成为孤儿框——正是本 RFC 要收的问题。只留日志，供「更新一直不动」时排查。
         log_event!("本次更新检查因另一处更新进程占用而跳过（BUSY）");
     }
 
@@ -248,10 +252,21 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
         return CheckResult::Abandoned;
     }
 
+    // 已知限制：元数据抓取本身**不带**取消谓词——检查点只覆盖安装包下载的每个数据块，
+    // 这一次 4KiB 请求从建连到收完之间不可中断（`HttpGet::open` 同理），因此父进程若在
+    // 该窗口内退出，「静默放弃」最坏要等这次抓取走完自身超时；该阶段无弹框、无写盘、
+    // 不启动安装器，用户可见后果只是多一次无人消费的元数据请求。这里保证的是：
+    // 抓取之间不再发起无人要的重试（见下面的重试前复判）。
     let mut response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     if response.is_err() {
         // 失败时增加 1 次重试，并等待片刻防止抖动
         std::thread::sleep(Duration::from_millis(UPDATE_FETCH_RETRY_DELAY_MS));
+        // 复判 R1：这 500ms 的等待里父进程可能已退出，规则要求父已消失就不再发起任何
+        // 网络动作——不能因为「已经决定要重试」而把一个无人要的请求发出去。
+        if ctx.abandoned() {
+            log_event!("父进程已退出且用户未确认安装，放弃本次更新检查");
+            return CheckResult::Abandoned;
+        }
         response = fetch_url(GITHUB_HOST, VERSION_PATH, VERSION_METADATA_MAX_BYTES);
     }
 
@@ -484,6 +499,11 @@ fn complete_update_interaction(
                 if ctx.parent_alive() {
                     // 父进程仍在却收不到交接：它不会退出、也不会释放 exe 映像，
                     // 此时启动安装器必然撞上文件占用——按硬错误收尾，不启安装器。
+                    //
+                    // 这里刻意不复判 R1：用户已在上面点过「是」，`user_confirmed` 为真，
+                    // `ctx.abandoned()` 在此恒为假（R2 的定义就是不因父进程消失而撤销
+                    // 用户刚表达的意图），补一条只等于写死代码。该框是本此交接失败的唯一
+                    // 可见提示，不能删；它是 R2 路径的错误提示，不受 R1「不弹框」约束。
                     log_event!("EXIT_MAIN 写出失败 ({e})，主进程仍在，取消本次安装");
                     show_error(&format!("无法通知主程序退出，已取消安装: {e}"));
                     return SubprocessEnd::Done;
