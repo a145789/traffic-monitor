@@ -68,6 +68,13 @@ pub const TIMER_ID_FULLSCREEN: usize = 3;
 pub const TIMER_ID_AUTO_UPDATE: usize = 4;
 /// 主窗口重建失败后的重试定时器，挂在看门狗窗口上（见 `arm_rebuild_retry`）。
 pub const TIMER_ID_REBUILD_RETRY: usize = 5;
+/// 看门狗上的恢复调度 tick（见 `main::recovery_tick`）。
+///
+/// 刻意不进 `timer_plan`：挂起态与全屏态的监测定时器集合必须保持全空（销毁与
+/// 恢复对称），而恢复调度在任何状态下都必须存在——看门狗永不参与挂起、永不重建，
+/// 因此它的定时器不会随状态切换被清掉，这正是「唯一的自愈 tick 被一起杀掉」
+/// 这一死结的解法。
+pub const TIMER_ID_RECOVERY: usize = 6;
 pub const TIMER_ID_INIT_TRIM: usize = 99;
 
 pub const TIMER_INTERVAL_NETWORK: u32 = 1000;
@@ -77,6 +84,11 @@ pub const TIMER_INTERVAL_FULLSCREEN: u32 = 2000;
 /// `TaskbarCreated` 每次任务栏创建只广播一次，重建失败后不重试等于永久失去主窗口。
 pub const TIMER_INTERVAL_REBUILD_RETRY_MIN: u32 = 1000;
 pub const TIMER_INTERVAL_REBUILD_RETRY_MAX: u32 = 60000;
+/// 恢复调度 tick 的基础间隔与失败退避上限（毫秒）：一轮恢复动作全部成功即回到
+/// 基础间隔，出现失败则翻倍至上限。恢复动作本身幂等，周期只为最终收敛服务；
+/// 「失败即立刻重试」会把持续单点失败放大成高频轮询。
+pub const TIMER_INTERVAL_RECOVERY: u32 = 60 * 1000;
+pub const TIMER_INTERVAL_RECOVERY_MAX: u32 = 10 * 60 * 1000;
 pub const TIMER_INTERVAL_INIT_TRIM: u32 = 10000;
 pub const CPU_MEM_INTERVAL: u32 = 5000;
 pub const TIMER_COALESCING_TOLERANCE_MS: u32 = 100;
@@ -92,6 +104,13 @@ pub const HTTP_TIMEOUT_MS: i32 = 15000;
 
 pub const AUTO_CHECK_COOLDOWN_SECS: u64 = 3600;
 pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
+/// `SUSPEND_REASON_MONITOR`（显示器关闭）挂起位的保守超长 TTL（秒）。
+///
+/// 显示器开关在本仓库 feature 集内没有可靠的只读真值源（只在变化时推送），
+/// 因此该位只能按「已置位够久」清理。12 小时刻意长于「整夜息屏/锁屏」这一最常见
+/// 的合法长挂起场景：误恢复的代价是显示器关闭期间多跑 1 Hz 采样，且下一次点亮
+/// 通知必然到达（可自愈）；误冻结的代价是组件永久假活、只能重启程序。
+pub const SUSPEND_MONITOR_TTL_SECS: u64 = 12 * 60 * 60;
 /// 启动安装包遇共享冲突类瞬态错误（如杀软实时扫描瞬时占用刚写完的文件）
 /// 时的最大尝试次数与每次重试前的等待时长。
 pub const INSTALLER_LAUNCH_MAX_ATTEMPTS: u32 = 3;

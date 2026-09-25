@@ -125,8 +125,10 @@ impl AtomicHwnd {
 
 /// `HPOWERNOTIFY` 的原子存储：与 [`AtomicHwnd`] 同构单列。
 ///
-/// 内值为 `isize`，无需指针转换；内存序契约与 `AtomicHwnd` 一致
-/// （`store`/`clear` 用 Release，`load` 用 Acquire，`take` 用 AcqRel）。
+/// 内值为 `isize`，无需指针转换；只保留注册/注销实际需要的两个操作：
+/// `store` 用 Release 发布新句柄，`take` 用 AcqRel 取走（注销路径专用，
+/// 取走即清零，重复注销自然变成空操作）。查询用的 `load` 没有生产消费者，
+/// 故不提供——需要只读 accessor 的调用方应另加窄接口，而不是先摆一个空壳。
 pub struct AtomicPowerNotify(std::sync::atomic::AtomicIsize);
 
 impl AtomicPowerNotify {
@@ -136,15 +138,6 @@ impl AtomicPowerNotify {
 
     pub fn store(&self, handle: HPOWERNOTIFY) {
         self.0.store(handle.0, std::sync::atomic::Ordering::Release);
-    }
-
-    pub fn load(&self) -> Option<HPOWERNOTIFY> {
-        let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
-        if raw == 0 {
-            None
-        } else {
-            Some(HPOWERNOTIFY(raw))
-        }
     }
 
     pub fn take(&self) -> Option<HPOWERNOTIFY> {
