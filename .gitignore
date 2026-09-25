@@ -5,3 +5,5 @@ Output
 node_modules
 
 .commandcode
+
+.dsh-rfc-loop-temp/
