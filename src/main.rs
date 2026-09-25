@@ -754,9 +754,12 @@ fn arm_recovery_timer(watchdog: HWND) {
 ///
 /// 恢复路径的存续不能取决于启动期那一次 `SetTimer` 是否成功（失败后没有任何
 /// WM_TIMER 能再调用 [`set_recovery_interval`]）。因此把「重新武装」挂到仍然存在的
-/// 周期入口上：主窗口的监测 tick（[`handle_timer`]）与状态切换
-/// （`suspend::resync_monitoring_timers`，那是「监测定时器集合可能全空」的临界点）。
-/// 只要还有任一个入口在跑，恢复调度就会被重新武装起来。
+/// 周期入口上：主窗口的监测 tick（[`handle_timer`]）、看门狗的重建重试 tick，以及
+/// 状态切换（`suspend::resync_monitoring_timers`——它覆盖「进入挂起」这一临界点，
+/// 恰好是监测定时器全部消失之前最后一次能补武装的机会）。
+///
+/// 覆盖边界：只要状态还会变化、或主窗口还有任一周期 tick 在跑，就会再试一次；唯一
+/// 补不上的情形是 `SetTimer` 本身持续失败（那时没有可用手段，属 API 级故障）。
 ///
 /// **已武装时必须直接返回**：`SetTimer` 复用同一 ID 会重设倒计时，每个 tick 都武装
 /// 一次会让恢复周期永远到不了。
