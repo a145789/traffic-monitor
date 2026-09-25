@@ -328,7 +328,8 @@ impl Renderer {
         let arrow_right = layout.speed_left + self.arrow_width;
 
         // 填充画布背景为透明色键，并设置文字颜色。
-        // SAFETY: self.hdc_mem、self.hbrush 均为有效 GDI 句柄；rect 在栈上。
+        // SAFETY: self.hdc_mem 为本结构体独占的内存 DC，self.hbrush 为本结构体独占的刷子，
+        // 两者在调用期间均存活；rect 在栈上且调用期间有效；FillRect 为同步调用，不保留指针。
         unsafe {
             let _ = FillRect(self.hdc_mem, &rect, self.hbrush);
         }
@@ -392,8 +393,8 @@ impl Renderer {
         draw_text(self.hdc_mem, mem_wide, &mut rc_mem, DT_RIGHT);
 
         // 把内存 DC 内容一次性 blit 到目标窗口 DC。
-        // SAFETY: hdc 与 self.hdc_mem 均为有效 DC；坐标与尺寸基于 self.width / self.height，
-        // 与位图选择时的尺寸一致。
+        // SAFETY: hdc 为调用方在本次同步调用期间有效的目标 DC，self.hdc_mem 为本结构体独占的内存 DC；
+        // 坐标与尺寸基于 self.width / self.height，与当前选入位图一致；BitBlt 不保留指针。
         let copied = unsafe {
             BitBlt(
                 hdc,

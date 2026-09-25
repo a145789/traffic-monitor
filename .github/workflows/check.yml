@@ -34,6 +34,36 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      - name: Check release imports (no winhttp/bcrypt in standard imports)
+        shell: powershell
+        run: |
+          $exe = "target/release/traffic-monitor.exe"
+          if (-not (Test-Path $exe)) { Write-Error "release binary not found: $exe"; exit 1 }
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)?.Source
+          if (-not $dumpbin) {
+            $roots = @("C:\Program Files\Microsoft Visual Studio", "C:\Program Files (x86)\Microsoft Visual Studio")
+            foreach ($root in $roots) {
+              if (Test-Path $root) {
+                $found = Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -like "*Hostx64\x64*" } |
+                  Select-Object -First 1
+                if ($found) { $dumpbin = $found.FullName; break }
+              }
+            }
+          }
+          if (-not $dumpbin) { Write-Error "dumpbin.exe not found"; exit 1 }
+          Write-Output "dumpbin: $dumpbin"
+          $output = & $dumpbin /IMPORTS $exe 2>&1 | Out-String
+          $marker = "delay load imports"
+          $idx = $output.ToLower().IndexOf($marker)
+          if ($idx -ge 0) { $standard = $output.Substring(0, $idx) } else { $standard = $output }
+          if ($standard -match "(?i)winhttp\.dll|bcrypt\.dll|bcryptprimitives\.dll") {
+            Write-Error "标准导入表不得包含 winhttp/bcrypt（/DELAYLOAD 失效）"
+            Write-Output $standard
+            exit 1
+          }
+          Write-Output "标准导入表不含 winhttp/bcrypt，/DELAYLOAD 生效"
+
   # MSRV 对账：Cargo.toml 声明 rust-version = "1.95"，此处用 1.95 工具链跑
   # cargo check --locked，与最新 stable 并行。若红，在同一 PR 内决定
   # 「升 rust-version」还是「改代码」，不允许声明与 CI 静默脱节。

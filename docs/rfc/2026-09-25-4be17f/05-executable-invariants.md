@@ -40,7 +40,9 @@ Status: proposed
 
 ## 验收标准
 
-`grep -rn "SAFETY: 句柄来自成功的" src` 与 `grep -rn "成功创建的" src` 均为 0 命中；上列 6 处注释改写后仍为 `// SAFETY:` 前缀（保持既有形式）。
+`grep -rn "成功创建的" src` 为 0 命中；`src/update/http.rs` 与 `src/update/crypto.rs` 内
+`grep -n "句柄来自成功的"` 为 0 命中（全仓 blanket 为 0 不成立：`src/update/protocol.rs:434`
+是带「唯一持有者」的所有权合格样本，不在本篇范围）；上列 6 处注释改写后仍为 `// SAFETY:` 前缀（保持既有形式）。
 
 导入表检查可执行且对当前 release 产物给出「不含 `winhttp.dll`、不含 `bcrypt.dll`」的结论；实现方式自选（`dumpbin /imports` 或等价的产物检查脚本），但不得为此在 `Cargo.toml` 引入新的运行时依赖。
 

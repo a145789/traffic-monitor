@@ -24,6 +24,16 @@ if (currentBranch !== "main") {
   process.exit(1);
 }
 
+// 远端一致性校验：本地 main 不得领先 origin/main，避免把未推送的提交一并推去发版。
+// 放在版本改写之前：发版需要推送，此处引入网络依赖是有意的。
+console.log("Checking local main is in sync with remote...");
+execSync("git fetch origin main", { stdio: "inherit" });
+const ahead = execSync("git rev-list --count origin/main..main", { encoding: "utf-8" }).trim();
+if (ahead !== "0") {
+  console.error(`Error: Local main is ${ahead} commit(s) ahead of origin/main. Push or reset before release.`);
+  process.exit(1);
+}
+
 // Check git status
 console.log("Checking git status...");
 const gitStatus = execSync("git status --porcelain", { encoding: "utf-8" }).trim();
@@ -102,6 +112,12 @@ writeFileSync("installer.iss", iss);
 // Update Cargo.lock to reflect the new version
 console.log("Updating Cargo.lock...");
 execSync("cargo update --workspace", { stdio: "inherit" });
+
+// 改锁后重验：前置门禁验的是改锁前的依赖图，被发布的 commit 用的是改锁后的。
+// 版本号只改元数据、无代码变更，test 已由前置门禁覆盖，此处仅重跑 release 构建
+// 验证锁定依赖图可构建（是否同时补 cargo test 的取舍见提交信息）。
+console.log("Verifying post-lock build...");
+execSync("cargo build --release --locked", { stdio: "inherit" });
 
 // Git commit
 console.log("Creating git commit...");
