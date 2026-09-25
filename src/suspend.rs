@@ -197,7 +197,6 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> bool {
         true
     };
 
-    // 这是辅助功能，失败不应让核心监测窗口退出或弹出错误框。
     if plan.auto_update {
         let _ = set_coalescable_timer(hwnd, TIMER_ID_AUTO_UPDATE, TIMER_INTERVAL_AUTO_UPDATE);
     }
@@ -264,7 +263,6 @@ pub fn check_fullscreen(hwnd: HWND) {
 
     // 前台窗口所在显示器 vs 任务栏所在显示器，仅同屏全屏才暂停。
     let hmon_fg = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
-    // 只读 rcMonitor，用轻量 MONITORINFO 即可（EXW 版仅多 szDevice）。
     let mut mi_fg = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -321,8 +319,6 @@ mod tests {
     use crate::config::AUTO_CHECK_COOLDOWN_SECS;
     use windows::Win32::Foundation::LPARAM;
 
-    // ===== is_immersive_color_set =====
-
     #[test]
     fn test_immersive_color_null_pointer() {
         // SAFETY: LPARAM(0) 表示 null 指针，函数应安全返回 false。
@@ -348,12 +344,8 @@ mod tests {
         assert!(!result);
     }
 
-    // ===== 恢复边沿与基线重建 =====
-
     #[test]
     fn test_baseline_rebuild_only_on_last_resume_edge() {
-        // 交错 suspend(SYSTEM)+suspend(SESSION) 后逐个 resume：
-        // 基线重建只允许发生在清掉最后一个原因位的那次恢复调用上。
         let state = SuspendReasons::new();
         state.suspend(SUSPEND_REASON_SYSTEM);
         state.suspend(SUSPEND_REASON_SESSION);
@@ -372,14 +364,10 @@ mod tests {
             "清掉最后一个原因位才构成恢复边沿"
         );
 
-        // 位集语义不变：已在运行态时的重复 resume 不得再次构成边沿，
-        // 否则基线被反复清空、恢复后长期显示零速（见本函数文档）。
         let was = state.is_suspended();
         state.resume(SUSPEND_REASON_SESSION);
         assert!(!should_rebuild_baseline(was, &state));
     }
-
-    // ===== timer_plan =====
 
     #[test]
     fn auto_update_poll_interval_must_be_far_below_cooldown() {

@@ -17,7 +17,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEV_BUILD: bool = option_env!("TRAFFIC_MONITOR_DEV_BUILD").is_some();
 
 pub const APP_NAME: &str = "TrafficMonitor";
-/// 用户可见显示标题：MessageBox、托盘 tip、HTTP User-Agent 等字符串的统一来源。
 pub const APP_TITLE: &str = "Traffic Monitor";
 pub const WINDOW_CLASS: &str = "TrafficMonitorWnd\0";
 pub const WINDOW_TITLE: &str = "Traffic Monitor\0";
@@ -40,10 +39,8 @@ pub const REG_PATH_PERSONALIZE: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 /// 调试日志开关（DWORD：1=开，0/缺失=关，见 `util::log_event!`）。
 pub const REG_VALUE_DEBUG_LOG: &str = "EnableDebugLog";
-/// release 现场诊断日志位置：`%LOCALAPPDATA%\Traffic Monitor\debug.log`。
 pub const DEBUG_LOG_DIR_NAME: &str = "Traffic Monitor";
 pub const DEBUG_LOG_FILE_NAME: &str = "debug.log";
-/// 日志环形截断上限（字节）：超限时只保留尾部一半。
 pub const DEBUG_LOG_MAX_BYTES: u64 = 256 * 1024;
 /// 连续写失败达此次数即在进程内自动关开关（注册表值不动，重启后重载）。
 pub const DEBUG_LOG_DISABLE_AFTER_FAILURES: u32 = 3;
@@ -52,12 +49,10 @@ pub const DISPLAY_WIDTH: i32 = 170;
 pub const DISPLAY_HEIGHT: i32 = 32;
 pub const GAP: i32 = -3;
 
-// --- 布局基准（96 DPI 物理像素，渲染时按当前 DPI 缩放） ---
 pub const LAYOUT_COL_GAP: i32 = 13;
 pub const LAYOUT_SPEED_MARGIN: i32 = 4;
 pub const LAYOUT_COL_WIDTH: i32 = 76;
 
-// --- 自定义窗口消息（WM_USER 偏移，全进程唯一，禁止重复取值） ---
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
 pub const WM_USER_NETWORK_RECONNECTED: u32 = WM_USER + 4;
 pub const WM_USER_UPDATE_ACTION: u32 = WM_USER + 5;
@@ -67,7 +62,6 @@ pub const WM_USER_UPDATE_ACTION: u32 = WM_USER + 5;
 pub const WM_USER_QUIT_REQUEST: u32 = WM_USER + 6;
 pub const WM_APP_TRAY: u32 = WM_USER + 100;
 
-// 定时器 ID 只在其所属窗口内唯一：看门狗与主窗口各自独立计时，互不遮蔽。
 pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 pub const TIMER_ID_FULLSCREEN: usize = 3;
@@ -88,7 +82,6 @@ pub const CPU_MEM_INTERVAL: u32 = 5000;
 pub const TIMER_COALESCING_TOLERANCE_MS: u32 = 100;
 pub const BACKOFF_ZERO_THRESHOLD: u32 = 5;
 
-/// 虚拟网卡黑名单缓存有效期（秒），避免每次采样重建。
 pub const BLACKLIST_REFRESH_SECS: u64 = 30;
 
 pub const VERSION_METADATA_MAX_BYTES: usize = 4 * 1024;
@@ -97,7 +90,6 @@ pub const HTTP_READ_CHUNK_BYTES: usize = 64 * 1024;
 /// WinHTTP 四段超时（毫秒）：名称解析 / 连接 / 发送 / 接收统一取此值，两抓取路径共用。
 pub const HTTP_TIMEOUT_MS: i32 = 15000;
 
-/// 自动检查更新的正常冷却与失败后短冷却（秒）。
 pub const AUTO_CHECK_COOLDOWN_SECS: u64 = 3600;
 pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 /// 启动安装包遇共享冲突类瞬态错误（如杀软实时扫描瞬时占用刚写完的文件）
@@ -105,7 +97,6 @@ pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 pub const INSTALLER_LAUNCH_MAX_ATTEMPTS: u32 = 3;
 pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
 
-/// 版本文件抓取失败后的重试等待（毫秒）：防抖一次，避免抖动空转。
 pub const UPDATE_FETCH_RETRY_DELAY_MS: u64 = 500;
 /// 更新工作线程栈大小（字节）。
 ///
@@ -151,7 +142,6 @@ pub const FONT_BASE_SIZE: i32 = 13;
 /// 字重与品质见 `FONT_WEIGHT_NORMAL`；品质具名常量（`NONANTIALIASED_QUALITY`）
 /// 由 `windows` crate 提供，避免裸数字构造该 newtype 时被改错位宽或取值。
 pub const FONT_FACE_NAME: &str = "Segoe UI";
-/// 常规字重 400（`LOGFONTW.lfWeight`）。
 pub const FONT_WEIGHT_NORMAL: i32 = 400;
 
 /// 托盘图标资源 ID（`MAKEINTRESOURCEW` 语义）：`assets/icon.ico` 经 `build.rs`
@@ -167,5 +157,4 @@ pub const MENU_ID_EXIT: u32 = 1002;
 pub const MENU_ID_AUTO_UPDATE_TOGGLE: u32 = 1005;
 pub const MENU_ID_CHECK_UPDATE_MANUAL: u32 = 1006;
 
-/// 从 WPARAM/LPARAM 提取低 16 位（LOWORD）的掩码，用于菜单 ID 与托盘事件。
 pub const LOWORD_MASK: u32 = 0xFFFF;

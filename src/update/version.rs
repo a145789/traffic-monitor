@@ -1,7 +1,3 @@
-//! 版本号解析与远端 metadata 严格解析。
-//!
-//! 与 HTTP/加密/安装逻辑解耦：纯字符串/字节处理，便于单测。
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Version {
     major: u32,
@@ -105,16 +101,11 @@ mod tests {
 
     #[test]
     fn test_parse_version_rejects_invalid() {
-        // 不足三段
         assert_eq!(parse_version("0.4"), None);
-        // 超过三段
         assert_eq!(parse_version("1.2.3.4"), None);
-        // 非数字
         assert_eq!(parse_version("invalid"), None);
         assert_eq!(parse_version("1.x.3"), None);
-        // 空段
         assert_eq!(parse_version("1..3"), None);
-        // 含 `-` 后缀一律拒绝
         assert_eq!(parse_version("1.2.3-nightly"), None);
     }
 
@@ -138,18 +129,14 @@ mod tests {
 
     #[test]
     fn test_parse_update_metadata_rejects_wrong_line_count() {
-        // 0 行
         assert!(parse_update_metadata("").is_err());
-        // 1 行
         assert!(parse_update_metadata("1.2.3").is_err());
-        // 3 行
         assert!(
             parse_update_metadata(
                 "1.2.3\nB94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9\nextra\n"
             )
             .is_err()
         );
-        // 末尾多余空行（trim 后仍被记为一行）
         assert!(parse_update_metadata("1.2.3\nhash\n\n").is_err());
     }
 
@@ -164,7 +151,6 @@ mod tests {
 
     #[test]
     fn test_parse_update_metadata_rejects_bad_hash() {
-        // 非 64 位
         assert!(parse_update_metadata("1.2.3\nABCD").is_err());
         assert!(
             parse_update_metadata(
@@ -178,14 +164,12 @@ mod tests {
             )
             .is_err()
         );
-        // 非十六进制字符
         assert!(
             parse_update_metadata(
                 "1.2.3\nZ94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9"
             )
             .is_err()
         );
-        // 包含空格
         assert!(
             parse_update_metadata(
                 "1.2.3\nB94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE908 F7ACE2EFCDE9"
@@ -196,7 +180,6 @@ mod tests {
 
     #[test]
     fn test_parse_update_metadata_trims_whitespace() {
-        // 合法但带前后空白与多余空白行（首尾被 trim 后正确解析）。
         let text =
             "  1.2.3  \n  B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9  ";
         let m = parse_update_metadata(text).unwrap();

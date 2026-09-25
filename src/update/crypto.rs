@@ -1,5 +1,4 @@
 //! BCrypt SHA-256 哈希计算与 RAII 句柄守卫。
-//!
 //! 与 HTTP/安装逻辑解耦：仅依赖 BCrypt API，输入可读流或已锁定句柄，输出大写十六进制哈希。
 
 use windows::Win32::Security::Cryptography::*;
@@ -103,7 +102,6 @@ pub(super) fn compute_sha256_hex_reader(reader: &mut impl std::io::Read) -> Resu
 /// 对已加只读共享锁的安装器句柄重算哈希。
 /// 不变量：调用方必须已持有 `FILE_SHARE_READ` 锁；本函数只在该句柄上读，
 /// 不按路径另开文件，避免“验后另开锁”的 TOCTOU 窗口。
-/// 成功返回大写十六进制哈希；失败返回中文错误。
 pub(super) fn compute_sha256_hex_locked(file: &mut std::fs::File) -> Result<String, String> {
     use std::io::Seek;
     file.rewind()
@@ -140,11 +138,8 @@ mod tests {
         assert_eq!(format_hex(&[0x12, 0x34, 0x56]), "123456");
     }
 
-    // ===== compute_sha256_hex known-answer =====
-
     #[test]
     fn test_sha256_known_answer() {
-        // "hello world" 的 SHA-256，由 shasum -a 256 确认。
         let expected = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
         let hash = compute_sha256_hex(b"hello world").unwrap();
         assert_eq!(hash, expected);
@@ -152,7 +147,6 @@ mod tests {
 
     #[test]
     fn test_sha256_incremental_matches_one_shot() {
-        // 分块 update 应与一次性计算结果一致（Sha256 复用正确性）。
         let hash = Sha256::new().unwrap();
         hash.update(b"hello ").unwrap();
         hash.update(b"world").unwrap();
@@ -164,8 +158,6 @@ mod tests {
 
     #[test]
     fn test_streaming_reader_matches_one_shot_large_input() {
-        // 本地大输入驱动流式（reader 分块）与整包两种哈希入口结果一致：
-        // 200KiB 确定性序列，多次 update/分块读取的切分方式不得影响结果。
         let mut data = Vec::with_capacity(200 * 1024);
         for i in 0..(200 * 1024) {
             data.push((i % 251) as u8);
@@ -177,7 +169,6 @@ mod tests {
 
     #[test]
     fn test_locked_handle_hash_matches_reader() {
-        // 锁定句柄入口与流式 reader 入口一致：同一内容经文件句柄重读应得同一哈希。
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "traffic-monitor-hash-test-{}-{}.tmp",

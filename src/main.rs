@@ -266,7 +266,6 @@ fn main() {
         return;
     }
 
-    // 看门狗是首个创建的顶层窗口；ImmDisableIME 已在其之前执行。
     if let Err(e) = register_watchdog_class() {
         show_error(&e);
         return;
@@ -384,8 +383,6 @@ fn run_message_loop() {
     }
 }
 
-// --- 看门狗窗口与 Explorer 重启恢复 ---
-
 /// 注册显示器开关电源通知到指定窗口。失败仅影响显示器开关节能（非致命）。
 fn register_power_notify(hwnd: HWND) {
     // DEVICE_NOTIFY_WINDOW_HANDLE = 0；误用 SERVICE_HANDLE(1) 会把 HWND 当服务句柄，
@@ -460,7 +457,6 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
         r.update_text_color();
     });
     if !dpi_ok {
-        // 与 WM_DPICHANGED 失败分支对称，共用同一份回滚实现。
         rollback_window_to_bitmap(hwnd);
     }
 
@@ -481,8 +477,6 @@ fn bind_display_and_timers(hwnd: HWND) -> bool {
 fn rebuild_main_window(watchdog: HWND) {
     invalidate_taskbar_cache();
 
-    // 会话通知必须在旧窗口销毁前配对注销：WTS 契约要求注销先于窗口销毁，
-    // 销毁后句柄失效，届时已无法补做。
     unregister_session_notification();
 
     let old = CURRENT_MAIN_HWND.take();
@@ -570,7 +564,6 @@ fn arm_rebuild_retry(watchdog: HWND) {
 /// 结束重建重试：复位退避档位并移除定时器。
 fn disarm_rebuild_retry(watchdog: HWND) {
     REBUILD_RETRY_INTERVAL_MS.with(|c| c.set(0));
-    // KillTimer 对不存在的定时器只返回错误，不会破坏窗口状态。
     unsafe {
         KillTimer(Some(watchdog), TIMER_ID_REBUILD_RETRY).ok();
     }
@@ -641,9 +634,6 @@ pub extern "system" fn watchdog_wnd_proc(
     }
 
     match msg {
-        // 退出请求（--quit 按 WATCHDOG_CLASS 检索到本窗口后投递）：主窗口嵌入
-        // 任务栏后检索不到，重建间隙更是完全不存在；请求可能重复到达，重复的
-        // 由 [`begin_exit`] 的幂等门吞掉。
         WM_USER_QUIT_REQUEST => {
             finish_exit_from_watchdog(hwnd);
             LRESULT(0)
@@ -660,15 +650,11 @@ pub extern "system" fn watchdog_wnd_proc(
             LRESULT(0)
         }
 
-        // 主窗口重建失败后的退避重试。
         WM_TIMER if wparam.0 == TIMER_ID_REBUILD_RETRY => {
             rebuild_main_window(hwnd);
             LRESULT(0)
         }
 
-        // 主题变更。WM_SETTINGCHANGE 走 HWND_BROADCAST 顶层广播，嵌入后的主窗口是
-        // WS_CHILD 收不到，必须由常驻顶层窗口接收；这里直接执行共享处理而不转发，
-        // 因为重建间隙主窗口可能不存在。电源与锁屏通知是定向消息，不经此路由。
         WM_SETTINGCHANGE => {
             // SAFETY: OS 保证 lparam 指向 NUL 结尾宽字符串（或 null）。
             if unsafe { is_immersive_color_set(lparam) } {
@@ -689,7 +675,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     match wparam.0 {
         TIMER_ID_INIT_TRIM => {
             trim_working_set();
-            // KillTimer 对不存在的定时器仅返回错误，不触发 UB。
             unsafe {
                 KillTimer(Some(hwnd), TIMER_ID_INIT_TRIM).ok();
             }
@@ -729,8 +714,6 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             }
         }
         TIMER_ID_AUTO_UPDATE => {
-            // 条件先命名：arm 体若只剩单个 if 会触发 collapsible_match，
-            // 与兄弟 arm 同保持函数体内 if（无 match guard）。
             let active = !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire);
             if active {
                 start_auto_check();

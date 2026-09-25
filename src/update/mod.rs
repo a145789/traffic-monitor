@@ -1,13 +1,5 @@
 //! 自动/手动检查更新、下载新版本安装包、SHA-256 校验、UAC 提权覆盖安装。
 //!
-//! 模块拆分：
-//! - [`version`]：版本号解析与远端 metadata 严格解析（纯字符串处理）。
-//! - [`http`]：WinHTTP 抓取与友好的中文错误映射。
-//! - [`crypto`]：BCrypt SHA-256 哈希与 RAII 句柄守卫。
-//! - [`cache`]：临时安装包路径、加锁打开/创建、启动期过期清理。
-//! - [`protocol`]：子进程 stdout 单行协议扫描、EXIT_MAIN 转发、收尾复位判定。
-//! - [`installer`]：缓存复用、流式下载校验、安装器提权启动、主进程退出等待。
-//! - 本文件：自动/手动编排、更新检查流程、用户交互、注册表开关读写。
 
 mod cache;
 mod crypto;
@@ -91,13 +83,10 @@ pub fn save_auto_update_enabled(enabled: bool) {
     );
 }
 
-/// 读取用户明确拒绝过的更新版本号；无记录返回 None。
 fn read_skipped_version() -> Option<String> {
     reg_read_string(REG_PATH_APP, REG_VALUE_SKIPPED_VERSION)
 }
 
-/// 记住被拒绝的版本号，避免自动检查周期性重复弹同一版本的确认框；
-/// 出现更新的版本后仍会正常提示。由子进程写入（与弹窗交互同进程）。
 fn record_skipped_version(version: &str) {
     reg_write_string(REG_PATH_APP, REG_VALUE_SKIPPED_VERSION, version);
 }
@@ -216,11 +205,6 @@ fn update_check_worker(is_manual: bool) {
     compact_and_trim();
 }
 
-/// 本次检查结果是否按「失败」记账（错误冷却），而不是一小时的正常冷却。
-///
-/// `BUSY`（另一处更新子进程仍在跑）不是一次成功的检查：本次没有产出任何结论，
-/// 写成正常冷却就等于把「没执行」记成「已经检查过」，整整一小时不再重试。
-/// 父进程消失导致的 R1 静默放弃以非零退出码表达，已经落在 `is_error` 里。
 fn should_use_error_cooldown(is_error: bool, busy: bool) -> bool {
     is_error || busy
 }
@@ -323,7 +307,6 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
         return CheckResult::InstalledReady(verified);
     }
 
-    // 取消谓词：每读到一个数据块判一次（块大小 HTTP_READ_CHUNK_BYTES，见 http 模块头）。
     let still_wanted = || !ctx.abandoned();
 
     // 主源下载失败才回落代理；校验/锁定等本地失败直接返回，不多下整包。
@@ -566,7 +549,6 @@ pub fn handle_update_action() {
 }
 
 fn show_yes_no(msg: &str) -> bool {
-    // 复用 util 的统一 MessageBoxW 入口；返回 IDYES 表示用户选择「是」。
     message_box(msg, MB_YESNO | MB_ICONINFORMATION) == IDYES
 }
 
@@ -614,15 +596,11 @@ mod tests {
 
     #[test]
     fn busy_result_must_not_take_the_normal_cooldown() {
-        // BUSY 是「另一处更新子进程占用、本次没跑」，不是一次成功的检查：
-        // 按正常冷却记账就等于把「没执行」记成「已检查过」，整整一小时不再重试。
         assert!(should_use_error_cooldown(false, true));
-        // 真失败仍按失败记账；只有正常结束才走一小时正常冷却。
         assert!(should_use_error_cooldown(true, false));
         assert!(!should_use_error_cooldown(false, false));
     }
 
-    // `NoUpdate` 是自动检查的常态，绝不能弹框：否则每小时一次。
     #[test]
     fn no_update_message_is_silent_for_auto_check() {
         assert!(no_update_message(false, false, "1.6.0").is_none());

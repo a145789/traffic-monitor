@@ -75,7 +75,6 @@ impl HttpGet {
         let host_wide = to_wide(host);
         let path_wide = to_wide(path);
 
-        // RAII 守卫：Drop 按 request → connect → session 顺序关闭非空句柄。
         let mut handles = WinHttpHandles {
             h_request: std::ptr::null_mut(),
             h_connect: std::ptr::null_mut(),
@@ -183,7 +182,6 @@ impl HttpGet {
         max_response_bytes: usize,
         mut on_chunk: impl FnMut(&[u8]) -> Result<(), FetchFileError>,
     ) -> Result<(), FetchFileError> {
-        // 复用固定缓冲：每轮只取用前 chunk_len 字节，避免随包大小线性分配。
         let mut buf = vec![0u8; HTTP_READ_CHUNK_BYTES];
         let mut total: usize = 0;
         loop {

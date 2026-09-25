@@ -1,5 +1,4 @@
 //! 安装器管线：缓存复用、流式下载、提权启动、主进程退出等待。
-//!
 //! 不变量：构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希
 //! （`compute_sha256_hex_locked`），不按路径另开文件。
 
@@ -162,7 +161,6 @@ pub(super) fn fetch_verified_installer(
     let verified_hash = match compute_sha256_hex_locked(&mut file_lock) {
         Ok(h) => h,
         Err(e) => {
-            // 先释放锁再删，否则 Windows 下删除被占用文件会失败而残留。
             drop(file_lock);
             let _ = std::fs::remove_file(temp_path);
             return Err(FetchFailure::Local(format!("计算安装包哈希失败: {e}")));
@@ -276,7 +274,6 @@ pub(super) fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
     result
 }
 
-/// 判定是否值得重试的启动失败：仅共享冲突/锁冲突类瞬态错误。
 fn is_transient_launch_error(launch: &InstallerLaunch) -> bool {
     matches!(
         launch,
@@ -329,12 +326,8 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
 mod tests {
     use super::*;
 
-    // ===== classify_fetch_error =====
-
     #[test]
     fn test_cancelled_is_not_classified_as_download() {
-        // 取消必须独立于下载失败：被归成 Download 会让调用方回落第三方代理，
-        // 在父进程已消失、本次动作已无人要的情况下再下整整一个安装包。
         assert_eq!(
             classify_fetch_error(FetchFileError::Cancelled),
             FetchFailure::Cancelled
@@ -349,11 +342,8 @@ mod tests {
         );
     }
 
-    // ===== is_transient_launch_error =====
-
     #[test]
     fn test_transient_launch_errors_are_retried() {
-        // 32 = ERROR_SHARING_VIOLATION，33 = ERROR_LOCK_VIOLATION。
         assert!(is_transient_launch_error(&InstallerLaunch::Failed(
             ERROR_SHARING_VIOLATION.0
         )));
@@ -372,8 +362,6 @@ mod tests {
 
     // ===== 锁定句柄重验（TOCTOU 防护） =====
 
-    /// 本模块的两个缓存复用测试使用真实临时文件：文件名含进程 ID，避免与并行用例冲突；
-    /// 首尾都删文件，不留残留。生产路径禁止 unwrap，此处为测试断言。
     fn cache_test_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "traffic-monitor-reuse-test-{}-{}.tmp",
@@ -408,7 +396,6 @@ mod tests {
             let mut f = open_locked_installer(&path).unwrap();
             compute_sha256_hex_locked(&mut f).unwrap()
         };
-        // 篡改：锁已释放后覆盖为坏内容（等价于无锁窗口内的替换）。
         std::fs::write(&path, b"tampered-installer-payload").unwrap();
         let reused = try_reuse_cached_installer(path.clone(), "9.9.9", &expected_good);
         assert!(reused.is_none(), "锁定句柄哈希不一致时必须拒绝复用");

@@ -33,7 +33,6 @@ pub fn to_wide(s: &str) -> Vec<u16> {
     v
 }
 
-/// 向已有缓冲区追加 NUL 结尾 UTF-16，供渲染热路径复用缓冲、避免逐帧分配。
 pub fn push_wide(buf: &mut Vec<u16>, s: &str) {
     buf.extend(s.encode_utf16());
     buf.push(0);
@@ -158,7 +157,6 @@ impl AtomicPowerNotify {
     }
 }
 
-/// 当前进程模块句柄（HINSTANCE），用于注册窗口类、加载内置资源。
 pub fn module_instance() -> Result<windows::Win32::Foundation::HINSTANCE, String> {
     // SAFETY: GetModuleHandleW(None) 查询当前进程模块，无指针参数。
     unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }
@@ -166,8 +164,6 @@ pub fn module_instance() -> Result<windows::Win32::Foundation::HINSTANCE, String
         .map_err(|e| format!("获取模块句柄失败: {e:?}"))
 }
 
-/// 统一的 MessageBoxW 入口：所有弹窗都经由本函数创建，避免各处重复拼装
-/// 标题/正文宽字符串。`style` 直接透传 Win32 组合标志，返回用户选择结果。
 pub fn message_box(msg: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     let title = to_wide(APP_TITLE);
     let msg_wide = to_wide(msg);
@@ -256,7 +252,6 @@ macro_rules! diag {
         let msg = ::std::format!("traffic-monitor: {}", ::std::format_args!($($arg)*));
         let wide: Vec<u16> = msg.encode_utf16().chain(::std::iter::once(0)).collect();
         // SAFETY: wide 以 NUL 结尾，且仅在本次同步调用期间存活。
-        // allow(unused_unsafe)：部分调用点本身位于 unsafe 块内，嵌套 unsafe 会触发告警。
         #[allow(unused_unsafe)]
         unsafe {
             ::windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(
@@ -286,13 +281,10 @@ static DEBUG_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 /// 连续写失败计数；成功一次即清零。Relaxed（与开关同理）。
 static DEBUG_LOG_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
 
-/// `log_event!` 的唯一门：开关关闭时仅一次 Relaxed 原子读即返回。
 pub fn debug_log_enabled() -> bool {
     DEBUG_LOG_ENABLED.load(Ordering::Relaxed)
 }
 
-/// 从注册表重载调试日志开关并清零失败计数。启动入口调用一次；
-/// 运行中改注册表需重启生效（热路径不读注册表，开关关闭时零系统调用）。
 pub fn refresh_debug_log_flag() {
     let on = reg_read_dword(REG_PATH_APP, REG_VALUE_DEBUG_LOG)
         .map(|v| v != 0)
@@ -317,7 +309,6 @@ pub fn write_debug_log(line: &str) {
     }
 }
 
-/// 连续失败达阈值即停写（纯函数，阈值见 `DEBUG_LOG_DISABLE_AFTER_FAILURES`）。
 fn failures_should_disable(consec_failures: u32) -> bool {
     consec_failures >= DEBUG_LOG_DISABLE_AFTER_FAILURES
 }
@@ -331,12 +322,10 @@ fn debug_log_path() -> std::path::PathBuf {
     debug_log_path_for_base(&base)
 }
 
-/// 纯拼接：`base\Traffic Monitor\debug.log`（单测钉死目录文件名）。
 fn debug_log_path_for_base(base: &std::path::Path) -> std::path::PathBuf {
     base.join(DEBUG_LOG_DIR_NAME).join(DEBUG_LOG_FILE_NAME)
 }
 
-/// 单次追加写；超限时先保留尾部一半（环形截断）。失败由调用方计数。
 fn append_debug_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -525,38 +514,31 @@ mod tests {
     fn test_push_wide_appends() {
         let mut buf = to_wide("A");
         push_wide(&mut buf, "B");
-        // "A\0" + "B\0"
         assert_eq!(buf, vec![b'A' as u16, 0, b'B' as u16, 0]);
     }
 
     #[test]
     fn test_copy_wide_truncated_fits_and_truncates() {
-        // 恰好装下：整体搬入（含尾 NUL）并补一位 NUL。
         let mut dst = [0xFFFFu16; 4];
         copy_wide_truncated(&mut dst, &to_wide("ab"));
         assert_eq!(dst, [b'a' as u16, b'b' as u16, 0, 0]);
 
-        // 装不下：截断并保证尾 NUL，调用方无需再补。
         let mut dst = [0xFFFFu16; 3];
         copy_wide_truncated(&mut dst, &to_wide("abcd"));
         assert_eq!(dst, [b'a' as u16, b'b' as u16, 0]);
 
-        // 空目标：静默返回，不 panic。
         let mut dst: [u16; 0] = [];
         copy_wide_truncated(&mut dst, &to_wide("ab"));
     }
 
     #[test]
     fn test_os_to_wide_matches_to_wide_on_ascii() {
-        // 不变量：常规路径输出逐字节不变。
         let w = os_to_wide(std::ffi::OsStr::new("C:\\Temp\\a.exe"));
         assert_eq!(w, to_wide("C:\\Temp\\a.exe"));
     }
 
     #[test]
     fn test_os_to_wide_preserves_lone_surrogate() {
-        // 含非 Unicode 可解码字符（孤立代理项）：无损直转保留原码元，
-        // 而 to_string_lossy 会替换成 U+FFFD。
         use std::os::windows::ffi::OsStringExt;
         let raw = std::ffi::OsString::from_wide(&[0x41u16, 0xD800u16, 0x42u16]);
         assert_eq!(
@@ -568,8 +550,6 @@ mod tests {
 
     #[test]
     fn test_dpi_scaled_matches_forward_formula() {
-        // 96 DPI 下恒等；150%（144）与 200%（192）逐点对账收敛前的调用点写法
-        //（base * (dpi/96)，与合并后的 (base*dpi)/96 乘除顺序不同）。
         for (base, dpi, expected) in [
             (170, 96, 170),
             (32, 96, 32),
@@ -604,7 +584,6 @@ mod tests {
 
     #[test]
     fn test_debug_log_path_layout() {
-        // 日志目录文件名钉死：改名即红，调用方不再各自拼接路径。
         let p = debug_log_path_for_base(std::path::Path::new("C:\\Base"));
         assert_eq!(
             p,
@@ -615,7 +594,6 @@ mod tests {
     #[test]
     fn test_debug_log_disable_threshold() {
         use crate::config::DEBUG_LOG_DISABLE_AFTER_FAILURES;
-        // 未达阈值不断写（容忍瞬时故障），达阈值即停写、后续调用在宏门返回。
         assert!(!failures_should_disable(0));
         assert!(!failures_should_disable(
             DEBUG_LOG_DISABLE_AFTER_FAILURES - 1
@@ -628,8 +606,6 @@ mod tests {
 
     #[test]
     fn test_log_event_disabled_writes_nothing() {
-        // 开关默认关闭（本进程内无测试开启它）：log_event 只做一次原子读即返回，
-        // 不得产生任何文件操作。本用例零副作用：只读不断言存在性，前后内容一致即过。
         assert!(!debug_log_enabled());
         let path = debug_log_path();
         let before = std::fs::read(&path).ok();
@@ -641,7 +617,6 @@ mod tests {
     #[test]
     fn test_append_debug_log_ring_truncates() {
         use crate::config::DEBUG_LOG_MAX_BYTES;
-        // 真实文件行为：小写追加留痕；超限后只保留尾部一半 + 本次行。
         let dir = std::env::temp_dir().join(format!(
             "traffic-monitor-debuglog-test-{}",
             std::process::id()

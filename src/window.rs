@@ -129,7 +129,6 @@ pub fn register_watchdog_class() -> Result<(), String> {
 /// 级联销毁，且 TaskbarCreated 广播只投递顶层窗口——主窗口自身永远收不到。
 /// 看门狗永不嵌入、从不显示（无 GDI 位图/DC），常驻开销可忽略。
 pub fn create_watchdog_window() -> Result<HWND, String> {
-    // 空标题的 NUL 结尾切片，与原 w!("") 等价。
     const EMPTY_TITLE: [u16; 1] = [0];
     let hwnd = create_window(&WindowSpec {
         class_name: WATCHDOG_CLASS,

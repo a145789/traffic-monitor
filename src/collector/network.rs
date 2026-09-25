@@ -40,9 +40,7 @@ const SUPPORTED_IF_TYPES: [u32; 4] = [
 thread_local! {
     static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
-    // 容量提示（非约束）：网卡数量级为个位数，超限时 HashMap 自动扩容。
     // 值 + 可选时间戳：空名单即合法初值，None 表示从未刷新。
-    // 注：HashSet::new 需要运行时随机种子，无法放进 const 初始化块。
     static VIRTUAL_BLACKLIST: RefCell<(HashSet<u64>, Option<Instant>)> =
         RefCell::new((HashSet::new(), None));
 }
@@ -148,7 +146,6 @@ pub fn collect_network(hwnd: HWND) {
     });
 }
 
-/// 向主窗口投递网络状态消息（断网退避/恢复）。
 fn post_to_main(hwnd: HWND, msg: u32) {
     // SAFETY: PostMessageW 只投递消息，线程安全；窗口已销毁时返回错误。
     unsafe {
@@ -285,7 +282,6 @@ fn with_virtual_blacklist<R>(f: impl FnOnce(&HashSet<u64>) -> R) -> R {
             rebuild_virtual_blacklist(&mut cache, now, build_virtual_blacklist);
         }
 
-        // 类型即不变量：空名单是合法初值，重建后必然有值，无需再解 Option 兜底。
         let (blacklist, _) = &*cache;
         f(blacklist)
     })
@@ -305,7 +301,6 @@ fn rebuild_virtual_blacklist(
 ) {
     match rebuild() {
         Some(set) => *cache = (set, Some(now)),
-        // 失败也刷新时间戳，避免每 tick 重试 GetAdaptersAddresses。
         None => cache.1 = Some(now),
     }
 }
@@ -313,8 +308,6 @@ fn rebuild_virtual_blacklist(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ===== is_valid_interface =====
 
     #[test]
     fn test_is_valid_interface_ethernet() {
@@ -352,7 +345,6 @@ mod tests {
 
     #[test]
     fn test_is_valid_interface_unknown_type_rejected() {
-        // 非以太网/非 WiFi 类型（如软件环回 IF_TYPE_SOFTWARE_LOOPBACK=24）应被过滤。
         let row = MIB_IF_ROW2 {
             Type: 24,
             PhysicalAddressLength: 6,
@@ -372,13 +364,9 @@ mod tests {
         assert!(!is_valid_interface(&row));
     }
 
-    // ===== is_virtual_friendly_name =====
-
     #[test]
     fn test_virtual_friendly_name_matrix() {
         // 每个样本只命中其标注的关键字：若删掉任一 contains 判据，对应样本即变红。
-        // 旧 hyperv/vmware 样本双命中 "virtual"，旧 vbox 样本实际被 "virtual" 命中，
-        // 此处全部换成单命中样本（见 C1/C2）。
         let virtual_cases = [
             ("Virtual Ethernet Device", "virtual"),
             ("VBoxNetLwf", "vbox"),
@@ -395,7 +383,6 @@ mod tests {
             ("PPP Adapter", "ppp"),
             ("KVM Net Adapter", "kvm"),
             ("Xen Network Interface", "xen"),
-            // 大小写不敏感。
             ("VBOX Network Adapter", "vbox"),
         ];
         for (name, keyword) in virtual_cases {
@@ -405,7 +392,6 @@ mod tests {
             );
         }
 
-        // 真实物理网卡的常见名称不应被误判为虚拟。
         for name in [
             "Intel(R) Ethernet Connection I219-LM",
             "Realtek PCIe GbE Family Controller",
@@ -414,8 +400,6 @@ mod tests {
             assert!(!is_virtual_friendly_name(name), "{name} 不应误判");
         }
     }
-
-    // ===== 黑名单缓存刷新语义 =====
 
     #[test]
     fn test_reset_network_baseline_clears_history() {
@@ -462,7 +446,6 @@ mod tests {
     fn test_blacklist_needs_refresh_when_empty_or_stale() {
         let now = Instant::now();
 
-        // 从未刷新（时间戳为 None）等价于旧表示的空缓存，必须触发重建。
         assert!(blacklist_needs_refresh(&(HashSet::new(), None), now));
         // 「刷新时间戳就是 now」不算陈旧。这一侧断言刻意放在下面的提前 return 之前，
         // 否则开机不足 30 秒时整条用例只跑了一半就结束。
@@ -503,7 +486,6 @@ mod tests {
             None
         });
 
-        // 失败路径必须保留旧表且只探测一次；刷新后的时间戳保证 30 秒内不会重试。
         assert_eq!(rebuild_calls, 1);
         let (list, refreshed_at) = &cache;
         assert_eq!(list, &HashSet::from([7]));

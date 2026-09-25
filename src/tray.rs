@@ -65,14 +65,12 @@ pub fn create_tray_icon(hwnd: HWND) -> bool {
     nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
 
     let tip = to_wide(APP_TITLE);
-    // 定长截断语义见 util::copy_wide_truncated（与字体 lfFaceName 共用）。
     copy_wide_truncated(&mut nid.szTip, &tip);
 
     // SAFETY: nid 完整初始化，同步调用期间存活。
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
     if !added {
         diag!("创建托盘图标失败: Shell_NotifyIconW(NIM_ADD) 未成功");
-        // 同上：失败早退保证 `TRAY_DATA` 为空。
         TRAY_DATA.with(|t| *t.borrow_mut() = None);
         return false;
     }
@@ -112,7 +110,6 @@ enum MenuEntry {
     Separator,
 }
 
-/// 依据当前运行时状态构建完整菜单项列表（版本号、自启、自动更新、检查更新、退出）。
 fn build_menu_entries() -> Vec<MenuEntry> {
     let update_in_progress = UPDATE_IN_PROGRESS.load(Ordering::Relaxed);
     vec![

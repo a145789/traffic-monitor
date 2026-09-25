@@ -17,7 +17,6 @@ use crate::config::{
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
 use crate::util::{copy_wide_truncated, diag, dpi_scaled, log_event, reg_read_dword, to_wide};
 
-/// 网速箭头「↑」「↓」的 NUL 结尾 UTF-16 常量：直接给码元，免去逐帧 `encode_utf16`。
 const ARROW_UP: [u16; 2] = [0x2191, 0];
 const ARROW_DOWN: [u16; 2] = [0x2193, 0];
 
@@ -26,7 +25,6 @@ thread_local! {
     static LAST_RENDERED_VALUES: Cell<Option<DisplayValues>> = const { Cell::new(None) };
 }
 
-/// 安装渲染器（启动时调用一次）。
 pub fn set_renderer(renderer: Renderer) {
     RENDERER.with(|r| *r.borrow_mut() = Some(renderer));
 }
@@ -48,14 +46,12 @@ pub fn with_renderer(f: impl FnOnce(&mut Renderer)) {
     });
 }
 
-/// 销毁渲染器（退出前调用，归还 GDI 资源）。
 pub fn take_renderer() {
     RENDERER.with(|r| {
         let _ = r.borrow_mut().take();
     });
 }
 
-/// 仅在展示数据变化后请求重绘，避免空闲时每秒执行完整 GDI 绘制。
 pub fn invalidate_if_values_changed(hwnd: HWND) {
     let values = DisplayValues::load();
     let changed = LAST_RENDERED_VALUES.with(|last| last.get() != Some(values));
@@ -221,13 +217,9 @@ impl Drop for ScreenDcGuard {
 }
 
 impl Renderer {
-    /// 事务式构造：所有 GDI 资源按依赖顺序创建，任何一步失败由局部 RAII 守卫
-    /// 自动清理；全部成功后选入对象并通过 `into_raw` 移交所有权。错误信息为中文。
     pub fn new() -> Result<Self, String> {
-        // 1. 临时屏幕 DC（Drop 时 ReleaseDC）。
         let screen_dc = ScreenDcGuard::acquire().ok_or("无法获取屏幕设备上下文".to_string())?;
 
-        // 2. 兼容内存 DC（守卫托管，失败时 DeleteDC）。
         // SAFETY: screen_dc.hdc 有效。
         let dc = OwnedGdi::new(unsafe { CreateCompatibleDC(Some(screen_dc.hdc)) })
             .ok_or("无法创建兼容内存 DC".to_string())?;
@@ -239,11 +231,8 @@ impl Renderer {
         })
         .ok_or("无法创建兼容位图".to_string())?;
 
-        // 4. 字体。
         let font = OwnedGdi::new(create_font(FONT_BASE_SIZE)).ok_or("无法创建字体".to_string())?;
 
-        // 5. 背景刷子。
-        // SAFETY: COLOR_KEY 是合法的 COLORREF 常量。
         let brush = OwnedGdi::new(unsafe { CreateSolidBrush(COLORREF(COLOR_KEY)) })
             .ok_or("无法创建背景刷子".to_string())?;
 
@@ -263,13 +252,10 @@ impl Renderer {
             let _ = SetBkMode(dc.0, TRANSPARENT);
         }
 
-        // 9. 测量箭头宽度（依赖已选入的字体）。
         let arrow_width = measure_arrow_width(dc.0);
 
-        // 10. 释放临时屏幕 DC（其使命仅限于提供创建上下文）。
         drop(screen_dc);
 
-        // 11. 移交独占资源所有权，杜绝守卫 Drop 误释放仍在使用的对象。
         Ok(Self {
             hdc_mem: dc.into_raw(),
             hbitmap: bitmap.into_raw(),
@@ -282,7 +268,6 @@ impl Renderer {
             height: DISPLAY_HEIGHT,
             arrow_width,
             layout: Layout::new(DISPLAY_WIDTH, DISPLAY_HEIGHT),
-            // 容量提示（非约束）：格式化缓冲常规输出远小于此，超限时 Vec 自动扩容。
             buf: Vec::with_capacity(32),
         })
     }
@@ -352,7 +337,6 @@ impl Renderer {
             SetTextColor(self.hdc_mem, self.text_color);
         }
 
-        // 网速列（右列）：箭头左对齐，数值右对齐 — 表格效果。
         let mut rc_up_arrow = RECT {
             left: layout.speed_left,
             top: 0,
@@ -389,7 +373,6 @@ impl Renderer {
         let down_val = Self::format_speed_wide(&mut self.buf, values.speed_down);
         draw_text(self.hdc_mem, down_val, &mut rc_down_val, DT_RIGHT);
 
-        // CPU/内存列（左列）：数值右对齐。
         let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", values.cpu);
         let mut rc_cpu = RECT {
             left: layout.cpu_left,
@@ -441,13 +424,11 @@ impl Renderer {
         let height = dpi_scaled(DISPLAY_HEIGHT, dpi);
         let font_size = dpi_scaled(FONT_BASE_SIZE, dpi);
 
-        // 1. 取得临时屏幕 DC。
         let Some(screen_dc) = ScreenDcGuard::acquire() else {
             diag!("DPI 更新失败: 无法获取屏幕 DC");
             return false;
         };
 
-        // 2. 创建新尺寸的兼容位图（必须用屏幕 DC）。失败时保持旧尺寸与旧位图。
         // SAFETY: screen_dc.hdc 有效。
         let Some(new_bitmap) =
             OwnedGdi::new(unsafe { CreateCompatibleBitmap(screen_dc.hdc, width, height) })
@@ -456,10 +437,8 @@ impl Renderer {
             return false;
         };
 
-        // 位图创建后不再需要屏幕 DC，提前释放。
         drop(screen_dc);
 
-        // 3. 创建新尺寸的字体。失败时由守卫自动释放位图。
         let Some(new_font) = OwnedGdi::new(create_font(font_size)) else {
             diag!("DPI 更新失败: 无法创建字号 {font_size} 字体");
             return false;
@@ -549,7 +528,6 @@ impl Layout {
     }
 }
 
-/// 向内存 DC 绘制单行文本（垂直居中、单行、不解析前缀符）。
 fn draw_text(hdc: HDC, text: &mut [u16], rect: &mut RECT, align: DRAW_TEXT_FORMAT) {
     // SAFETY: hdc 有效；rect 在栈上；text 为 NUL 结尾的 UTF-16 缓冲区。
     unsafe {
@@ -633,10 +611,6 @@ mod tests {
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024)),
             "1.0 KB/s"
         );
-        // KB→MB 由 KB 十分位闸门裁决：x >= 10240（即显示值将达 1024.0 KB/s）
-        // 落入 MB 分支重新舍入。下面两条是闸门两侧最近的邻居：1048474 B/s 的
-        // 定点值恰为 10239（留在 KB 分支），1048575 B/s 的恰为 10240（落入 MB
-        // 分支）——上移或下移闸门、或改回「先判字节数」，必有一条变红。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 102)),
             "1023.9 KB/s"
@@ -662,11 +636,8 @@ mod tests {
         );
     }
 
-    // ===== write_u32 =====
-
     #[test]
     fn test_write_u32() {
-        // 6 个边界输入覆盖零值、各进位边界和最大值，一条表驱动即够。
         for (input, expected) in [
             (0, "0"),
             (9, "9"),

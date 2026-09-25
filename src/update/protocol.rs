@@ -1,5 +1,4 @@
 //! 子进程协议：stdout 单行动作扫描、EXIT_MAIN 转发、收尾复位判定、父身份绑定与 R1/R2 判定。
-//!
 //! stdout 单行协议：
 //! - `DONE`：子进程已处理完毕，主进程继续运行。
 //! - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
@@ -7,11 +6,9 @@
 //!   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 //! - `BUSY`：另一处更新子进程已持有更新互斥量，本次未执行任何检查。是「有效动作」
 //!   但**不是**成功完成：父侧据此不推进一小时的正常冷却（见 `should_use_error_cooldown`）。
-//!
 //! 父身份绑定（[`ParentProbe`]）：父进程 spawn 时传 `--parent-pid <n> --parent-start <FILETIME>`，
 //! 子进程用 `OpenProcess` + `GetProcessTimes` 复核创建时刻后持有句柄，之后所有存活检查
 //! 都走该句柄的 `WaitForSingleObject`——只传 PID 在 PID 被复用时会误判「父还在」。
-//!
 //! R1/R2 动作规则（[`UpdateContext`]）：R1 = 父已消失且用户尚未确认安装 ⇒ 静默放弃
 //! （不下载、不弹框、不启动安装器、不输出协议行）；R2 = 用户已在模态框点「是」⇒ 无论父
 //! 是否还在都继续交接，但此时父仍在而 `EXIT_MAIN` 写失败按硬错误处理，不得启动安装器。
@@ -505,8 +502,6 @@ fn should_reset_update_progress(exit_signalled: bool, exit_forwarded: bool) -> b
 mod tests {
     use super::*;
 
-    // ===== parse_update_action =====
-
     #[test]
     fn test_parse_update_actions() {
         assert_eq!(parse_update_action(b"DONE"), Some(UpdateAction::Done));
@@ -536,10 +531,6 @@ mod tests {
         }
     }
 
-    // ===== scan_subprocess_protocol =====
-
-    /// 用内存缓冲驱动协议扫描，并记录转发回调次数与送达结果。
-    /// 返回具名结构而非元组：字段名即文档，避免多个 bool 在位置上混淆。
     fn scan(data: &[u8]) -> (ScanOutcome, usize) {
         let mut reader = std::io::Cursor::new(data);
         let mut forwards = 0usize;
@@ -550,8 +541,6 @@ mod tests {
         (outcome, forwards)
     }
 
-    /// 用内存队列驱动协议扫描，模拟「转发目标已失效」：回调返回 false，等价于
-    /// 看门狗窗口已销毁时 `PostMessageW` 失败。
     fn scan_with_dead_target(data: &[u8]) -> ScanOutcome {
         let mut reader = std::io::Cursor::new(data);
         scan_subprocess_protocol(&mut reader, || false)
@@ -572,7 +561,6 @@ mod tests {
 
     #[test]
     fn test_scan_duplicate_exit_main_forward_only_once() {
-        // 钉死不变量：无论子进程输出多少行 EXIT_MAIN，转发恰好一次。
         let (outcome, forwards) = scan(b"EXIT_MAIN\nEXIT_MAIN\nEXIT_MAIN\n");
         assert!(outcome.exit_signalled);
         assert_eq!(forwards, 1);
@@ -590,8 +578,6 @@ mod tests {
 
     #[test]
     fn test_scan_busy_is_valid_action_without_completion() {
-        // BUSY 是有效动作，但**不是**成功完成：父侧必须把它与 DONE 分开，
-        // 否则「另一处更新子进程占用、本次没跑」会被记成一次成功检查。
         let (outcome, forwards) = scan(b"BUSY\n");
         assert!(outcome.saw_valid_action);
         assert!(outcome.busy);
@@ -602,8 +588,6 @@ mod tests {
 
     #[test]
     fn test_scan_unknown_line_before_busy_does_not_stop_reading() {
-        // 新旧版本混跑时旧父进程会读到不认识的协议行：未知行只被跳过，
-        // 不得中断读取（BUSY 故意放在未知行之后）。
         let (outcome, _) = scan(b"NO_UPDATE\nBUSY\n");
         assert!(outcome.busy);
         assert!(outcome.saw_valid_action);
@@ -612,9 +596,6 @@ mod tests {
 
     #[test]
     fn test_scan_invalid_lines_do_not_block_later_exit_main() {
-        // 无效行必须只被跳过，不得阻断其后的有效动作：EXIT_MAIN 故意放在无效行之后。
-        // 旧输入（无效行之后无有效动作）对任何实现都成立，本用例才能真正区分
-        // 「跳过无效行」与「遇无效行即停止读取」两种实现。
         let (outcome, forwards) = scan(b"NO_UPDATE\nEXIT_MAIN|extra\nEXIT_MAIN\n");
         assert!(outcome.saw_valid_action);
         assert!(!outcome.busy);
@@ -642,12 +623,8 @@ mod tests {
         assert_eq!(forwards, 0);
     }
 
-    // ===== 转发送达与进行中标志复位 =====
-
     #[test]
     fn test_scan_dead_target_still_signals_but_not_forwarded() {
-        // 看门狗已销毁或消息未能入队：协议层仍读到 EXIT_MAIN，
-        // 但必须上报未送达——否则 worker 会误以为主进程即将退出而跳过复位。
         let outcome = scan_with_dead_target(b"EXIT_MAIN\n");
         assert!(outcome.exit_signalled);
         assert!(!outcome.exit_forwarded);
@@ -655,11 +632,8 @@ mod tests {
 
     #[test]
     fn test_should_reset_update_progress_matrix() {
-        // 唯一免复位的情形：EXIT_MAIN 已读到且消息已入队，等待看门狗处理退出。
         assert!(!should_reset_update_progress(true, true));
-        // 读到但未送达：主进程仍在运行，必须复位——否则检查被永久挡掉。
         assert!(should_reset_update_progress(true, false));
-        // 常规结束（DONE）与只读到无效行同样必须复位。
         assert!(should_reset_update_progress(false, false));
     }
 
@@ -679,9 +653,6 @@ mod tests {
         assert!(!UPDATE_IN_PROGRESS.load(Ordering::Acquire));
     }
 
-    // ===== 父身份绑定与 R1/R2 =====
-
-    /// 本进程的 (pid, 创建时刻)：探针的真实取值，用于构造「同一个进程」的正例。
     fn own_identity() -> (u32, u64) {
         // SAFETY: GetCurrentProcess 只返回本进程伪句柄，不失败、无需关闭。
         let this = unsafe { GetCurrentProcess() };
@@ -736,8 +707,6 @@ mod tests {
         ctx.mark_user_confirmed();
         assert!(!ctx.abandoned());
     }
-
-    // ===== 跨进程更新互斥 =====
 
     #[test]
     fn test_named_mutex_reports_busy_then_releases() {
