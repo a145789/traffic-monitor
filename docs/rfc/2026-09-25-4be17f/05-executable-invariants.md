@@ -46,9 +46,17 @@ Status: proposed
 
 导入表检查可执行且对当前 release 产物给出「不含 `winhttp.dll`、不含 `bcrypt.dll`」的结论；实现方式自选（`dumpbin /imports` 或等价的产物检查脚本），但不得为此在 `Cargo.toml` 引入新的运行时依赖。
 
-`src/ffi_guard.rs` 的 `MutexGuard` 与 `MenuGuard` 各至少 1 条用例，覆盖「对象创建即持有、`Drop` 后句柄已关闭」。
+`src/ffi_guard.rs` 的 `MenuGuard` 至少 1 条用例（`test_menu_guard_drop_runs_exactly_once`），
+`MutexGuard` 的释放断言位于 `src/update/protocol.rs` 的 `test_named_mutex_reports_busy_then_releases`
+（该用例是默认门禁下 `MutexGuard` 的唯一构造点，且末尾“释放后可重取”同时证明 OS 层释放）；
+两者都覆盖「创建即持有、`Drop` 恰好执行一次」。`MutexGuard` 不在 `ffi_guard` 内另设用例的原因：
+`protocol` 的占用测试并发构造同一守卫，计数断言放在别处会竞态；这是有意为之，不是覆盖缺口。
 
-弱测试自查（本条最关键）：把 `Drop` 中的 `CloseHandle`/`DestroyMenu` 调用注释掉，上述用例必须变红。若无法观测「句柄是否已关闭」，说明用例不成立，必须换用能观测的手段（例如对已关闭句柄再次调用返回失败），不得用「不 panic 即通过」充数。
+弱测试自查（本条最关键）：把 `Drop` 整体中和（删除计数自增与其配对的 `CloseHandle`/`DestroyMenu`），
+上述用例必须变红。判据是测试专用的 `#[cfg(test)]` 释放计数（`MUTEX_GUARD_DROPS`/`MENU_GUARD_DROPS`，
+release 无此符号），不是句柄重操作探针——后者已证伪：二次 `CloseHandle` 探针在默认并行下约 2/16 轮
+假红（句柄槽复用），且复用时会关掉他人的活句柄；`GetHandleInformation` 非破坏性但同受复用影响。
+测试专用面的代价已登记：两处 `Drop` 内各一行 `cfg(test)` 自增，`ffi_guard` 头两处静态量。
 
 默认门禁数量只增不减（起点 `108 passed; 0 failed; 4 ignored`），四条门禁全绿。
 
