@@ -1,6 +1,6 @@
 # Agent Note：给更新子进程定归属（父身份绑定 + 可取消下载 + 跨进程互斥）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
