@@ -24,10 +24,10 @@
 //! 主程序被重新拉起。
 
 use std::sync::atomic::Ordering;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetParent, IsWindow, KillTimer, SendMessageW, WM_DPICHANGED,
+    DestroyWindow, GetParent, GetWindowRect, IsWindow, KillTimer, SendMessageW, WM_DPICHANGED,
 };
 
 /// 串行 RAII fixture：建窗与清理配对，`Drop` 不 panic。
@@ -241,6 +241,23 @@ fn dpi_dirty_cleared_by_recovery_transaction() {
     unsafe {
         SendMessageW(fx.main(), WM_DPICHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
     }
+    // 本分支的承重不变量：WM_DPICHANGED 的两条失败出口都必须收敛到「窗口物理尺寸
+    // == 位图尺寸」——资源换新成功那条由 embed_in_taskbar 提交完整几何，嵌入失败
+    // 那条由 align_window_size_to 兜底。此处真跑的是成功出口（本机任务栏横向、嵌入
+    // 成功）；失败出口需竖排任务栏或真实瞬态失败，仍归文件头的人工清单。
+    let mut rc = RECT::default();
+    assert!(
+        // SAFETY: fx.main 为本线程有效窗口；GetWindowRect 为查询型调用，只写本地 RECT。
+        unsafe { GetWindowRect(fx.main(), &mut rc) }.is_ok(),
+        "GetWindowRect 须成功"
+    );
+    let mut bitmap = (0, 0);
+    crate::renderer::with_renderer(|r| bitmap = r.bitmap_size());
+    assert_eq!(
+        (rc.right - rc.left, rc.bottom - rc.top),
+        bitmap,
+        "WM_DPICHANGED 后窗口尺寸必须等于渲染器位图尺寸，否则 BitBlt 边缘会露色键底色"
+    );
     assert!(
         crate::state::DPI_DIRTY.load(Ordering::Acquire),
         "消息分支成功时不得清位：清位权只归恢复事务"

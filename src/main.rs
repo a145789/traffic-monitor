@@ -1134,9 +1134,19 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let mut dpi_updated = false;
             renderer::with_renderer(|r| dpi_updated = r.update_dpi(hwnd));
             if dpi_updated {
-                // 失败不弹框：DPI 变更本身就是重排，改由 reembed_if_lost 在下一 tick 补做，
-                // 避免跨屏拖动时连环弹窗。
-                let _ = embed_in_taskbar(hwnd);
+                // 失败不弹框：DPI 变更本身就是重排，改由 reembed_if_lost 在下一 tick
+                // 补做，避免跨屏拖动时连环弹窗。
+                if let Err(e) = embed_in_taskbar(hwnd) {
+                    diag!("WM_DPICHANGED: 嵌入失败，尺寸已对齐，交由 reembed_if_lost 重试: {e}");
+                    // 与 recover_dpi 第 2 步同原语：SWP_NOMOVE，只提交新位图尺寸，把
+                    // 「新位图 + 旧窗口」错配压到零。注意别复用 rollback_window_to_bitmap：
+                    // 它走 resize_embedded_window，被 EMBEDDED 门控，而嵌入失败后 EMBEDDED
+                    // 必为 false，那一步会空转。
+                    renderer::with_renderer(|r| {
+                        let (w, h) = r.bitmap_size();
+                        align_window_size_to(hwnd, w, h);
+                    });
+                }
             } else {
                 // 位图/字体创建失败：先把窗口回滚到渲染器维持的旧尺寸（尺寸与位图必须
                 // 始终一致），再登记脏位。只回滚不登记会永久停在这个错配状态——真正

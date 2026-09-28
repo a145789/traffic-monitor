@@ -187,6 +187,66 @@ impl GdiHandle for HBRUSH {
     }
 }
 
+/// 把 GDI 对象选入 DC，返回被替换出的旧对象；失败返回 `Err(())`。
+///
+/// `SelectObject` 失败时返回 NULL 或 HGDI_ERROR（两者均满足 `is_invalid`），
+/// 此时 DC 中的选中对象不变。调用方必须把已完成的交换回滚到本调用之前的
+/// 状态（见 `swap_dpi_objects`）：失败本身只说得出「选入没成功」这一件事实，
+/// 该换上什么上下文文案由调用方补足，故不带负载。
+///
+/// # Safety
+/// `hdc` 与 `obj` 均须为有效句柄，且 `obj` 未被任何 DC 选中（新建独占对象）。
+unsafe fn select_or_fail(hdc: HDC, obj: HGDIOBJ) -> Result<HGDIOBJ, ()> {
+    // SAFETY: 前提由调用方保证；SelectObject 为同步调用，不保留参数指针。
+    let old = unsafe { SelectObject(hdc, obj) };
+    // HGDIOBJ::is_invalid 覆盖 NULL(0) 与 HGDI_ERROR(-1) 两种失败返回
+    // （windows 0.62 Gdi/mod.rs:5410），这是本判别成立的关键前提。
+    if old.is_invalid() { Err(()) } else { Ok(old) }
+}
+
+/// 把新位图与新字体依次换入内存 DC，返回换出的两个旧对象；两者都换成才算成功。
+///
+/// `Renderer::new` 的首次选入与 `Renderer::update_dpi` 的换新共用本函数，是「四处
+/// 交换」唯一的判别与回滚实现：任一步失败都回滚已完成的交换——把刚换出的旧位图
+/// 选回 DC（顺带把新位图挤回未选中状态）——使 DC 状态回到调用前，`self.hbitmap` /
+/// `self.hfont`（启动期则是 stock 默认对象）无需改动即可继续成立，新对象也能被
+/// 调用方的 `OwnedGdi` 守卫删掉。回滚方向不可调换：必须先让旧对象回到 DC，新对象
+/// 才脱离 DC、`DeleteObject` 才可能生效。
+///
+/// # Safety
+/// `hdc` 须为有效内存 DC；两个新对象须为有效独占对象（未被任何 DC 选中）。
+unsafe fn swap_dpi_objects(
+    hdc: HDC,
+    new_bitmap: HGDIOBJ,
+    new_font: HGDIOBJ,
+) -> Result<(HGDIOBJ, HGDIOBJ), &'static str> {
+    let old_bitmap = match unsafe { select_or_fail(hdc, new_bitmap) } {
+        Ok(old) => old,
+        Err(()) => return Err("选入位图失败"),
+    };
+
+    let old_font = match unsafe { select_or_fail(hdc, new_font) } {
+        Ok(old) => old,
+        Err(()) => {
+            // 回滚：把刚换出的旧位图选回 DC（尚未删除、仍有效），新位图随调用方的
+            // OwnedGdi 守卫删除；DC 回到调用前的状态。
+            // SAFETY: old_bitmap 是刚换出、尚未删除的有效对象。
+            // 注意：回滚与被回滚的交换共用同一 hdc，回滚失败等价于本进程不再持有
+            // 可信 DC 状态（此时 DC 里选中的是 new_bitmap，而字段仍指向 old_bitmap
+            // ——这正是本函数要消灭的分叉），故只留痕不掩盖。
+            // 判别标准与 select_or_fail 相同：is_invalid 覆盖 NULL 与 HGDI_ERROR。
+            unsafe {
+                if SelectObject(hdc, old_bitmap).is_invalid() {
+                    diag!("对象交换失败: 回滚位图交换失败，DC 状态不可信");
+                }
+            }
+            return Err("选入字体失败");
+        }
+    };
+
+    Ok((old_bitmap, old_font))
+}
+
 /// 临时屏幕 DC 守卫：构造时通过 `GetWindowDC(null)` 获取，`Drop` 时 `ReleaseDC`。
 /// 与 `OwnedGdi` 分离：它是借来的 DC，配对释放 API 是 `ReleaseDC` 而非 `DeleteDC`。
 struct ScreenDcGuard {
@@ -236,17 +296,20 @@ impl Renderer {
         let brush = OwnedGdi::new(unsafe { CreateSolidBrush(COLORREF(COLOR_KEY)) })
             .ok_or("无法创建背景刷子".to_string())?;
 
-        // ── 至此所有可失败步骤均已成功。后续选入/测量/配置均不会失败。──
+        // ── 资源创建至此全部成功；选入仍可能失败（见 `select_or_fail`），故与
+        //    `update_dpi` 共用 `swap_dpi_objects` 的回滚序，失败即整体早退。──
 
-        // 6. 选入位图并备份原默认位图（stock 1x1 位图）。
-        // SAFETY: dc.0 与 bitmap.0 均为刚创建的有效独占句柄。
-        let old_bitmap = unsafe { SelectObject(dc.0, bitmap.0.into()) };
+        // 6. 选入位图与字体，备份被替换出的 stock 默认对象（1x1 位图 / 系统字体）。
+        // SAFETY: dc.0 为刚创建的有效内存 DC；bitmap.0 / font.0 为刚创建的有效独占对象。
+        let (old_bitmap, old_font) =
+            match unsafe { swap_dpi_objects(dc.0, bitmap.0.into(), font.0.into()) } {
+                Ok(olds) => olds,
+                // 失败时 DC 已被回滚到 stock 默认对象，两个新对象随各自 OwnedGdi
+                // Drop 删除，DC 仍可安全 DeleteDC。
+                Err(e) => return Err(e.to_string()),
+            };
 
-        // 7. 选入字体并备份原默认字体（stock 系统字体）。
-        // SAFETY: dc.0 与 font.0 均为有效独占句柄。
-        let old_font = unsafe { SelectObject(dc.0, font.0.into()) };
-
-        // 8. 设置背景模式为透明，便于 DrawTextW 与位图 blit 保留透明色键。
+        // 7. 设置背景模式为透明，便于 DrawTextW 与位图 blit 保留透明色键。
         // SAFETY: dc.0 有效。
         unsafe {
             let _ = SetBkMode(dc.0, TRANSPARENT);
@@ -414,9 +477,10 @@ impl Renderer {
         }
     }
 
-    /// 按窗口当前 DPI 重建位图/字体并缓存新布局。返回 false 表示任一资源创建
-    /// 失败、维持旧尺寸不变（调用方须把窗口回滚到 [`bitmap_size`]，否则
-    /// 「窗口新尺寸 + 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、露出色键底色）。
+    /// 按窗口当前 DPI 重建位图/字体并缓存新布局。返回 false 表示位图/字体创建失败，
+    /// 或新对象选入内存 DC 失败（此时已回滚到调用前的 DC 状态），两种情况都维持旧
+    /// 尺寸不变（调用方须把窗口回滚到 [`bitmap_size`]，否则「窗口新尺寸 + 位图旧尺寸」
+    /// 会让 BitBlt 只覆盖旧位图区域、露出色键底色）。
     pub fn update_dpi(&mut self, hwnd: HWND) -> bool {
         // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用
         // GetDpiForWindow 是纯查询 API，无跨进程非法访问问题。
@@ -445,20 +509,26 @@ impl Renderer {
             return false;
         };
 
-        // 4. 新资源均已就绪：原子替换并向后清理旧对象，确保 BitBlt 源/目标尺寸一致。
-        // SAFETY: self.hdc_mem 有效；new_bitmap 为刚创建的独占位图；SelectObject 返回的
-        // old_bitmap 是此前选入并被替换的 self.hbitmap，已脱离 DC 可安全 DeleteObject。
-        let old_bitmap = unsafe { SelectObject(self.hdc_mem, new_bitmap.0.into()) };
+        // 4. 新资源均已就绪：两次交换都成功才删除旧对象并提交新状态；任一步失败则
+        //    回滚已完成的交换，保证 DC 状态与 self 记录始终一致（见 swap_dpi_objects）。
+        // SAFETY: self.hdc_mem 有效；new_bitmap/new_font 为刚创建的独占对象；
+        // swap_dpi_objects 验证了两次交换都成功，故 old_bitmap/old_font 是已脱离 DC 的
+        // self.hbitmap/self.hfont，可安全 DeleteObject。
+        let (old_bitmap, old_font) =
+            match unsafe { swap_dpi_objects(self.hdc_mem, new_bitmap.0.into(), new_font.0.into()) }
+            {
+                Ok(old) => old,
+                Err(e) => {
+                    diag!("DPI 更新失败: {e}");
+                    return false;
+                }
+            };
+
         unsafe {
             let _ = DeleteObject(old_bitmap);
-        }
-        self.hbitmap = new_bitmap.into_raw();
-
-        // SAFETY: self.hdc_mem 有效；new_font 为独占字体；old_font 是被替换的 self.hfont。
-        let old_font = unsafe { SelectObject(self.hdc_mem, new_font.0.into()) };
-        unsafe {
             let _ = DeleteObject(old_font);
         }
+        self.hbitmap = new_bitmap.into_raw();
         self.hfont = new_font.into_raw();
 
         self.width = width;
@@ -587,6 +657,8 @@ fn write_u32(buf: &mut Vec<u16>, mut n: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Gdi::{GetCurrentObject, OBJ_BITMAP};
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
 
     fn wide_to_string(wide: &[u16]) -> String {
         String::from_utf16_lossy(wide.strip_suffix(&[0]).unwrap_or(wide))
@@ -651,5 +723,78 @@ mod tests {
             write_u32(&mut buf, input);
             assert_eq!(wide_to_string(&buf), expected);
         }
+    }
+
+    #[test]
+    fn test_dpi_swap_rejects_failed_select() {
+        // 以失效 DC 触发交换失败：update_dpi 必须返回 false 且位图尺寸不变。
+        let hwnd = unsafe { GetDesktopWindow() };
+        let mut renderer = Renderer::new().expect("测试环境 GDI 不可用");
+        // 前置自证：用例的 false 必须来自「选入判别」，而不是更早的创建步骤。`Renderer::new`
+        // 成功已证明屏幕 DC、兼容位图与字体创建在本环境可用，而 `update_dpi` 的创建阶段
+        // 用的是同一批原语（位图取自 screen_dc，不是 hdc_mem），故创建阶段不会提前失败。
+        // 显式断言这一前提，避免在拿不到屏幕 DC 的环境里用例静默退化成空转（两条断言
+        // 照样成立，却什么都没测）。
+        assert!(
+            ScreenDcGuard::acquire().is_some(),
+            "测试环境拿不到屏幕 DC，本用例会退化为空转"
+        );
+        let size_before = renderer.bitmap_size();
+        let real_dc = renderer.hdc_mem;
+        // 置无效 DC：SelectObject 对无效 hdc 返回 NULL/HGDI_ERROR。
+        renderer.hdc_mem = HDC::default();
+        let updated = renderer.update_dpi(hwnd);
+        let size_after = renderer.bitmap_size();
+        // 先还原真实 DC 再断言：这样无论断言是否失败，Drop 都在真实 DC 上跑完释放序
+        // （还原 stock → 删独占对象 → DeleteDC），不会把释放序留在无效 DC 上。
+        renderer.hdc_mem = real_dc;
+        assert!(!updated);
+        assert_eq!(size_after, size_before);
+
+        // 失败出口的核心不变量：DC 里选中的位图仍与 self 记录一致，不得分叉。
+        // 判别 + 回滚的承重承诺就是这一条，单独断言它而不只看返回值。
+        // SAFETY: real_dc 是本测试持有且有效的内存 DC，GetCurrentObject 为查询型调用。
+        let selected_bitmap = unsafe { GetCurrentObject(real_dc, OBJ_BITMAP) };
+        assert_eq!(selected_bitmap.0, renderer.hbitmap.0);
+    }
+
+    #[test]
+    fn test_dpi_swap_rolls_back_bitmap_when_second_select_fails() {
+        // 直击本 PR 新增的「第二次交换失败 → 回滚」分支：位图换入成功、第二次交换失败，
+        // 必须把旧位图选回 DC，不留半交换状态。
+        // 构造手段：第一个对象给有效位图，第二个给已被 DeleteObject 的失效句柄——
+        // SelectObject 对无效对象返回 NULL/HGDI_ERROR，于是第二次交换失败。
+        let dc = OwnedGdi::new(unsafe { CreateCompatibleDC(None) }).expect("测试环境 GDI 不可用");
+        let old_bitmap = OwnedGdi::new(unsafe { CreateCompatibleBitmap(dc.0, 1, 1) })
+            .expect("测试环境 GDI 不可用");
+        let new_bitmap = OwnedGdi::new(unsafe { CreateCompatibleBitmap(dc.0, 4, 4) })
+            .expect("测试环境 GDI 不可用");
+
+        // 基线：先把 old_bitmap 换入 DC，本函数须把它换出、再回滚换回。
+        // SAFETY: dc.0 有效，old_bitmap 为有效独占对象。
+        let stock = unsafe { SelectObject(dc.0, old_bitmap.0.into()) };
+        assert!(!stock.is_invalid(), "基线换入应成功");
+
+        // 制造失效句柄：创建后立即删除，得到一个「曾经有效」但已失效的句柄值。
+        let dead_raw = OwnedGdi::new(unsafe { CreateCompatibleBitmap(dc.0, 1, 1) })
+            .expect("测试环境 GDI 不可用")
+            .into_raw();
+        unsafe {
+            let _ = DeleteObject(dead_raw.into());
+        }
+
+        // SAFETY: dc.0 有效；new_bitmap 为有效独占对象；dead_raw 是刚被删除的失效句柄，
+        // 正是本用例要注入的失败源。
+        let result = unsafe { swap_dpi_objects(dc.0, new_bitmap.0.into(), dead_raw.into()) };
+        assert!(result.is_err(), "失效句柄必须让第二次交换失败");
+
+        // 回滚后 DC 仍选中 old_bitmap —— 这正是「DC 状态不得与 self 记录分叉」的具体形态。
+        // SAFETY: dc.0 有效，GetCurrentObject 为查询型调用。
+        let selected = unsafe { GetCurrentObject(dc.0, OBJ_BITMAP) };
+        assert_eq!(selected.0, old_bitmap.0.0);
+
+        // 收尾：把 stock 选回 DC 让 old_bitmap 脱离 DC，OwnedGdi 的 Drop 才删得掉。
+        // SAFETY: dc.0 有效；stock 是上面换出的原选中对象，仍然有效。
+        assert!(!unsafe { SelectObject(dc.0, stock) }.is_invalid());
     }
 }
