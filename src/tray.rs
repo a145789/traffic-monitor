@@ -104,6 +104,20 @@ pub fn remove_tray_icon() {
     });
 }
 
+/// 托盘图标缺失时补建一次（恢复调度器每个周期调用）。
+///
+/// `TRAY_DATA` 非空 ⟺ 图标存在（见 [`remove_tray_icon`]），它就是「是否需要补做」的
+/// 唯一真值源：非空直接返回，**不重复 `NIM_ADD`**（重复添加不会覆盖既有图标，只会
+/// 多出一个绑定同一窗口的图标）。返回 false 表示本轮真的尝试了补建且失败
+/// （`TRAY_DATA` 保持为空），由下个恢复周期继续补——托盘是唯一的 UI 入口，
+/// 没有图标时退出、开机自启、更新开关全部不可达，不能只等下一次 Explorer 重建。
+pub fn ensure_tray_icon(hwnd: HWND) -> bool {
+    if TRAY_DATA.with(|t| t.borrow().is_some()) {
+        return true;
+    }
+    create_tray_icon(hwnd)
+}
+
 /// 只读观测托盘图标当前绑定的窗口（`#[cfg(test)]` 冒烟测试用，不暴露写入口）。
 ///
 /// `Some(hwnd)` ⟺ 图标存在且回调落点是该窗口；重建前后对比它即验证托盘迁移

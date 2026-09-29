@@ -599,10 +599,41 @@ fn rearm_display_notify(hwnd: HWND) {
 /// 注册会话锁屏通知，并记录句柄供 [`unregister_session_notification`] 配对注销。
 /// 失败非致命：锁屏暂停失效，显示器关闭仍由电源通知覆盖。
 fn register_session_notification(hwnd: HWND) {
-    match unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
-        // 只有注册成功才记位：失败时无配对可注销，记位会让状态位谎报存在注册。
-        Ok(()) => SESSION_NOTIFY_HWND.store(hwnd),
-        Err(e) => show_error(&format!("注册会话通知失败: {e:?}")),
+    if let Err(e) = wts_register_session_notification(hwnd) {
+        show_error(&format!("注册会话通知失败: {e:?}"));
+    }
+}
+
+/// `WTSRegisterSessionNotification` 的唯一调用点：成功才记位。
+///
+/// 只有注册成功才记位：失败时无配对可注销，记位会让状态位谎报存在注册。
+/// 启动/重建路径与恢复调度的静默补注册共用本函数，注册纪律只有一份实现。
+fn wts_register_session_notification(hwnd: HWND) -> windows::core::Result<()> {
+    // SAFETY: hwnd 是当前主窗口句柄；注册只登记「把会话切换通知投递到该窗口」，
+    // 不解引用调用方内存，也不要求调用方内存存活到注册之后；注册结果以 HWND 值
+    // 存入 SESSION_NOTIFY_HWND，由 unregister_session_notification 配对注销。
+    unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }
+        .map(|()| SESSION_NOTIFY_HWND.store(hwnd))
+}
+
+/// 静默补注册缺失的会话通知（恢复调度器每个周期调用一次）。
+///
+/// 句柄即真值源（同 [`ensure_power_notifications`]）：为空 ⇔ 无注册。注册缺失意味着
+/// `SUSPEND_REASON_SESSION` 在本进程内永远没有生产者——锁屏不再暂停采样，且此后
+/// 不会再有第二次提示。因此按真值源在周期 tick 上补，而不是等下一次 Explorer 重建。
+///
+/// 失败只留 release 日志，绝不弹框（周期路径：启动/重建那次失败已经提示过）；
+/// 返回 false 让本轮计入退避，下个周期继续补。
+fn ensure_session_notification(hwnd: HWND) -> bool {
+    if SESSION_NOTIFY_HWND.load().is_some() {
+        return true;
+    }
+    match wts_register_session_notification(hwnd) {
+        Ok(()) => true,
+        Err(e) => {
+            log_event!("补注册会话通知失败: {e:?}");
+            false
+        }
     }
 }
 
@@ -848,7 +879,7 @@ fn recovery_tick(watchdog: HWND) {
 }
 
 /// 一轮恢复动作，全部通过 `live_main_hwnd()` 取当前主窗口：
-/// 重试 DPI 事务 → 补建缺失定时器 → 按原因探针清陈旧挂起位。
+/// 重试 DPI 事务 → 补建缺失定时器 → 补做缺失的托盘/会话通知 → 按原因探针清陈旧挂起位。
 ///
 /// 返回本轮是否全部成功（决定下个周期是否退避）。重建间隙（无主窗口）视为
 /// 「无事可做」而不是失败：主窗口重建自有 `arm_rebuild_retry` 的独立退避，
@@ -865,6 +896,11 @@ fn run_recovery() -> bool {
     if !retry_missing_timers(hwnd) {
         all_ok = false;
     }
+    // 托盘图标与会话通知都是一次性注册：失败后除 Explorer 重建外无人重试，而
+    // Explorer 可能整场会话都不重启。真值源为空即静默补做一次，失败计入退避。
+    if !rearm_tray_and_session_capabilities(hwnd).all_ok() {
+        all_ok = false;
+    }
 
     if heal_stale_suspend(hwnd) & SUSPEND_REASON_MONITOR != 0 {
         // TTL 清位等价于本进程承认「可能漏掉了一次点亮通知」：先撤销再重新订阅。
@@ -877,6 +913,38 @@ fn run_recovery() -> bool {
     }
 
     all_ok
+}
+
+/// 补做「一次性注册」能力（托盘图标、会话通知）的结果；逐项报告。
+///
+/// 两项失败互不蕴含：合并成一个 `bool` 后，恢复表里删掉任一项都会被另一项的失败
+/// 掩盖，测试就钉不住表里到底有哪几项。`all_ok` 才是 `run_recovery` 用的退避判据。
+#[derive(Debug)]
+struct CapabilityRearm {
+    tray: bool,
+    session: bool,
+}
+
+impl CapabilityRearm {
+    /// 本轮两项都已就位或补做成功。
+    fn all_ok(&self) -> bool {
+        self.tray && self.session
+    }
+}
+
+/// 补做缺失的托盘图标与会话通知（恢复调度器每个周期调用一次）。
+///
+/// 判据与 [`ensure_power_notifications`] 同构：**真值源为空 ⇔ 该项不在**——托盘看
+/// `TRAY_DATA`（`tray::ensure_tray_icon`），会话通知看 `SESSION_NOTIFY_HWND`。
+/// 两项都只做一次注册尝试，注册前先判空，因此不会出现「两次注册、一次注销」。
+///
+/// 与电源订阅不同，本项失败计入 `run_recovery` 的退避（同 [`retry_missing_timers`]）：
+/// 两者同属「注册/创建失败后留在缺失集合里」的一次性动作，语义一致，不新增退避机制。
+fn rearm_tray_and_session_capabilities(hwnd: HWND) -> CapabilityRearm {
+    CapabilityRearm {
+        tray: crate::tray::ensure_tray_icon(hwnd),
+        session: ensure_session_notification(hwnd),
+    }
 }
 
 /// DPI 恢复事务（四步顺序不可拆，第 2 步内部再分「先对齐尺寸、再提交完整几何」）。
@@ -1194,7 +1262,8 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
 #[cfg(test)]
 mod tests {
-    //! 看门狗控制入口的语义测试：只覆盖纯判定与句柄校验，不创建真实窗口。
+    //! 看门狗控制入口的语义测试：只覆盖纯判定、句柄校验与不依赖真 Explorer 的
+    //! 补做失败路径，不创建真实窗口。
 
     use super::{CURRENT_MAIN_HWND, claim_exit_request, live_main_hwnd, parse_cli_args};
 
@@ -1323,6 +1392,68 @@ mod tests {
         assert!(!claim_exit_request(&gate), "重复请求应被吞掉");
         assert!(!claim_exit_request(&gate), "第三次仍应被吞掉");
         assert!(gate.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_recovery_rearms_tray_and_session() {
+        use windows::Win32::Foundation::HWND;
+
+        // 清空两个真值源：模拟「一次性注册失败、此后除 Explorer 重建外无人重试」。
+        crate::tray::remove_tray_icon();
+        super::unregister_session_notification();
+
+        // 两项缺失时恢复动作必须真的去补做一次，而不是看一眼真值源就返回：无效句柄上
+        // 两项都必然失败（`NIM_ADD` 拒绝无效窗口，`WTSRegisterSessionNotification`
+        // 对无效窗口返回 E_INVALIDARG），失败必须逐项反映到返回值里——删掉恢复表里的
+        // 托盘那一项，`rearmed.tray` 断言即变红。
+        let bogus = HWND(0x0BAD_F00D as *mut _);
+        let rearmed = super::rearm_tray_and_session_capabilities(bogus);
+        assert!(
+            !rearmed.tray,
+            "托盘缺失时本轮必须尝试补建并如实报告失败: {rearmed:?}"
+        );
+        assert!(
+            !rearmed.session,
+            "会话通知缺失时本轮必须尝试补注册并如实报告失败: {rearmed:?}"
+        );
+        assert!(
+            !rearmed.all_ok(),
+            "任一项补做失败都不得报告为全部就位: {rearmed:?}"
+        );
+
+        // 补做失败不得写入真值源（沿用「注册成功才记位」的纪律），否则下个周期会
+        // 误判能力已就位而不再补做。
+        assert_eq!(
+            crate::tray::tray_owner(),
+            None,
+            "补建失败后 TRAY_DATA 必须保持为空"
+        );
+        assert_eq!(
+            super::session_notify_hwnd(),
+            None,
+            "补注册失败后 SESSION_NOTIFY_HWND 必须保持为空"
+        );
+
+        // 已就位（句柄非空）即无需补做，也不得改写句柄：值域是 HWND 的能力一旦
+        // 出现「两次注册、一次注销」就会留下悬空注册。预置句柄的手法同
+        // `stale_main_hwnd_is_rejected` 的 `CURRENT_MAIN_HWND.store_raw`。
+        super::SESSION_NOTIFY_HWND.store(bogus);
+        let rearmed = super::rearm_tray_and_session_capabilities(bogus);
+        assert!(
+            rearmed.session,
+            "句柄非空 ⇒ 本轮无需补注册，应报告为已就位: {rearmed:?}"
+        );
+        assert_eq!(
+            super::session_notify_hwnd(),
+            Some(bogus),
+            "已就位时不得改写会话通知句柄"
+        );
+        assert!(
+            !rearmed.all_ok(),
+            "托盘仍缺失时不得因会话通知已就位而报告全部就位: {rearmed:?}"
+        );
+        // 收尾清掉预置句柄：注销对未真实注册的句柄只会失败并返回，无副作用。
+        super::unregister_session_notification();
     }
 
     #[test]
