@@ -56,7 +56,7 @@ pub static SUSPEND_REASONS: SuspendReasons = SuspendReasons::new();
 pub static MONITOR_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
 /// DPI 资源重建失败后置位：窗口几何与渲染器位图/字体可能不一致，须由恢复调度器
-/// 的 DPI 事务重试（见 `main::recover_dpi`）。
+/// 的 DPI 事务重试（见 `recovery::recover_dpi`）。
 ///
 /// 唯一真值源，归属明确：
 /// - 置位（2 处）：`WM_DPICHANGED` 的失败分支、`bind_display_and_timers` 的启动/

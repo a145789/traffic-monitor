@@ -413,7 +413,7 @@ fn parent_is_current_taskbar(hwnd: HWND) -> bool {
 /// 任务栏定位的 `SetWindowPos` 标志集合（纯判定，便于单测）。
 ///
 /// `dpi_dirty` 期间追加 `SWP_NOSIZE`：此时渲染器位图尺寸与实际 DPI 已经错位，
-/// 尺寸的提交权归 DPI 恢复事务（`main::recover_dpi`）；若定位路径也改尺寸，事务
+/// 尺寸的提交权归 DPI 恢复事务（`recovery::recover_dpi`）；若定位路径也改尺寸，事务
 /// 失败后的回滚会在下个 tick 被再次推翻，窗口尺寸将停在位图尺寸不匹配的一方。
 fn position_flags(dpi_dirty: bool) -> SET_WINDOW_POS_FLAGS {
     let base = SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER;

@@ -11,8 +11,8 @@
 //! Fixture 契约（用例间不互相污染靠它）：单个串行 RAII fixture，`setup()` 依次
 //! `ImmDisableIME`（首个顶层窗口之前，生产在 `main` 同样要求）、注册窗口类、
 //! `Renderer::new` + `set_renderer`、建看门狗与主窗口并登记 `CURRENT_MAIN_HWND`；
-//! `Drop` 按生产同样的顺序清理：先 `unregister_session_notification()`、
-//! `unregister_power_notifications()`（注销先于 `DestroyWindow`），再
+//! `Drop` 按生产同样的顺序清理：先 `power::unregister_session_notification()`、
+//! `power::unregister_power_notifications()`（注销先于 `DestroyWindow`），再
 //! `remove_tray_icon()`、`DestroyWindow` 两个窗口、`take_renderer()`，最后把
 //! `DPI_DIRTY` / `MONITOR_FULLSCREEN` / 全局挂起位复位到干净态。
 //! 预处理条件不满足（本机无 Explorer/任务栏）时显式 panic 并给出可操作信息，
@@ -67,8 +67,8 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        super::unregister_session_notification();
-        super::unregister_power_notifications();
+        crate::power::unregister_session_notification();
+        crate::power::unregister_power_notifications();
         crate::tray::remove_tray_icon();
         // SAFETY: 两句柄同属本测试线程创建；KillTimer 对不存在的 ID 仅返回错误。
         unsafe {
@@ -137,25 +137,28 @@ fn rebuild_rebinds_new_main_window() {
     // 与生产一致的旧绑定（main 启动尾段同顺序）：电源订阅 → 嵌入 → 托盘/定时器 → 会话通知。
     // 没有这一步，重建内的 unregister_*/remove_tray_icon 对旧窗口全是空操作，
     // 用例只能证明“新建成功”，不能证明“旧资源正确交接”。
-    super::register_power_notifications(old);
+    crate::power::register_power_notifications(old);
     crate::window::embed_in_taskbar(old).expect("旧窗口嵌入失败：请确认 explorer.exe 正在运行");
     assert!(
         super::bind_display_and_timers(old),
         "旧绑定尾段核心定时器须建起"
     );
-    super::register_session_notification(old);
+    crate::power::register_session_notification(old);
     assert_eq!(
-        super::session_notify_hwnd(),
+        crate::power::session_notify_hwnd(),
         Some(old),
         "旧窗口会话通知须已登记"
     );
-    assert!(super::power_notify_handle().is_some(), "旧窗口订阅须已登记");
     assert!(
-        super::display_notify_handle().is_some(),
+        crate::power::power_notify_handle().is_some(),
         "旧窗口订阅须已登记"
     );
     assert!(
-        super::suspend_notify_handle().is_some(),
+        crate::power::display_notify_handle().is_some(),
+        "旧窗口订阅须已登记"
+    );
+    assert!(
+        crate::power::suspend_notify_handle().is_some(),
         "旧窗口订阅须已登记"
     );
     assert_eq!(crate::tray::tray_owner(), Some(old), "旧窗口托盘须已绑定");
@@ -172,7 +175,7 @@ fn rebuild_rebinds_new_main_window() {
     // 电源句柄值域不透明（OS 会回收复用数值），只断言重建后在册——
     // “注销先于 DestroyWindow 的顺序”仍由代码评审覆盖。
     assert_eq!(
-        super::session_notify_hwnd(),
+        crate::power::session_notify_hwnd(),
         Some(new),
         "会话通知必须从旧柄迁移到新柄"
     );
@@ -182,15 +185,15 @@ fn rebuild_rebinds_new_main_window() {
         "托盘绑定必须从旧柄迁移到新柄"
     );
     assert!(
-        super::power_notify_handle().is_some(),
+        crate::power::power_notify_handle().is_some(),
         "重建后 legacy 显示器订阅必须重绑"
     );
     assert!(
-        super::display_notify_handle().is_some(),
+        crate::power::display_notify_handle().is_some(),
         "重建后控制台显示状态订阅必须重绑"
     );
     assert!(
-        super::suspend_notify_handle().is_some(),
+        crate::power::suspend_notify_handle().is_some(),
         "重建后休眠定向订阅必须重绑"
     );
     // SAFETY: new 为重建刚登记的新主窗口；GetParent 只查询父子关系。
@@ -263,7 +266,10 @@ fn dpi_dirty_cleared_by_recovery_transaction() {
         "消息分支成功时不得清位：清位权只归恢复事务"
     );
     // 驱动真正的清位 owner（恢复调度器的 DPI 事务），断言它收敛并清位。
-    assert!(super::recover_dpi(fx.main()), "同 DPI 下恢复事务须成功");
+    assert!(
+        crate::recovery::recover_dpi(fx.main()),
+        "同 DPI 下恢复事务须成功"
+    );
     assert!(
         !crate::state::DPI_DIRTY.load(Ordering::Acquire),
         "恢复事务成功后脏位必须被清"

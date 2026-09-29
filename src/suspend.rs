@@ -247,7 +247,7 @@ fn probe_session_unlocked() -> Option<bool> {
 /// 挂起位自愈：按原因各自的真值源判断「已置位的位是否仍然真实」，只对判定为陈旧的
 /// 原因调用既有的 [`resume_system`]。
 ///
-/// 承接 tick 是看门狗上的恢复调度器（`main::recovery_tick`）：挂起态下监测定时器
+/// 承接 tick 是看门狗上的恢复调度器（`recovery::recovery_tick`）：挂起态下监测定时器
 /// 集合全空，它是唯一仍存在的周期入口。三原因的处理强度**刻意不同**：
 /// `SYSTEM` 自证、`SESSION` 探针、`MONITOR` 保守超长 TTL；不做统一超时，那会把
 /// 零成本的 `SYSTEM` 自证降级成猜测。
@@ -418,7 +418,7 @@ fn register_missing_timers(missing: MissingTimers) {
 /// 顺带确保看门狗上的恢复调度 tick 处于武装状态：这里是「监测定时器集合可能变全空」
 /// 的临界点（挂起/全屏分支），过了这一步可能就没有别的周期入口来补武装了。
 pub fn resync_monitoring_timers(hwnd: HWND) -> MissingTimers {
-    crate::ensure_recovery_timer();
+    crate::recovery::ensure_recovery_timer();
     let missing = sync_monitoring_timers(hwnd);
     register_missing_timers(missing);
     missing

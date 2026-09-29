@@ -66,9 +66,9 @@ pub const TIMER_ID_NETWORK: usize = 1;
 pub const TIMER_ID_CPU_MEM: usize = 2;
 pub const TIMER_ID_FULLSCREEN: usize = 3;
 pub const TIMER_ID_AUTO_UPDATE: usize = 4;
-/// 主窗口重建失败后的重试定时器，挂在看门狗窗口上（见 `arm_rebuild_retry`）。
+/// 主窗口重建失败后的重试定时器，挂在看门狗窗口上（见 `recovery::arm_rebuild_retry`）。
 pub const TIMER_ID_REBUILD_RETRY: usize = 5;
-/// 看门狗上的恢复调度 tick（见 `main::recovery_tick`）。
+/// 看门狗上的恢复调度 tick（见 `recovery::recovery_tick`）。
 ///
 /// 刻意不进 `timer_plan`：挂起态与全屏态的监测定时器集合必须保持全空（销毁与
 /// 恢复对称），而恢复调度在任何状态下都必须存在——看门狗永不参与挂起、永不重建，
