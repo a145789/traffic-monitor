@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{
     ERROR_SHARING_VIOLATION, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    GetExitCodeProcess, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
@@ -18,8 +18,9 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    INSTALLER_LAUNCH_MAX_ATTEMPTS, INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES,
-    MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS, RELAUNCHED_BY_UPDATE_ARG,
+    INSTALLER_EXIT_WAIT_TIMEOUT_MS, INSTALLER_LAUNCH_MAX_ATTEMPTS, INSTALLER_LAUNCH_RETRY_DELAY_MS,
+    INSTALLER_MAX_BYTES, MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS,
+    RELAUNCHED_BY_UPDATE_ARG,
 };
 use crate::util::{log_event, os_to_wide, to_wide, win32_code_from_hresult, win32_error_code};
 
@@ -48,19 +49,19 @@ pub(super) struct VerifiedInstaller {
 pub(super) struct InstallerProcess(HANDLE);
 
 impl InstallerProcess {
-    /// 等安装器收场并读 Inno 退出码；`None` 表示等待或取码失败（结果未知）。
+    /// 等安装器收场并读 Inno 退出码；`None` 表示等待超时或取码失败（结果未知）。
     ///
-    /// 无超时的 `INFINITE` 是刻意的：安装器未收场前重新拉起组件没有意义——那时它正处在
-    /// `ssInstall`（`installer.iss` 的 `CurStepChanged`）会主动终止同名实例，提前拉起
-    /// 只会被杀掉，反而留下「装完之后组件不在」。官方退出码表：0 = 成功跑完；其余任何值
-    /// 都表示没跑完（初始化失败 / 取消 / 致命错误 / 回滚）；调用方对「非 0」与
-    /// 「取不到」同一处置。
+    /// 上界是 `INSTALLER_EXIT_WAIT_TIMEOUT_MS`（远大于任何健康安装），它只兜「安装器永不
+    /// 收场」这一种卡死：无上界等待会让本子进程与跨进程更新互斥量被永久占住，而组件早已随
+    /// 旧实例退出——那是"永久冻结的假活"。超时按结果未知处置，调用方会重新拉起组件。
+    /// 官方退出码表：0 = 成功跑完；其余任何值都表示没跑完（初始化失败 / 取消 / 致命错误 /
+    /// 回滚）。
     pub(super) fn wait_for_exit_code(self) -> Option<u32> {
         // SAFETY: 句柄由成功的 ShellExecuteExW + SEE_MASK_NOCLOSEPROCESS 唯一取得，本类型
         // 是它的唯一持有者（Drop 中关闭一次，此处不关闭）。两个 API 都只读该句柄指向的
         // 进程状态，不消费句柄；`code` 为本地 u32。
         unsafe {
-            if WaitForSingleObject(self.0, INFINITE) != WAIT_OBJECT_0 {
+            if WaitForSingleObject(self.0, INSTALLER_EXIT_WAIT_TIMEOUT_MS) != WAIT_OBJECT_0 {
                 return None;
             }
             let mut code = 0u32;
