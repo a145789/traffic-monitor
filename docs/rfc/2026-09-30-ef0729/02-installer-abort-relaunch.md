@@ -46,6 +46,7 @@ Status: proposed
 - 提案 1：`grep -n "SEE_MASK_NOCLOSEPROCESS\|WaitForSingleObject\|GetExitCodeProcess" src/update/installer.rs` 三个 API 名都能命中；`src/update/mod.rs` 的安装交接以 `wait_main_instance_appear` 的结果决定是否 `relaunch_main_app()`，四条日志分别覆盖"已在跑 / 成功但不在跑 / 非 0 / 取不到码"。
 - 提案 3：`grep -n "skipifsilent" installer.iss` 不再命中，Flags 行为 `nowait postinstall runasoriginaluser`；成功路径由 `[Run]` 拉起、失败路径由子进程补拉起，两者不并存（补拉起的判据是单例互斥量）。
 - **真机两条（本次交付未做，见风险）**：①安装成功 → 组件自动回到任务栏，且任务管理器"已提升"列为**否**（同时验证 01 的身份问题）；②安装中途用任务管理器结束 `TrafficMonitor-Setup-*.exe` → 组件在数秒内自动回来（而不是要手动启动）。
+- **真机（本次交付未做）**：组件在跑时手动带 `/VERYSILENT` 跑一次安装包，确认装完组件自动启动——这条专门验"静默路径的拉起者没有被砍掉"，是提案 3 的关键边界。
 - 人工清单（`src/smoke.rs`）已新增两条：「更新成功后不手动启动，组件自动回到任务栏且非提权」与「安装器被强杀/失败后，组件自动回来」。
 - 现有 UAC 取消兜底不回归：默认动词下 UAC 取消表现为安装器非 0 退出码（走提案 1 那条），`InstallerLaunch::Cancelled` 分支保留给 `ShellExecuteExW` 自身仍返回 `ERROR_CANCELLED` 的场合，两条互不冲突。
 - `cargo fmt -- --check`、`cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings` 全绿。
