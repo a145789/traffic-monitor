@@ -50,6 +50,16 @@ thread_local! {
     /// 否则「矩形 == 缓存」会让下个 tick 直接跳过定位，把未生效的几何记成已生效。
     /// 仅 UI 线程访问，故用 `Cell` 而非原子。
     static LAST_RECT: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
+
+    /// 上次失败原因；`None` 表示上一轮没有失败（本就已嵌入，或刚重嵌入成功）。
+    ///
+    /// 唯一写方：`report_reembed_failure`（失败时写入本轮原因）与
+    /// `clear_reembed_failure`（已嵌入/成功时清空）；读方只有 `should_log_reembed_failure`
+    /// 的比较。同一失败原因连续出现只记首条、原因变化才再记一条：失败重试由 2 秒
+    /// 定时器驱动，竖排任务栏下每轮一条会把现场日志刷成噪声并高频触发环形截断。
+    /// 仅在 UI 线程访问，故用 `RefCell` 而非锁。
+    static LAST_REEMBED_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// 失效任务栏位置缓存。
@@ -283,6 +293,8 @@ pub fn embed_in_taskbar(hwnd: HWND) -> Result<(), String> {
 
         // SetWindowLongPtrW 返回 isize（前值），0 既可能表示"前值就是 0"也可能表示失败，
         // 必须先 SetLastError(WIN32_ERROR(0)) 再调用，事后用 GetLastError 才能可靠区分。
+        // 勿改为读返回的 Err：该 API 不以 Result 表达失败，本协议是唯一判别途径
+        // （其余失败路径已改用 Err 自带的码，唯独这类「返回前值」的 API 不能照搬）。
         // TODO(dedup-setlong): 本段与下方 GWL_EXSTYLE 段的判别协议可抽同一私有 helper 收口；
         // 为保住嵌入五步序列的逐字可核对性，暂各留一份。
         SetLastError(WIN32_ERROR(0));
@@ -386,16 +398,52 @@ pub fn resize_embedded_window(hwnd: HWND, width: i32, height: i32) {
 /// 返回 true 表示本轮真的重新嵌入过，调用方需要重绘。
 pub fn reembed_if_lost(hwnd: HWND) -> bool {
     if EMBEDDED.load(Ordering::Acquire) && parent_is_current_taskbar(hwnd) {
+        // 已嵌入即「上一轮没有失败」：必须复位，否则「失败 → 成功 → 再失败」里
+        // 恢复后的第一次失败会因原因未被清空而漏记。
+        clear_reembed_failure();
         return false;
     }
     match embed_in_taskbar(hwnd) {
-        Ok(()) => true,
+        Ok(()) => {
+            clear_reembed_failure();
+            true
+        }
         Err(e) => {
+            // diag! 在 release 空展开，log_event! 才是现场证据通道，两者都保留。
             diag!("周期重嵌入任务栏失败: {e}");
-            log_event!("周期重嵌入任务栏失败: {e}");
+            report_reembed_failure(&e);
             false
         }
     }
+}
+
+/// 失败日志去重判定（纯函数）：仅当失败原因与上次不同才为真。
+fn should_log_reembed_failure(previous: Option<&str>, current: &str) -> bool {
+    previous != Some(current)
+}
+
+/// 记录本轮失败：同一原因只记首条，原因变化才再记一条；日志在状态提交后写，
+/// 保证「写日志失败」不会反过来影响去重状态。
+fn report_reembed_failure(reason: &str) {
+    LAST_REEMBED_FAILURE.with(|last| {
+        let mut last = last.borrow_mut();
+        if !should_log_reembed_failure(last.as_deref(), reason) {
+            return;
+        }
+        *last = Some(reason.to_string());
+        log_event!("周期重嵌入任务栏失败: {reason}");
+    });
+}
+
+/// 清空上次失败原因（成功或本就已嵌入）。与 `report_reembed_failure` 共用同一份
+/// 状态，这是「恢复后再失败仍要记一条」的前提。
+fn clear_reembed_failure() {
+    LAST_REEMBED_FAILURE.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.is_some() {
+            *last = None;
+        }
+    });
 }
 
 /// 窗口父级是否仍是当前任务栏。explorer 崩溃（非干净退出）时任务栏句柄失效而子
@@ -464,7 +512,10 @@ mod tests {
     //! 只覆盖纯判定：`position_flags` 的标志选择、位置缓存的失效，以及任务栏方向判据。
     //! 真实窗口行为不在本模块单测范围内。
 
-    use super::{LAST_RECT, invalidate_last_rect, is_horizontal_taskbar, position_flags};
+    use super::{
+        LAST_RECT, LAST_REEMBED_FAILURE, clear_reembed_failure, invalidate_last_rect,
+        is_horizontal_taskbar, position_flags, report_reembed_failure, should_log_reembed_failure,
+    };
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE, SWP_NOZORDER};
 
@@ -503,5 +554,31 @@ mod tests {
         LAST_RECT.with(|c| c.set(Some((1, 2, 3, 4))));
         invalidate_last_rect();
         assert_eq!(LAST_RECT.with(|c| c.get()), None);
+    }
+
+    #[test]
+    fn reembed_failure_log_dedup() {
+        // 同一失败原因连续 N 次只产出 1 条记录（去重判定的全部语义）。
+        assert!(should_log_reembed_failure(None, "嵌入失败"));
+        assert!(!should_log_reembed_failure(Some("嵌入失败"), "嵌入失败"));
+        assert!(!should_log_reembed_failure(Some("嵌入失败"), "嵌入失败"));
+        // 失败原因变化必须再记一条，否则换了一种坏法现场就没有证据。
+        assert!(should_log_reembed_failure(Some("嵌入失败"), "任务栏不存在"));
+        // 恢复（状态被清空）后再失败仍要记：与「一直失败」不是同一状态。
+        assert!(should_log_reembed_failure(None, "嵌入失败"));
+    }
+
+    #[test]
+    fn reembed_failure_state_is_cleared_on_recovery() {
+        // 状态与日志共用一份「上次失败原因」：清空后必须真的回到未失败状态，
+        // 否则下次失败会被误判为重复而静默。
+        clear_reembed_failure();
+        report_reembed_failure("嵌入失败");
+        assert_eq!(
+            LAST_REEMBED_FAILURE.with(|c| c.borrow().clone()),
+            Some("嵌入失败".to_string())
+        );
+        clear_reembed_failure();
+        assert_eq!(LAST_REEMBED_FAILURE.with(|c| c.borrow().clone()), None);
     }
 }

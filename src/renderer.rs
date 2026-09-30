@@ -360,11 +360,20 @@ impl Renderer {
             buf.extend(" B/s".encode_utf16());
         } else {
             // 先算 KB 十分位定点值；满 1024.0 KB/s（x >= 10240，十分位即 1.0 MB/s）
-            // 落入 MB 分支按 MB 重新舍入，避免两条分支各自重复格式化。
+            // 再按更大量级重新舍入，避免各档各自重复格式化。档位判定与舍入全程整数
+            // （`+512`、`+524288`、`+1024^3/2` 都是「除数的一半」同构写法）：渲染路径
+            // 要能在测试里逐字节断言，不引入浮点。
             let mut x = ((bytes_per_sec as u64 * 10 + 512) / 1024) as u32;
             let unit: &str = if x >= 10240 {
-                x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
-                " MB/s"
+                if bytes_per_sec as u64 >= 1024 * 1024 * 1024 {
+                    // 万兆链路满速是 1.25e9 B/s：没有这一档就只能显示成 4 位数的 MB。
+                    x = ((bytes_per_sec as u64 * 10 + 1024 * 1024 * 1024 / 2)
+                        / (1024 * 1024 * 1024)) as u32;
+                    " GB/s"
+                } else {
+                    x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
+                    " MB/s"
+                }
             } else {
                 " KB/s"
             };
@@ -703,9 +712,28 @@ mod tests {
             )),
             "10.5 MB/s"
         );
+        // 跨档边界：差 1 字节仍走 MB 档（四舍五入后是 1024.0，不是 1023.9），正好
+        // 1 GiB 才跳 GB 档。阶梯式单位的固有跳变，这里把它固定成已知行为而不是消除。
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                1024 * 1024 * 1024 - 1
+            )),
+            "1024.0 MB/s"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 * 1024)),
+            "1.0 GB/s"
+        );
+        // 万兆链路满速（1.25e9 B/s）：没有 GB 档时这里是 4 位数的 "1192.1 MB/s"。
+        assert_eq!(
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1_250_000_000)),
+            "1.2 GB/s"
+        );
+        // u32 上限 = 4 GiB/s - 1 字节，四舍五入后正好 4.0（不是溢出）。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, u32::MAX)),
-            "4096.0 MB/s"
+            "4.0 GB/s"
         );
     }
 

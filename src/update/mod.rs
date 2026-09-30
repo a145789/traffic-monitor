@@ -516,6 +516,14 @@ fn complete_update_interaction(
                     relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
+                InstallerLaunch::FailedWithoutCode => {
+                    // 取不到裸 Win32 码时 `Failed(0)` 会把这个框拼成「错误码: 0」——
+                    // 用户拿不到任何信息也无法据此行动，所以这一支只写现场日志；
+                    // 恢复动作（重新拉起主程序）与 `Failed` 完全一致。
+                    log_event!("安装器启动失败（Err 不带 Win32 错误码），重新拉起主程序");
+                    relaunch_main_app();
+                    SubprocessEnd::ExitMain
+                }
             }
         }
         CheckResult::Error(message) => {

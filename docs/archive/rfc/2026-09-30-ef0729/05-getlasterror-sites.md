@@ -1,6 +1,6 @@
 # Agent Note：三处失败的 Win32 调用改用返回的 Error——同时把另外六处"看上去一样"的 GetLastError 钉成禁区
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

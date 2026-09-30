@@ -1,6 +1,6 @@
 //! 网卡流量采样：接口过滤、虚拟网卡黑名单缓存、断网/恢复判定。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -19,7 +19,7 @@ use crate::config::{
     WM_USER_NETWORK_RECONNECTED,
 };
 use crate::state::{CONSECUTIVE_ZERO_COUNT, NET_SPEED_DOWN, NET_SPEED_UP};
-use crate::util::diag;
+use crate::util::{diag, log_event};
 
 /// 允许统计的接口类型。数值取自 windows crate 的 `IpHelper`，勿在本文件手写。
 ///
@@ -43,6 +43,9 @@ thread_local! {
     // 值 + 可选时间戳：空名单即合法初值，None 表示从未刷新。
     static VIRTUAL_BLACKLIST: RefCell<(HashSet<u64>, Option<Instant>)> =
         RefCell::new((HashSet::new(), None));
+    /// 本轮是否走了「零候选救回」；日志按进入该状态的那一次记一条（见
+    /// `should_log_fallback`）。仅 UI 线程访问，故用 `Cell` 而非原子。
+    static FALLBACK_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 struct MibTable(*mut MIB_IF_TABLE2);
@@ -103,23 +106,9 @@ pub fn collect_network(hwnd: HWND) {
     with_virtual_blacklist(|virtual_blacklist| {
         CURRENT_DATA.with(|cell| {
             let mut current_data = cell.borrow_mut();
-            current_data.clear();
-
-            for row in table_wrapper.rows() {
-                if !is_valid_interface(row) {
-                    continue;
-                }
-
-                // SAFETY: 系统已初始化的 InterfaceLuid 联合体，只读 Value。
-                let luid = unsafe { row.InterfaceLuid.Value };
-                if virtual_blacklist.contains(&luid) {
-                    continue;
-                }
-
-                if row.OperStatus == IfOperStatusUp {
-                    current_data.insert(luid, (row.InOctets, row.OutOctets));
-                }
-            }
+            let fell_back =
+                fill_candidates(&mut current_data, table_wrapper.rows(), virtual_blacklist);
+            report_zero_candidate_fallback(fell_back);
 
             // 首 tick 基线不需要独立标志：历史表为空时 select_winner_interface 对每个
             // LUID 都取不到历史并返回 (0, 0)，同时把本次数据写入历史——"无历史即零速"
@@ -143,6 +132,71 @@ pub fn collect_network(hwnd: HWND) {
                 }
             }
         });
+    });
+}
+
+/// 候选收集 + 「零候选救回」的唯一实现（纯函数：只写 `out`，便于离线单测）。
+///
+/// 两层判据的权责刻意不对称：类型白名单 + MAC 判据是**承重判据**（决定生死），
+/// 名字黑名单只是**偏好**。当承重判据确实存在 up 接口、但一张都没通过名字黑名单时，
+/// 退回忽略黑名单按承重判据选卡，返回 true。没有这条救回，虚拟化客户机（Hyper-V /
+/// VMware / VirtualBox 里唯一那张网卡名字必含 `hyper-v` / `vmware` / `vbox`）会恒为
+/// 0 B/s，还会被判成断网退避到 15 秒采样，且产品不带配置文件、用户无从自救。
+///
+/// 仍然只选一张、仍由 `select_winner_interface` 每周期独立择大：本函数只改候选集合的
+/// 构造，不改「同一周期同一张卡、不累加、不跨周期粘滞赢家」的既有不变量。
+///
+/// 救回刻意覆盖不到的边界：
+/// - 类型白名单或 MAC 判据本身误杀：救回走同一套判据，救不回来；
+/// - 被拉黑的接口并非唯一候选：按「仍有候选」不触发救回，此时显示的是那张通过筛选
+///   的卡（数字不完美，但不是 0）。
+fn fill_candidates(
+    out: &mut HashMap<u64, (u64, u64)>,
+    rows: &[MIB_IF_ROW2],
+    virtual_blacklist: &HashSet<u64>,
+) -> bool {
+    out.clear();
+
+    // 先收「承重判据 + up」的全体候选；名字黑名单留到第二步才参与。
+    let mut eligible: Vec<(u64, u64, u64)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !is_valid_interface(row) || row.OperStatus != IfOperStatusUp {
+            continue;
+        }
+        // SAFETY: 系统已初始化的 InterfaceLuid 联合体，只读 Value。
+        let luid = unsafe { row.InterfaceLuid.Value };
+        eligible.push((luid, row.InOctets, row.OutOctets));
+    }
+
+    for (luid, in_octets, out_octets) in &eligible {
+        if !virtual_blacklist.contains(luid) {
+            out.insert(*luid, (*in_octets, *out_octets));
+        }
+    }
+
+    if out.is_empty() && !eligible.is_empty() {
+        out.extend(eligible.into_iter().map(|(luid, i, o)| (luid, (i, o))));
+        return true;
+    }
+
+    false
+}
+
+/// 救回日志去重（纯函数）：只在「本轮进入救回状态」时为真。
+///
+/// 长期处于救回状态的机器上每 tick 一条日志，等于把唯一的现场诊断通道刷成噪声，
+/// 所以去重不是可选优化而是本条机制的一部分。
+fn should_log_fallback(previous: bool, current: bool) -> bool {
+    current && !previous
+}
+
+/// 按状态切换记录救回日志：进入救回状态记一条，退出时复位以便下次进入再记一条。
+fn report_zero_candidate_fallback(fell_back: bool) {
+    FALLBACK_ACTIVE.with(|active| {
+        if should_log_fallback(active.get(), fell_back) {
+            log_event!("接口筛选零候选（候选均被名字黑名单否掉），已退回类型+MAC 判据选卡");
+        }
+        active.set(fell_back);
     });
 }
 
@@ -177,6 +231,10 @@ fn is_valid_interface(row: &MIB_IF_ROW2) -> bool {
     true
 }
 
+/// 名字启发式：只作**偏好**，不单独决定生死。
+///
+/// 候选全灭时由 [`fill_candidates`] 的零候选救回忽略本表，因此这里的宽子串
+/// (`tap` / `ppp` / `vpn` 等) 即便误伤，也不会再让用户永久看到 0 B/s。
 fn is_virtual_friendly_name(name: &str) -> bool {
     let name_lower = name.to_ascii_lowercase();
     name_lower.contains("virtual")
@@ -308,6 +366,7 @@ fn rebuild_virtual_blacklist(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::NetworkManagement::Ndis::{IfOperStatusDown, NET_LUID_LH};
 
     #[test]
     fn test_is_valid_interface_ethernet() {
@@ -377,7 +436,9 @@ mod tests {
             ("VPN Client Adapter", "vpn"),
             ("Microsoft Loopback Adapter", "loopback"),
             ("Teredo Tunneling Pseudo-Interface", "teredo"),
-            // ISATAP 名字含 "tap" 子串，经 tap 判据命中，不需要单独的判据。
+            // ISATAP 名字含 "tap" 子串而被拉黑，这不是误伤、但确实是已知代价：
+            // 该代价由 `fill_candidates` 的零候选救回承担（候选全灭时忽略本表），
+            // 名字判据因此不再单独决定生死。
             ("Microsoft ISATAP Adapter", "tap"),
             ("Microsoft 6to4 Adapter", "6to4"),
             ("PPP Adapter", "ppp"),
@@ -504,5 +565,92 @@ mod tests {
         assert!(list.is_empty());
         assert_eq!(*refreshed_at, Some(now));
         assert!(!blacklist_needs_refresh(&cache, now));
+    }
+
+    // ===== 候选筛选与零候选救回 =====
+
+    /// 构造一行用于筛选的接口记录：只填筛选与计数用到的字段。
+    fn candidate_row(luid: u64, if_type: u32, is_up: bool) -> MIB_IF_ROW2 {
+        MIB_IF_ROW2 {
+            InterfaceLuid: NET_LUID_LH { Value: luid },
+            Type: if_type,
+            PhysicalAddressLength: 6,
+            OperStatus: if is_up {
+                IfOperStatusUp
+            } else {
+                IfOperStatusDown
+            },
+            InOctets: 1_000,
+            OutOctets: 2_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_all_candidates_blacklisted_falls_back() {
+        // 虚拟化客户机场景：唯一那张网卡的名字必被黑名单命中，其 LUID 因此进黑名单
+        // （此处直接以 LUID 表达 build_virtual_blacklist 的结论，名字判据本身由下面
+        // 这条断言钉住）。没有救回时这里恒为空候选 ⇒ 永久 0 B/s + 断网退避。
+        assert!(is_virtual_friendly_name(
+            "Microsoft Hyper-V Network Adapter"
+        ));
+        let rows = [candidate_row(100, IF_TYPE_ETHERNET_CSMACD, true)];
+        let mut out = HashMap::new();
+
+        let fell_back = fill_candidates(&mut out, &rows, &HashSet::from([100]));
+
+        assert!(fell_back, "候选全灭时必须走救回");
+        assert_eq!(
+            out,
+            HashMap::from([(100, (1_000, 2_000))]),
+            "救回后仍要选出一张"
+        );
+    }
+
+    #[test]
+    fn test_partial_blacklist_does_not_fall_back() {
+        // 救回只在「零候选」时生效：还剩一张能过筛的卡时不得把被拉黑的卡放回来，
+        // 否则就从「显示那张卡」退化为「显示另一张卡」。
+        let rows = [
+            candidate_row(100, IF_TYPE_ETHERNET_CSMACD, true),
+            candidate_row(200, IF_TYPE_IEEE80211, true),
+        ];
+        let mut out = HashMap::new();
+
+        let fell_back = fill_candidates(&mut out, &rows, &HashSet::from([100]));
+
+        assert!(!fell_back);
+        assert_eq!(out, HashMap::from([(200, (1_000, 2_000))]));
+    }
+
+    #[test]
+    fn test_no_up_interface_does_not_fall_back() {
+        // 承重判据自己一张都不放行时救回不得触发：此时恒 0 与断网退避是正确语义，
+        // 救回会把「真的没有可采样接口」掩盖成有数据。
+        let mut zero_mac = candidate_row(300, IF_TYPE_ETHERNET_CSMACD, true);
+        zero_mac.PhysicalAddressLength = 0;
+        let rows = [
+            candidate_row(100, 24, true),                       // 类型不在白名单
+            candidate_row(200, IF_TYPE_ETHERNET_CSMACD, false), // 非 up
+            zero_mac,                                           // 无 MAC
+        ];
+        let mut out = HashMap::new();
+
+        let fell_back = fill_candidates(&mut out, &rows, &HashSet::from([100, 200, 300]));
+
+        assert!(!fell_back, "没有可采样的 up 接口时不得救回");
+        assert!(out.is_empty(), "空候选保持原样：断网退避依赖它");
+    }
+
+    #[test]
+    fn test_fallback_log_dedup() {
+        assert!(should_log_fallback(false, true), "进入救回记一条");
+        assert!(
+            !should_log_fallback(true, true),
+            "持续处于救回不得每 tick 记"
+        );
+        assert!(!should_log_fallback(false, false), "常态不记");
+        // 退出救回后再进入是新的状态切换，必须再记一条。
+        assert!(should_log_fallback(false, true));
     }
 }

@@ -5,7 +5,7 @@
 use std::time::Instant;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
-    ERROR_SHARING_VIOLATION, GetLastError,
+    ERROR_SHARING_VIOLATION,
 };
 use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::Shell::{
@@ -18,7 +18,7 @@ use crate::config::{
     INSTALLER_LAUNCH_MAX_ATTEMPTS, INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES,
     MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS, RELAUNCHED_BY_UPDATE_ARG,
 };
-use crate::util::{log_event, os_to_wide, to_wide};
+use crate::util::{log_event, os_to_wide, to_wide, win32_code_from_hresult, win32_error_code};
 
 use super::cache::{create_locked_installer, open_locked_installer};
 use super::crypto::compute_sha256_hex_locked;
@@ -39,6 +39,10 @@ pub(super) enum InstallerLaunch {
     Started,
     Cancelled,
     Failed(u32),
+    /// 启动失败但 `Err` 不带裸 Win32 码（HRESULT 非 `FACILITY_WIN32`，或裸码恰为 0）。
+    /// 与 `Failed` 分开是为了不把「错误码: 0」这种没有信息的话弹给用户：该分支只写
+    /// 日志，重新拉起主程序的处置与 `Failed` 一致（见 `update::subprocess_main`）。
+    FailedWithoutCode,
 }
 
 /// 单源失败的错误归类：只有下载段失败才回落代理。
@@ -196,10 +200,11 @@ pub(super) fn wait_main_instance_gone() {
         // 最小权限：SYNCHRONIZE 只够打开既有互斥量做存在性探测；
         // 主进程提权运行时低完整性子进程只会拿到 ACCESS_DENIED 而非「已消失」。
         match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
-            Err(_) => {
-                // SAFETY: 紧接 OpenMutexW 失败读取 last-error，中间无其他 Win32 调用。
-                let last = unsafe { GetLastError() };
-                if last == ERROR_FILE_NOT_FOUND {
+            Err(e) => {
+                // 错误码取自 Err 自带的那份：`BOOL → Err` 转换时 crate 已经读过一次
+                // last-error，这里再裸读一次是同一事实的重复表示，且依赖「中间没有别的
+                // Win32 调用」这个无人承诺的前提。取不到裸码（None）落在下面的保守侧。
+                if win32_code_from_hresult(e.code().0 as u32) == Some(ERROR_FILE_NOT_FOUND.0) {
                     return;
                 }
                 // 其余错误（含 ACCESS_DENIED）保守按「互斥量仍存在」继续等待，
@@ -208,7 +213,7 @@ pub(super) fn wait_main_instance_gone() {
                     logged_probe_error = true;
                     log_event!(
                         "等待主进程退出: 互斥量仍存在或无权打开 (0x{:08X})，继续等待",
-                        last.0
+                        win32_error_code(&e)
                     );
                 }
             }
@@ -305,20 +310,25 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
     // ShellExecuteExW 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体
     // 实际大小一致；fMask 仅含 SEE_MASK_FLAG_NO_UI，不含需要调用方提供额外
     // 指针或接管进程句柄的掩码。
-    let launched = unsafe { ShellExecuteExW(&mut sei) };
-
-    if launched.is_ok() {
-        return InstallerLaunch::Started;
+    match unsafe { ShellExecuteExW(&mut sei) } {
+        Ok(()) => InstallerLaunch::Started,
+        // 失败分类读 Err 自带的码，不再裸读 last-error（见 classify_launch_hresult）。
+        Err(e) => classify_launch_hresult(e.code().0 as u32),
     }
+}
 
-    // SAFETY:
-    // 紧接失败的 ShellExecuteExW 调用读取当前线程 last-error，中间未调用其他
-    // 可能覆盖错误码的 Win32 API。
-    let error = unsafe { GetLastError() };
-    if error == ERROR_CANCELLED {
-        InstallerLaunch::Cancelled
-    } else {
-        InstallerLaunch::Failed(error.0)
+/// `ShellExecuteExW` 失败的唯一分类处（纯函数：入参是 `Err` 携带的 HRESULT）。
+///
+/// - `ERROR_CANCELLED` ⇒ `Cancelled`：UAC 被用户取消，调用方据此重新拉起主程序。
+/// - 其余裸 Win32 码 ⇒ `Failed(code)`：原样交给调用方决定是否重试/弹框。
+/// - 取不到裸码（HRESULT 非 `FACILITY_WIN32`）或裸码恰为 0 ⇒ `FailedWithoutCode`：
+///   `Failed(0)` 会被更新协调器拼成「启动安装程序失败 (错误码: 0)」弹给用户——一句
+///   没有信息、也无法据以行动的话。无码分支只写日志，重新拉起主程序的处置不变。
+fn classify_launch_hresult(hresult: u32) -> InstallerLaunch {
+    match win32_code_from_hresult(hresult) {
+        Some(code) if code == ERROR_CANCELLED.0 => InstallerLaunch::Cancelled,
+        Some(code) if code != 0 => InstallerLaunch::Failed(code),
+        _ => InstallerLaunch::FailedWithoutCode,
     }
 }
 
@@ -358,6 +368,43 @@ mod tests {
         assert!(!is_transient_launch_error(&InstallerLaunch::Cancelled));
         assert!(!is_transient_launch_error(&InstallerLaunch::Failed(5)));
         assert!(!is_transient_launch_error(&InstallerLaunch::Failed(2)));
+        // 无码失败没有可重试的判据，必须与永久失败同侧。
+        assert!(!is_transient_launch_error(
+            &InstallerLaunch::FailedWithoutCode
+        ));
+    }
+
+    #[test]
+    fn test_launch_failure_classification_keeps_win32_codes() {
+        // HRESULT_FROM_WIN32(ERROR_CANCELLED = 1223)：UAC 取消必须仍走 Cancelled。
+        assert_eq!(
+            classify_launch_hresult(0x8007_04C7),
+            InstallerLaunch::Cancelled
+        );
+        // 其余 Win32 码折回裸码后原样保留，重试判据（占用/锁定）才能继续生效。
+        assert_eq!(
+            classify_launch_hresult(0x8007_0005),
+            InstallerLaunch::Failed(5)
+        );
+        assert_eq!(
+            classify_launch_hresult(0x8007_0020),
+            InstallerLaunch::Failed(ERROR_SHARING_VIOLATION.0)
+        );
+    }
+
+    #[test]
+    fn test_launch_failure_without_win32_code_has_no_dialog_code() {
+        // E_FAIL：非 FACILITY_WIN32，取不到裸码——必须落到无码分支，不能变成
+        // Failed(0) 被拼成「错误码: 0」弹给用户。
+        assert_eq!(
+            classify_launch_hresult(0x8000_4005),
+            InstallerLaunch::FailedWithoutCode
+        );
+        // 裸码恰为 0（ERROR_SUCCESS）也不是失败的诊断信息，同样归无码分支。
+        assert_eq!(
+            classify_launch_hresult(0x8007_0000),
+            InstallerLaunch::FailedWithoutCode
+        );
     }
 
     // ===== 锁定句柄重验（TOCTOU 防护） =====
