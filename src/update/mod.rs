@@ -18,14 +18,15 @@ use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_YESN
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD, REG_PATH_APP,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD,
+    INSTALLER_SETTLE_TAKEOVER_WAIT_MS, MAIN_EXIT_POLL_INTERVAL_MS, REG_PATH_APP,
     UPDATE_FETCH_RETRY_DELAY_MS, UPDATE_WORKER_STACK_BYTES, VERSION, VERSION_METADATA_MAX_BYTES,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::{
     compact_and_trim, configure_background_process, log_event, message_box, refresh_debug_log_flag,
     reg_read_dword, reg_read_string, reg_write_dword, reg_write_string, show_error, show_info,
-    to_wide,
+    to_wide, wait_main_instance_appear,
 };
 
 use cache::get_temp_installer_path;
@@ -353,8 +354,9 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
 /// stdout 单行协议：
 /// - `DONE`：子进程已处理完毕，主进程继续运行。
 /// - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
-///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才提权
-///   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
+///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才
+///   运行安装器（默认动词启动，提权由 SetupLdr 自己完成），从源头消除「文件正在使用」
+///   竞态；安装器内 taskkill 仅作兜底。
 /// - 无协议行：R1 静默放弃（父进程已消失且用户未确认），退出码非零。
 ///
 /// 退出码：0 = 检查流程成功完成（含 `EXIT_MAIN` 交接），1 = 检查失败或 R1 静默放弃。
@@ -498,25 +500,48 @@ fn complete_update_interaction(
             }
             wait_main_instance_gone();
 
+            // 「谁负责拉起」由**客观事实**裁决：组件是不是已经在跑（单例互斥量在不在），
+            // 不由安装器退出码也不由 `[Run]` 条目在静默模式下的语义裁决——后两者都没有
+            // 逐字保证，而组件在不在跑这件事在两种语义下都给出正确答案。
+            // 退出码只用来省一次探测：非 0 时 `[Run]` 必然没执行（官方退出码表：任何非 0
+            // 都表示 Setup 没跑完），不必等；0 时才需要确认它在不在。
             match launch_installer(verified) {
-                InstallerLaunch::Started => {
-                    log_event!("安装器已启动");
+                Ok(process) => {
+                    let exit_code = process.wait_for_exit_code();
+                    let instance_present = exit_code == Some(0)
+                        && wait_main_instance_appear(
+                            INSTALLER_SETTLE_TAKEOVER_WAIT_MS,
+                            MAIN_EXIT_POLL_INTERVAL_MS,
+                        );
+                    if instance_present {
+                        log_event!("安装器已成功收场，组件已由安装器拉起，不再重复拉起");
+                    } else {
+                        match exit_code {
+                            Some(0) => log_event!("安装器已成功收场但组件未在跑，重新拉起主程序"),
+                            Some(code) => {
+                                log_event!("安装器未成功收场 (退出码: {code})，重新拉起主程序")
+                            }
+                            None => log_event!("安装器收场结果未知，重新拉起主程序"),
+                        }
+                        relaunch_main_app();
+                    }
                     SubprocessEnd::ExitMain
                 }
-                InstallerLaunch::Cancelled => {
-                    // 主进程已按约定退出（如 UAC 被取消），重新拉起应用，
-                    // 避免任务栏小组件凭空消失。
+                Err(InstallerLaunch::Cancelled) => {
+                    // 默认动词下 UAC 取消发生在 SetupLdr 内部，表现为非 0 退出码（走上面
+                    // 那一支）；本支保留给 ShellExecuteExW 自身仍返回 ERROR_CANCELLED 的
+                    // 场合。主进程已按约定退出，重新拉起应用，避免组件凭空消失。
                     log_event!("安装器启动被取消，重新拉起主程序");
                     relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
-                InstallerLaunch::Failed(code) => {
+                Err(InstallerLaunch::Failed(code)) => {
                     log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
                     show_error(&format!("启动安装程序失败 (错误码: {code})"));
                     relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
-                InstallerLaunch::FailedWithoutCode => {
+                Err(InstallerLaunch::FailedWithoutCode) => {
                     // 取不到裸 Win32 码时 `Failed(0)` 会把这个框拼成「错误码: 0」——
                     // 用户拿不到任何信息也无法据此行动，所以这一支只写现场日志；
                     // 恢复动作（重新拉起主程序）与 `Failed` 完全一致。

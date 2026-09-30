@@ -111,8 +111,11 @@ pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 /// 的合法长挂起场景：误恢复的代价是显示器关闭期间多跑 1 Hz 采样，且下一次点亮
 /// 通知必然到达（可自愈）；误冻结的代价是组件永久假活、只能重启程序。
 pub const SUSPEND_MONITOR_TTL_SECS: u64 = 12 * 60 * 60;
-/// 启动安装包遇共享冲突类瞬态错误（如杀软实时扫描瞬时占用刚写完的文件）
-/// 时的最大尝试次数与每次重试前的等待时长。
+/// 「启动一个外部进程」失败时的最大尝试次数与每次重试前的等待时长，两处共用：
+/// 启动安装包（`update::installer::launch_installer`）与重新拉起主程序
+/// （`update::installer::relaunch_main_app`）。两者遇到的都是同一类瞬态失败——文件
+/// 刚写完就被杀软实时扫描占用/替换——原先只有安装器那侧有重试，而 `relaunch_main_app`
+/// 是静默更新交接唯一的拉起点，它静默失败就等于组件蒸发。
 pub const INSTALLER_LAUNCH_MAX_ATTEMPTS: u32 = 3;
 pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
 
@@ -128,17 +131,42 @@ pub const UPDATE_WORKER_STACK_BYTES: usize = 256 * 1024;
 
 /// 子进程发出 EXIT_MAIN 后等待主进程退出（单实例互斥量消失）的总超时与轮询间隔。
 /// 超时后照常启动安装器，由安装器内 taskkill 兜底强杀。
-/// 同一对常量亦被 `--quit` 的 `quit_existing_instance`（`main.rs`）共用：两处都是
-/// “等主进程退净、上限 5 秒”，仅存在性探针不同（此处 `OpenMutexW` 互斥量消失，
-/// 对方 `FindWindowW` 看门狗窗口消失），原先两处轮询间隔（50ms/100ms）之差无原则含义，
-/// 故收口到同一对常量。
-/// `installer.iss` 的 `GracefulWaitTimeoutMs` 与此同量级，三处调整须同步。
+/// 同一对常量亦被另两处共用：`--quit` 的 `quit_existing_instance`（`main.rs`）等主进程
+/// 退净，`main.rs` 的 `wait_for_relayed_instance` 等替代实例接管（同一把互斥量**出现**）。
+/// 三处都是「等一个进程状态到位、上限 5 秒」，仅探针不同（此处与自去提权处用
+/// `OpenMutexW` 看互斥量消失/出现，`--quit` 用 `FindWindowW` 看门狗窗口消失）；
+/// 原先几处轮询间隔（50ms/100ms）之差无原则含义，故收口到同一对常量。
+/// `installer.iss` 的 `GracefulWaitTimeoutMs` 与此同量级，各处调整须同步。
 pub const MAIN_EXIT_WAIT_TIMEOUT_MS: u64 = 5000;
 pub const MAIN_EXIT_POLL_INTERVAL_MS: u64 = 50;
 
-/// 重新拉起主进程时携带的一次性参数：更新确认框刚被用户决策过（UAC 取消
-/// 或安装器启动失败），拉起后的首个自动检查冷却周期被推迟，避免立刻
-/// 再弹同一版本的确认框。
+/// 安装器收场后等待「组件实例已经在跑」的上限（毫秒）；轮询间隔复用
+/// `MAIN_EXIT_POLL_INTERVAL_MS`。
+///
+/// 判据是单例互斥量而不是安装器退出码：安装成功时 `[Run]` 条目本应已把组件拉起来，
+/// 但「静默模式下 `postinstall` 条目是否照常处理」这件事没有逐字保证，而设置
+/// `skipifsilent` 又会让手动静默安装/升级失去唯一的拉起者。以互斥量为准可在两种语义下
+/// 都得到正确答案：已经在跑就什么都不做，不在跑就补一次。
+///
+/// 刻意短于 `MAIN_EXIT_WAIT_TIMEOUT_MS`：这里判错的代价只是多拉起一个注定按重复实例
+/// 静默退出的进程（单例互斥兜住），而拖长等待会让刚点过「是」的用户多等。
+pub const INSTALLER_SETTLE_TAKEOVER_WAIT_MS: u64 = 2000;
+
+/// 更新子进程等待安装器收场的上限（毫秒），直接交给 `WaitForSingleObject`，故为 `u32`。
+///
+/// 取得远大于任何健康安装（十几秒级）：上界不是用来"催"安装器的，只用来兜住它**永不收场**
+/// 的那一种卡死——`/SUPPRESSMSGBOXES` 官方列明有 5 类消息框压不住，安装器若卡在其中之一，
+/// 无上界等待会让更新子进程永久存活、跨进程更新互斥量永久被占，而组件早已随旧实例退出，
+/// 正是要消灭的"永久冻结的假活"。超时按"结果未知"处置：重新拉起组件（此时安装器不是卡在
+/// `ssInstall` 之前就是之后，拉起即可恢复），子进程随即退出、更新互斥量归还。
+pub const INSTALLER_EXIT_WAIT_TIMEOUT_MS: u32 = 30 * 60 * 1000;
+
+/// 重新拉起主进程时携带的一次性参数：更新确认框刚被用户决策过，或者安装器刚
+/// 收场（成功/失败/被取消都算），拉起后的首个自动检查冷却周期被推迟，避免
+/// 立刻再弹同一版本的确认框。
+///
+/// 注意它不是「本次实例是否由更新拉起」的判据：`installer.iss` 的 `[Run]` 条目
+/// 不传任何参数，自去提权（`main::de_elevate_self`）因此不能以它作门。
 pub const RELAUNCHED_BY_UPDATE_ARG: &str = "--relaunched-by-update";
 
 /// 临时安装包缓存有效期（秒），超时才在启动期清理。有效期内是否复用由

@@ -1,16 +1,19 @@
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
 use windows::Win32::System::Power::HPOWERNOTIFY;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
-    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, ProcessMemoryPriority, ProcessPowerThrottling,
-    SetProcessInformation, SetProcessWorkingSetSize,
+    GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW, OpenMutexW, OpenProcess,
+    OpenProcessToken, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    PROCESS_QUERY_LIMITED_INFORMATION, ProcessMemoryPriority, ProcessPowerThrottling,
+    SYNCHRONIZATION_SYNCHRONIZE, SetProcessInformation, SetProcessWorkingSetSize,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW,
+    GetWindowThreadProcessId, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MessageBoxW,
 };
 use windows::core::PCWSTR;
 use windows_registry::CURRENT_USER;
@@ -96,6 +99,122 @@ pub fn win32_code_from_hresult(code: u32) -> Option<u32> {
 pub fn win32_error_code(err: &windows::core::Error) -> u32 {
     let hresult = err.code().0 as u32;
     win32_code_from_hresult(hresult).unwrap_or(hresult)
+}
+
+/// 读当前进程令牌的提权标志（`TOKEN_ELEVATION`）：`Some(true)` 表示已提权（high IL）。
+///
+/// 取不到时返回 `None`，与「确定未提权」严格分开：调用方（`main::de_elevate_self`）
+/// 对「未知」必须走保守侧（维持现状），不能当成「未提权」而跳过自检。
+pub fn current_process_is_elevated() -> Option<bool> {
+    // SAFETY: GetCurrentProcess 返回当前进程伪句柄，不需关闭；token 句柄成功取得后
+    // 在本函数内关闭一次。
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return None;
+        }
+        let elevated = token_is_elevated(token);
+        let _ = CloseHandle(token);
+        elevated
+    }
+}
+
+/// 读任意窗口所属进程的提权标志；窗口无效、进程已退出或无权打开时返回 `None`。
+///
+/// 只请求 `PROCESS_QUERY_LIMITED_INFORMATION` + `TOKEN_QUERY`：提权进程查询低完整性
+/// 等级进程（典型为 medium IL 的 explorer）只需这两项权限，不依赖调试特权。
+pub fn window_process_is_elevated(hwnd: HWND) -> Option<bool> {
+    let mut pid = 0u32;
+    // SAFETY: 只写本地 u32；hwnd 为调用方持有的窗口句柄，本 API 仅做查询，
+    // 对任意句柄值安全返回（取不到所属进程时 pid 保持 0）。
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: OpenProcess 只请求查询权限、不继承句柄；进程句柄与令牌句柄各关闭一次，
+    // 且都只在本函数内使用。
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
+        let elevated = if opened {
+            token_is_elevated(token)
+        } else {
+            None
+        };
+        if opened {
+            let _ = CloseHandle(token);
+        }
+        let _ = CloseHandle(process);
+        elevated
+    }
+}
+
+/// `TOKEN_ELEVATION` 的读取与判定：上面两个入口的唯一实现。
+fn token_is_elevated(token: HANDLE) -> Option<bool> {
+    let mut info = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: info 为本地 TOKEN_ELEVATION，长度按 `size_of` 原样给出，GetTokenInformation
+    // 同步写入且不超过该长度；returned 为本地 u32。token 的有效性由调用方保证
+    // （它来自成功的 OpenProcessToken，且在本函数返回前不被关闭）。
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(std::ptr::from_mut(&mut info).cast::<core::ffi::c_void>()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+        .ok()?;
+    }
+    Some(info.TokenIsElevated != 0)
+}
+
+/// 单例互斥量当前是否存在：组件实例是否在跑的唯一探针。
+///
+/// 只报「打开成功」与「打开失败」两种结果，任何错误（含 ACCESS_DENIED）都归「不存在」。
+/// 两处调用方都只需要这个方向的近似——「替代实例是否已接管」与「是否重复启动」——判错
+/// 的最坏后果都只是多一次注定按重复实例静默退出的进程创建；反过来把错误当成「存在」，
+/// 会让该补拉起的不补（组件真消失）、该让位的不让位（两个实例并存）。
+pub fn main_instance_exists() -> bool {
+    // MUTEX_NAME 常量已含尾 NUL。
+    let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
+    // SAFETY: name 以 NUL 结尾；句柄仅用于存在性探测，成功取得时立即关闭。
+    // 最小权限：SYNCHRONIZE 只够打开既有互斥量做存在性探测。
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => {
+            // SAFETY: handle 由紧邻的 OpenMutexW 成功返回，仅关闭一次。
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 轮询等待组件实例接管单例（同名单例互斥量出现），超时返回 false。
+///
+/// 两处共用，超时参数由调用方给——两处判错的代价不对称，故意不统一：
+/// - 组件启动期的自去提权（`main::de_elevate_self`）：等的是 explorer 中转的替代实例。
+///   `ShellExecuteW` 只说明 shell 接受了请求，不代表目标起来了；等不到就继续以提权身份
+///   运行（不影响用户），所以可以等满 5 秒。
+/// - 更新子进程在安装器收场后（`update::complete_update_interaction`）：判据是
+///   「组件是不是已经在跑」，而不是安装器的退出码。等不到的代价只是多拉起一个注定
+///   按重复实例静默退出的进程，因此这里故意取更短的上限，不让用户干等。
+pub fn wait_main_instance_appear(timeout_ms: u64, poll_interval_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if main_instance_exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+    }
 }
 
 /// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处。
@@ -675,5 +794,25 @@ mod tests {
         // （当作 0 会被误判成某个具体分支）。
         assert_eq!(win32_code_from_hresult(0x8000_4005), None); // E_FAIL
         assert_eq!(win32_code_from_hresult(0x8007_0000), Some(0));
+    }
+
+    #[test]
+    fn test_current_process_elevation_is_queryable() {
+        // 只钉「本进程的令牌可被查询」这一事实，不钉具体取值：用例既可能在普通用户
+        // 也可能在提权 CI/终端里跑，把 Some(false) 写死会变成环境依赖的假红。
+        // 但必须是 Some：None 意味着 OpenProcessToken/GetTokenInformation 失败，
+        // 而 main::de_elevate_self 对 None 走保守分支，等于自去提权整条路径失效。
+        assert!(
+            current_process_is_elevated().is_some(),
+            "必须能读到本进程令牌的提权状态"
+        );
+    }
+
+    #[test]
+    fn test_invalid_window_has_no_process_elevation() {
+        // 取不到所属进程（空句柄）必须返回 None 而不是 Some(false)：
+        // Some(false) 会让 main::de_elevate_self 把「查不到」当成「shell 未提权」，
+        // 从而把组件托付给一个根本不该被信任的中转对象。
+        assert_eq!(window_process_is_elevated(HWND(std::ptr::null_mut())), None);
     }
 }
