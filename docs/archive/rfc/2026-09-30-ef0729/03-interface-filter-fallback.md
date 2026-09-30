@@ -1,6 +1,6 @@
 # Agent Note：给网卡筛选加"零候选救回"——让名字黑名单不再单独决定生死
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

@@ -1,6 +1,6 @@
 # Agent Note：让 `reembed_if_lost` 的周期重试日志按状态去重（debug.log 的落盘与截断两条改动经复核判为净负，附否决记录）
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

@@ -1,6 +1,6 @@
 # Agent Note：速度显示补 GB 档（顺带解掉被单测钉死的 4096.0 MB/s），并把"互斥量"文案改成用户能懂的话
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
