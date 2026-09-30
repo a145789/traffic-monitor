@@ -278,9 +278,15 @@ pub(super) fn wait_main_instance_gone() {
     }
 }
 
-/// 重新拉起常驻主程序（仅用于 EXIT_MAIN 发出后安装未能继续的场景）。
+/// 重新拉起常驻主程序（EXIT_MAIN 发出后安装未能继续，或安装器收场后确认组件不在跑）。
 /// 携带一次性参数让新进程推迟首个自动检查冷却周期：更新确认框刚被用户
 /// 决策过，立刻再弹同一版本的确认框属于骚扰；下个冷却周期恢复正常。
+///
+/// **失败必须留痕、并做有限次重试**：静默更新交接里本函数是唯一的拉起点（另一处
+/// `[Run]` 只在安装成功收尾时执行），静默失败就等于「组件永久消失，而日志里查不到
+/// 原因」——正是本次改动要消灭的现场。`ShellExecuteW` 返回值 ≤32 是它自己的 SE_ERR_*
+/// 码（不是 last-error，故原样记录）；失败重试覆盖「exe 刚写完被杀软实时扫描占用」
+/// 这类可自愈的瞬态，与安装器启动同一对常量。
 pub(super) fn relaunch_main_app() {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -291,16 +297,32 @@ pub(super) fn relaunch_main_app() {
     };
     let path_wide = os_to_wide(exe.as_os_str());
     let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
-    // SAFETY: 两个缓冲均含尾 NUL，ShellExecuteW 同步返回前存活。
-    unsafe {
-        let _ = ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(path_wide.as_ptr()),
-            PCWSTR(args_wide.as_ptr()),
-            None,
-            SW_SHOWNORMAL,
-        );
+    for attempt in 1..=INSTALLER_LAUNCH_MAX_ATTEMPTS {
+        // SAFETY: 两个缓冲均含尾 NUL，ShellExecuteW 同步返回前存活。
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(path_wide.as_ptr()),
+                PCWSTR(args_wide.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        // >32 即 shell 接受了请求（该 API 的返回值约定）。
+        if result.0 as isize > 32 {
+            return;
+        }
+        if attempt == INSTALLER_LAUNCH_MAX_ATTEMPTS {
+            log_event!(
+                "重新拉起主程序失败: ShellExecuteW 返回 {}（组件不会自动回来）",
+                result.0 as isize
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            INSTALLER_LAUNCH_RETRY_DELAY_MS,
+        ));
     }
 }
 

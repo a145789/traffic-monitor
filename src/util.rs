@@ -5,11 +5,11 @@ use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
 use windows::Win32::System::Power::HPOWERNOTIFY;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW, OpenProcess,
+    GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW, OpenMutexW, OpenProcess,
     OpenProcessToken, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
     PROCESS_QUERY_LIMITED_INFORMATION, ProcessMemoryPriority, ProcessPowerThrottling,
-    SetProcessInformation, SetProcessWorkingSetSize,
+    SYNCHRONIZATION_SYNCHRONIZE, SetProcessInformation, SetProcessWorkingSetSize,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_RESULT,
@@ -170,6 +170,51 @@ fn token_is_elevated(token: HANDLE) -> Option<bool> {
         .ok()?;
     }
     Some(info.TokenIsElevated != 0)
+}
+
+/// 单例互斥量当前是否存在：组件实例是否在跑的唯一探针。
+///
+/// 只报「打开成功」与「打开失败」两种结果，任何错误（含 ACCESS_DENIED）都归「不存在」。
+/// 两处调用方都只需要这个方向的近似——「替代实例是否已接管」与「是否重复启动」——判错
+/// 的最坏后果都只是多一次注定按重复实例静默退出的进程创建；反过来把错误当成「存在」，
+/// 会让该补拉起的不补（组件真消失）、该让位的不让位（两个实例并存）。
+pub fn main_instance_exists() -> bool {
+    // MUTEX_NAME 常量已含尾 NUL。
+    let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
+    // SAFETY: name 以 NUL 结尾；句柄仅用于存在性探测，成功取得时立即关闭。
+    // 最小权限：SYNCHRONIZE 只够打开既有互斥量做存在性探测。
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => {
+            // SAFETY: handle 由紧邻的 OpenMutexW 成功返回，仅关闭一次。
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 轮询等待组件实例接管单例（同名单例互斥量出现），超时返回 false。
+///
+/// 两处共用，超时参数由调用方给——两处判错的代价不对称，故意不统一：
+/// - 组件启动期的自去提权（`main::de_elevate_self`）：等的是 explorer 中转的替代实例。
+///   `ShellExecuteW` 只说明 shell 接受了请求，不代表目标起来了；等不到就继续以提权身份
+///   运行（不影响用户），所以可以等满 5 秒。
+/// - 更新子进程在安装器收场后（`update::complete_update_interaction`）：判据是
+///   「组件是不是已经在跑」，而不是安装器的退出码。等不到的代价只是多拉起一个注定
+///   按重复实例静默退出的进程，因此这里故意取更短的上限，不让用户干等。
+pub fn wait_main_instance_appear(timeout_ms: u64, poll_interval_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if main_instance_exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+    }
 }
 
 /// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处。

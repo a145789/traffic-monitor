@@ -44,17 +44,19 @@ Name: "startup"; Description: "开机自动启动"; GroupDescription: "启动选
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TrafficMonitor"; ValueData: """{app}\traffic-monitor.exe"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-; 两条安装路径的拉起点必须各自唯一，且身份都要是非提权的交互用户：
-; - 向导路径（手动双击安装包）：由本条目经 postinstall 复选框拉起。显式写出
+; 拉起点按安装结果分派，任何时候只有一个真正生效，且身份都是非提权的交互用户：
+; - 安装成功收尾：由本条目拉起（向导路径给出 postinstall 复选框 UX；静默路径没有
+;   Finished 页，条目照常处理，因此手动静默安装/升级也会自动启动组件）。显式写出
 ;   runasoriginaluser 把意图钉住（它本就是 postinstall 的默认身份，但只有在 SetupLdr
 ;   有机会以原始凭据跑过代码时才生效——更新器已改用默认动词启动安装器，见
 ;   src/update/installer.rs）。
-; - 静默路径（/VERYSILENT，自动更新）：skipifsilent 让本条目整条跳过，改由更新子进程
-;   在安装器收场后拉起（src/update/mod.rs）。两边都拉起会让组件被创建两次，单例互斥
-;   虽能挡下第二个，但多一次进程创建与竞态窗口。
+; - 安装器起来了却没能成功收尾：本条目按 Inno 语义根本不执行，改由更新子进程在确认
+;   组件不在跑之后补拉起（src/update/mod.rs；判据是单例互斥量，不是退出码）。
+; 刻意不写 skipifsilent：那会让手动静默安装/升级也失去唯一的拉起者——临时的更新子进程
+; 只存在于自动更新路径——正好是「装完之后组件没了」要消灭的现场。
 Filename: "{app}\traffic-monitor.exe"; \
 Description: "启动 Traffic Monitor"; \
-Flags: nowait postinstall skipifsilent runasoriginaluser
+Flags: nowait postinstall runasoriginaluser
 
 [Code]
 // 安装交接实行“先礼后兵”：拷贝阶段前先请求旧实例优雅退出并等待其消失，

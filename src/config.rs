@@ -111,8 +111,11 @@ pub const AUTO_CHECK_ERROR_COOLDOWN_SECS: u64 = 300;
 /// 的合法长挂起场景：误恢复的代价是显示器关闭期间多跑 1 Hz 采样，且下一次点亮
 /// 通知必然到达（可自愈）；误冻结的代价是组件永久假活、只能重启程序。
 pub const SUSPEND_MONITOR_TTL_SECS: u64 = 12 * 60 * 60;
-/// 启动安装包遇共享冲突类瞬态错误（如杀软实时扫描瞬时占用刚写完的文件）
-/// 时的最大尝试次数与每次重试前的等待时长。
+/// 「启动一个外部进程」失败时的最大尝试次数与每次重试前的等待时长，两处共用：
+/// 启动安装包（`update::installer::launch_installer`）与重新拉起主程序
+/// （`update::installer::relaunch_main_app`）。两者遇到的都是同一类瞬态失败——文件
+/// 刚写完就被杀软实时扫描占用/替换——原先只有安装器那侧有重试，而 `relaunch_main_app`
+/// 是静默更新交接唯一的拉起点，它静默失败就等于组件蒸发。
 pub const INSTALLER_LAUNCH_MAX_ATTEMPTS: u32 = 3;
 pub const INSTALLER_LAUNCH_RETRY_DELAY_MS: u64 = 400;
 
@@ -136,6 +139,18 @@ pub const UPDATE_WORKER_STACK_BYTES: usize = 256 * 1024;
 /// `installer.iss` 的 `GracefulWaitTimeoutMs` 与此同量级，各处调整须同步。
 pub const MAIN_EXIT_WAIT_TIMEOUT_MS: u64 = 5000;
 pub const MAIN_EXIT_POLL_INTERVAL_MS: u64 = 50;
+
+/// 安装器收场后等待「组件实例已经在跑」的上限（毫秒）；轮询间隔复用
+/// `MAIN_EXIT_POLL_INTERVAL_MS`。
+///
+/// 判据是单例互斥量而不是安装器退出码：安装成功时 `[Run]` 条目本应已把组件拉起来，
+/// 但「静默模式下 `postinstall` 条目是否照常处理」这件事没有逐字保证，而设置
+/// `skipifsilent` 又会让手动静默安装/升级失去唯一的拉起者。以互斥量为准可在两种语义下
+/// 都得到正确答案：已经在跑就什么都不做，不在跑就补一次。
+///
+/// 刻意短于 `MAIN_EXIT_WAIT_TIMEOUT_MS`：这里判错的代价只是多拉起一个注定按重复实例
+/// 静默退出的进程（单例互斥兜住），而拖长等待会让刚点过「是」的用户多等。
+pub const INSTALLER_SETTLE_TAKEOVER_WAIT_MS: u64 = 2000;
 
 /// 重新拉起主进程时携带的一次性参数：更新确认框刚被用户决策过，或者安装器刚
 /// 收场（成功/失败/被取消都算），拉起后的首个自动检查冷却周期被推迟，避免

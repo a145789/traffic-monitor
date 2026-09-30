@@ -18,14 +18,15 @@ use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_YESN
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD, REG_PATH_APP,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD,
+    INSTALLER_SETTLE_TAKEOVER_WAIT_MS, MAIN_EXIT_POLL_INTERVAL_MS, REG_PATH_APP,
     UPDATE_FETCH_RETRY_DELAY_MS, UPDATE_WORKER_STACK_BYTES, VERSION, VERSION_METADATA_MAX_BYTES,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::{
     compact_and_trim, configure_background_process, log_event, message_box, refresh_debug_log_flag,
     reg_read_dword, reg_read_string, reg_write_dword, reg_write_string, show_error, show_info,
-    to_wide,
+    to_wide, wait_main_instance_appear,
 };
 
 use cache::get_temp_installer_path;
@@ -499,22 +500,31 @@ fn complete_update_interaction(
             }
             wait_main_instance_gone();
 
-            // 静默路径的 `[Run]` 条目已带 `skipifsilent`（`installer.iss`）：安装器自己
-            // 不再拉起组件，本子进程是这次更新**唯一**的拉起点——成功、失败与「结果未知」
-            // 三种收场都必须重新拉起，少任何一支都会留下「装完之后组件不在」。
+            // 「谁负责拉起」由**客观事实**裁决：组件是不是已经在跑（单例互斥量在不在），
+            // 不由安装器退出码也不由 `[Run]` 条目在静默模式下的语义裁决——后两者都没有
+            // 逐字保证，而组件在不在跑这件事在两种语义下都给出正确答案。
+            // 退出码只用来省一次探测：非 0 时 `[Run]` 必然没执行（官方退出码表：任何非 0
+            // 都表示 Setup 没跑完），不必等；0 时才需要确认它在不在。
             match launch_installer(verified) {
                 Ok(process) => {
-                    // 退出码只用于区分「装好了」与「没装成（已回滚）」：官方退出码表里
-                    // 非 0 一律表示 Setup 没跑完，此时 `{app}` 下仍是旧版可执行文件，
-                    // 拉起来即恢复；取不到码同样是「结果未知」，按需要恢复处理。
-                    match process.wait_for_exit_code() {
-                        Some(0) => log_event!("安装器已成功收场，重新拉起主程序"),
-                        Some(code) => {
-                            log_event!("安装器未成功收场 (退出码: {code})，已回滚，重新拉起主程序")
+                    let exit_code = process.wait_for_exit_code();
+                    let instance_present = exit_code == Some(0)
+                        && wait_main_instance_appear(
+                            INSTALLER_SETTLE_TAKEOVER_WAIT_MS,
+                            MAIN_EXIT_POLL_INTERVAL_MS,
+                        );
+                    if instance_present {
+                        log_event!("安装器已成功收场，组件已由安装器拉起，不再重复拉起");
+                    } else {
+                        match exit_code {
+                            Some(0) => log_event!("安装器已成功收场但组件未在跑，重新拉起主程序"),
+                            Some(code) => {
+                                log_event!("安装器未成功收场 (退出码: {code})，重新拉起主程序")
+                            }
+                            None => log_event!("安装器收场结果未知，重新拉起主程序"),
                         }
-                        None => log_event!("安装器收场结果未知，重新拉起主程序"),
+                        relaunch_main_app();
                     }
-                    relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
                 Err(InstallerLaunch::Cancelled) => {

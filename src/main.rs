@@ -20,7 +20,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
-use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -59,8 +59,9 @@ use crate::update::{
     load_auto_update_enabled, start_auto_check, subprocess_main,
 };
 use crate::util::{
-    AtomicHwnd, current_process_is_elevated, diag, log_event, os_to_wide, refresh_debug_log_flag,
-    set_low_memory_priority, show_error, to_wide, trim_working_set, window_process_is_elevated,
+    AtomicHwnd, current_process_is_elevated, diag, log_event, main_instance_exists, os_to_wide,
+    refresh_debug_log_flag, set_low_memory_priority, show_error, to_wide, trim_working_set,
+    wait_main_instance_appear, window_process_is_elevated,
 };
 use crate::window::{
     align_window_size_to, create_main_window, create_watchdog_window, embed_in_taskbar,
@@ -217,10 +218,17 @@ fn de_elevate_self(relaunched_by_update: bool) -> bool {
         }
         return false;
     }
-    // 已提权：只有「存在一个未提权的 shell 可以托付」时才值得中转。
-    // explorer.exe 中转靠正在运行的 shell 代为启动（见 relay_via_shell）；若承载任务栏的
-    // shell 自己也是提权的，中转不会降低完整性等级，白跑一趟，还可能让替代实例继续以
-    // 提权身份启动并再次触发本函数——正是要避免的循环。
+    // 已提权且已有实例在跑：本次是重复启动。先探一次单例互斥量再决定要不要中转，否则会白拉
+    // 一个注定按重复实例退出的替代实例（多一次进程创建与竞态窗口）。直接让位退出，与
+    // `init_single_instance` 命中重复实例时的处置一致。
+    if main_instance_exists() {
+        log_event!("自去提权: 已有实例在跑，本次为重复启动，直接让位退出");
+        return true;
+    }
+    // 只有「存在一个未提权的 shell 可以托付」时才值得中转。explorer.exe 中转靠正在运行的
+    // shell 代为启动（见 relay_via_shell）；若承载任务栏的 shell 自己也是提权的，中转不会
+    // 降低完整性等级，白跑一趟，还可能让替代实例继续以提权身份启动并再次触发本函数——
+    // 正是要避免的循环。
     let Some(taskbar) = crate::window::get_taskbar_hwnd() else {
         log_event!("自去提权: 本进程已提权，但没有正在运行的 shell 可中转，维持现状");
         return false;
@@ -229,7 +237,11 @@ fn de_elevate_self(relaunched_by_update: bool) -> bool {
         log_event!("自去提权: 承载任务栏的 shell 自身不是未提权进程，中转不会降级，维持现状");
         return false;
     }
-    if relay_via_shell() && wait_for_relayed_instance() {
+    // 退出前必须确认替代实例真的接管（单例互斥量出现），而不是只看 ShellExecuteW 的返回值
+    // ——后者只说明 shell 接受了请求。
+    if relay_via_shell()
+        && wait_main_instance_appear(MAIN_EXIT_WAIT_TIMEOUT_MS, MAIN_EXIT_POLL_INTERVAL_MS)
+    {
         log_event!("自去提权: 本进程已提权，已经 explorer 中转拉起非提权实例并退出");
         return true;
     }
@@ -279,42 +291,6 @@ fn relay_via_shell() -> bool {
         )
         .0 as isize
             > 32
-    }
-}
-
-/// 等待替代实例接管单例（新进程创建了同名单例互斥量）。
-///
-/// 只认「互斥量出现」这个客观事实，不认 `ShellExecuteW` 的返回值：后者只说明 shell 接受
-/// 了请求，不代表目标真的起来了。等不到就返回 false，由调用方继续以提权身份运行——
-/// 这样「为了去提权把组件弄丢」在结构上不可能发生。窗口内若已有另一个实例在跑
-/// （本进程是重复启动），这里同样会看到互斥量并退出，与启动期「重复实例静默退出」一致。
-///
-/// 超时/轮询与 `installer::wait_main_instance_gone`、`quit_existing_instance` 共用
-/// MAIN_EXIT_WAIT_TIMEOUT_MS / MAIN_EXIT_POLL_INTERVAL_MS：三处都是「等一个进程状态
-/// 到位、上限 5 秒」，只是探针不同（此处等互斥量出现，另两处等它消失 / 窗口消失）。
-fn wait_for_relayed_instance() -> bool {
-    // MUTEX_NAME 常量已含尾 NUL。
-    let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(MAIN_EXIT_WAIT_TIMEOUT_MS);
-    loop {
-        // SAFETY: name 以 NUL 结尾；句柄仅用于存在性探测，成功取得时立即关闭。
-        // 最小权限：SYNCHRONIZE 只够打开既有互斥量做存在性探测。
-        match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
-            Ok(handle) => {
-                // SAFETY: handle 由紧邻的 OpenMutexW 成功返回，仅关闭一次。
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                return true;
-            }
-            Err(_) => {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(MAIN_EXIT_POLL_INTERVAL_MS));
-            }
-        }
     }
 }
 
