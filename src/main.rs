@@ -20,13 +20,14 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, IsWindow, KillTimer,
-    MSG, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetTimer, TranslateMessage,
-    WM_CLOSE, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT, WM_POWERBROADCAST,
-    WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+    MSG, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_SHOWNORMAL, SetTimer,
+    TranslateMessage, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE, WM_DPICHANGED, WM_PAINT,
+    WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -58,8 +59,8 @@ use crate::update::{
     load_auto_update_enabled, start_auto_check, subprocess_main,
 };
 use crate::util::{
-    AtomicHwnd, diag, log_event, refresh_debug_log_flag, set_low_memory_priority, show_error,
-    trim_working_set,
+    AtomicHwnd, current_process_is_elevated, diag, log_event, os_to_wide, refresh_debug_log_flag,
+    set_low_memory_priority, show_error, to_wide, trim_working_set, window_process_is_elevated,
 };
 use crate::window::{
     align_window_size_to, create_main_window, create_watchdog_window, embed_in_taskbar,
@@ -182,6 +183,141 @@ fn quit_existing_instance() {
     }
 }
 
+/// 已提权实例的自去提权。返回 `true` 表示已拉起并确认替代实例接管，本进程必须退出。
+///
+/// 背景：组件一旦以 high IL 运行，UIPI 会切断它与 explorer 之间**所有**需要窗口消息的
+/// 交互——`TaskbarCreated` 广播收不到（Explorer 重建后组件永久消失，AGENTS.md
+/// 「必须保留一个不嵌入、隐藏且比主窗口更稳定的顶层恢复接收者」这条同时失效）、
+/// `WM_SETTINGCHANGE` 收不到（主题自适应失效）、用户手敲 `--quit` 的 `PostMessageW`
+/// 被拦下且返回值被丢弃（静默无效）。而这个状态会**自续**：提权组件 re-exec 出的更新
+/// 子进程继承 token，安装器与它拉起的下一版组件一直是提权的；被旧版 `runas` 启动的
+/// 安装器拉起过一次的机器不会自行恢复。因此这里做**无条件**自检（不以
+/// `RELAUNCHED_BY_UPDATE_ARG` 为门）：那一版 `[Run]` 条目不带任何参数，更新交接拉起的
+/// 提权实例身上根本没有这个标记，只有无条件自检才能修复已经装了旧版的机器。
+///
+/// 调用位置刻意在单例锁**之前**：那时本进程还没持有互斥量，替代实例可以直接拿到锁，
+/// 「先放锁再拉起」的时序要求、以及它留下的第三方抢跑窗口，在结构上都不存在。
+///
+/// 中转只在「确定存在一个未提权的 shell 可以托付」时进行：中转失败或等不到替代实例
+/// 接管时本进程**继续以提权身份运行**（能力受损但仍然活着），下次启动再试——所以既不会
+/// 「为了去提权把组件弄丢」，也不会形成进程创建循环。
+fn de_elevate_self(relaunched_by_update: bool) -> bool {
+    let elevated = match current_process_is_elevated() {
+        Some(value) => value,
+        None => {
+            log_event!("完整性自检: 无法读取本进程令牌的提权状态，维持现状");
+            return false;
+        }
+    };
+    if !elevated {
+        // 正向可观测点：由更新拉起且未提权，就是本条问题已修的现场证据（需用户开
+        // EnableDebugLog，见 util::log_event!）。
+        if relaunched_by_update {
+            log_event!("完整性自检: 本次由更新拉起，未提权 (medium IL)");
+        }
+        return false;
+    }
+    // 已提权：只有「存在一个未提权的 shell 可以托付」时才值得中转。
+    // explorer.exe 中转靠正在运行的 shell 代为启动（见 relay_via_shell）；若承载任务栏的
+    // shell 自己也是提权的，中转不会降低完整性等级，白跑一趟，还可能让替代实例继续以
+    // 提权身份启动并再次触发本函数——正是要避免的循环。
+    let Some(taskbar) = crate::window::get_taskbar_hwnd() else {
+        log_event!("自去提权: 本进程已提权，但没有正在运行的 shell 可中转，维持现状");
+        return false;
+    };
+    if window_process_is_elevated(taskbar) != Some(false) {
+        log_event!("自去提权: 承载任务栏的 shell 自身不是未提权进程，中转不会降级，维持现状");
+        return false;
+    }
+    if relay_via_shell() && wait_for_relayed_instance() {
+        log_event!("自去提权: 本进程已提权，已经 explorer 中转拉起非提权实例并退出");
+        return true;
+    }
+    log_event!("自去提权: 经 explorer 中转未成功接管，继续以提权身份运行");
+    false
+}
+
+/// 经正在运行的 shell 以交互登录用户身份重新启动自己。
+///
+/// **不能**对自身直接 `ShellExecuteW("open", self)`：那会继承当前（提权）token，等于没去
+/// 提权。改传 `explorer.exe` + 自身路径：explorer 是单例，第二次调用会由既有 shell
+/// （medium IL、交互登录用户）代为启动目标，于是替代实例是 medium IL。这条依赖
+/// 「交互登录用户 = 目标用户」：标准用户 + 管理员凭据提升的场景下，经 explorer 中转能
+/// 回到交互用户，「以当前用户身份直接重启」不能。
+///
+/// 代价（知情取舍）：explorer 的命令行不把参数转交给目标程序，替代实例因此不带
+/// `RELAUNCHED_BY_UPDATE_ARG`，这一次「推迟首个自动检查周期」的优惠会丢失；影响面只是
+/// 提权实例去提权的这一次启动可能立刻做一次自动检查（无更新时静默）。
+///
+/// 返回值只说明 shell 接受了请求，不代表目标已经起来——是否真的接管由
+/// `wait_for_relayed_instance` 用互斥量这个客观事实判定。
+fn relay_via_shell() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        log_event!("自去提权: 无法获取自身路径");
+        return false;
+    };
+    let exe_wide = os_to_wide(exe.as_os_str());
+    let explorer_wide = to_wide("explorer.exe");
+    // 参数串按宽字符直接拼（不经 `String`）：路径可能含非 Unicode 可解码字符，
+    // `display()` 会把它替换成 U+FFFD 从而指向另一个路径。引号必须有：默认安装目录
+    // `C:\Program Files\Traffic Monitor` 含空格，不引会被当成多个参数。
+    let mut params: Vec<u16> = Vec::with_capacity(exe_wide.len() + 2);
+    params.push(u16::from(b'"'));
+    params.extend_from_slice(&exe_wide[..exe_wide.len() - 1]);
+    params.push(u16::from(b'"'));
+    params.push(0);
+    // SAFETY: explorer_wide / params 两个缓冲均含尾 NUL，且在 ShellExecuteW 同步返回前存活。
+    // 返回值为 HINSTANCE：>32 表示 shell 接受了请求（该 API 的返回值约定）。
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(explorer_wide.as_ptr()),
+            PCWSTR(params.as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        )
+        .0 as isize
+            > 32
+    }
+}
+
+/// 等待替代实例接管单例（新进程创建了同名单例互斥量）。
+///
+/// 只认「互斥量出现」这个客观事实，不认 `ShellExecuteW` 的返回值：后者只说明 shell 接受
+/// 了请求，不代表目标真的起来了。等不到就返回 false，由调用方继续以提权身份运行——
+/// 这样「为了去提权把组件弄丢」在结构上不可能发生。窗口内若已有另一个实例在跑
+/// （本进程是重复启动），这里同样会看到互斥量并退出，与启动期「重复实例静默退出」一致。
+///
+/// 超时/轮询与 `installer::wait_main_instance_gone`、`quit_existing_instance` 共用
+/// MAIN_EXIT_WAIT_TIMEOUT_MS / MAIN_EXIT_POLL_INTERVAL_MS：三处都是「等一个进程状态
+/// 到位、上限 5 秒」，只是探针不同（此处等互斥量出现，另两处等它消失 / 窗口消失）。
+fn wait_for_relayed_instance() -> bool {
+    // MUTEX_NAME 常量已含尾 NUL。
+    let name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(MAIN_EXIT_WAIT_TIMEOUT_MS);
+    loop {
+        // SAFETY: name 以 NUL 结尾；句柄仅用于存在性探测，成功取得时立即关闭。
+        // 最小权限：SYNCHRONIZE 只够打开既有互斥量做存在性探测。
+        match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+            Ok(handle) => {
+                // SAFETY: handle 由紧邻的 OpenMutexW 成功返回，仅关闭一次。
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                return true;
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(MAIN_EXIT_POLL_INTERVAL_MS));
+            }
+        }
+    }
+}
+
 /// 获取单实例锁。已存在实例（重复启动）静默返回 None；锁创建本身失败弹框后
 /// 返回 None。两种情况 `main()` 都直接退出，与提取前的早退路径一一对应。
 fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
@@ -251,6 +387,17 @@ fn main() {
             cli.parent_pid,
             cli.parent_start,
         ));
+    }
+
+    // 调试日志开关要在第一处可能写日志的调用之前加载：自去提权的自检结论只落在日志里
+    // （见 `de_elevate_self`）。本行与尾段 `refresh_debug_log_flag` 的同名调用幂等
+    // （同一次注册表读），可安全重复。
+    refresh_debug_log_flag();
+
+    // 自去提权必须早于单例锁与任何窗口创建：否则本进程已持有互斥量，替代实例会撞上
+    // 「重复实例静默退出」，结果是两个都退、组件反而没了（时序理由见 `de_elevate_self`）。
+    if de_elevate_self(cli.relaunched_by_update) {
+        return;
     }
 
     // guard 必须活到消息循环结束：它是单例互斥量的存活证明，提前 drop 会让
@@ -343,8 +490,9 @@ fn main() {
     register_session_notification(hwnd);
 
     init_cleanup_temp();
-    // 更新流程 relaunch 拉起的进程：刚发生过 UAC 取消或安装器启动失败，
-    // 推迟首个自动检查周期，避免立刻再弹同一版本的更新确认框。
+    // 更新流程 relaunch 拉起的进程（安装器已收场后重新拉起，无论装成没装成；
+    // 以及 UAC 取消、安装器启动失败）：推迟首个自动检查周期，避免刚决策过
+    // 同一版本又立刻弹一次确认框。
     if cli.relaunched_by_update {
         defer_initial_auto_check();
     }

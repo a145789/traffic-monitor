@@ -353,8 +353,9 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
 /// stdout 单行协议：
 /// - `DONE`：子进程已处理完毕，主进程继续运行。
 /// - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
-///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才提权
-///   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
+///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才
+///   运行安装器（默认动词启动，提权由 SetupLdr 自己完成），从源头消除「文件正在使用」
+///   竞态；安装器内 taskkill 仅作兜底。
 /// - 无协议行：R1 静默放弃（父进程已消失且用户未确认），退出码非零。
 ///
 /// 退出码：0 = 检查流程成功完成（含 `EXIT_MAIN` 交接），1 = 检查失败或 R1 静默放弃。
@@ -498,25 +499,39 @@ fn complete_update_interaction(
             }
             wait_main_instance_gone();
 
+            // 静默路径的 `[Run]` 条目已带 `skipifsilent`（`installer.iss`）：安装器自己
+            // 不再拉起组件，本子进程是这次更新**唯一**的拉起点——成功、失败与「结果未知」
+            // 三种收场都必须重新拉起，少任何一支都会留下「装完之后组件不在」。
             match launch_installer(verified) {
-                InstallerLaunch::Started => {
-                    log_event!("安装器已启动");
+                Ok(process) => {
+                    // 退出码只用于区分「装好了」与「没装成（已回滚）」：官方退出码表里
+                    // 非 0 一律表示 Setup 没跑完，此时 `{app}` 下仍是旧版可执行文件，
+                    // 拉起来即恢复；取不到码同样是「结果未知」，按需要恢复处理。
+                    match process.wait_for_exit_code() {
+                        Some(0) => log_event!("安装器已成功收场，重新拉起主程序"),
+                        Some(code) => {
+                            log_event!("安装器未成功收场 (退出码: {code})，已回滚，重新拉起主程序")
+                        }
+                        None => log_event!("安装器收场结果未知，重新拉起主程序"),
+                    }
+                    relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
-                InstallerLaunch::Cancelled => {
-                    // 主进程已按约定退出（如 UAC 被取消），重新拉起应用，
-                    // 避免任务栏小组件凭空消失。
+                Err(InstallerLaunch::Cancelled) => {
+                    // 默认动词下 UAC 取消发生在 SetupLdr 内部，表现为非 0 退出码（走上面
+                    // 那一支）；本支保留给 ShellExecuteExW 自身仍返回 ERROR_CANCELLED 的
+                    // 场合。主进程已按约定退出，重新拉起应用，避免组件凭空消失。
                     log_event!("安装器启动被取消，重新拉起主程序");
                     relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
-                InstallerLaunch::Failed(code) => {
+                Err(InstallerLaunch::Failed(code)) => {
                     log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
                     show_error(&format!("启动安装程序失败 (错误码: {code})"));
                     relaunch_main_app();
                     SubprocessEnd::ExitMain
                 }
-                InstallerLaunch::FailedWithoutCode => {
+                Err(InstallerLaunch::FailedWithoutCode) => {
                     // 取不到裸 Win32 码时 `Failed(0)` 会把这个框拼成「错误码: 0」——
                     // 用户拿不到任何信息也无法据此行动，所以这一支只写现场日志；
                     // 恢复动作（重新拉起主程序）与 `Failed` 完全一致。

@@ -4,6 +4,8 @@ Status: proposed
 
 ## 问题
 
+（「问题」「明确不在本次范围」「为什么不保留」三节是改动前的现场记录，行号相对改动前的代码；本次改动的规范见"提案"。）
+
 自动更新成功后，把组件重新拉起来的是 `installer.iss:46-49` 的 `[Run]` 条目，而它的**身份**由 Inno 的 `postinstall` 语义决定，不由是否手写 `runasoriginaluser` 决定。
 
 Inno 官方文档的 `[Run]` 章节写明：`runasoriginaluser` 是「the default behavior when the postinstall flag is used」，而 `runascurrentuser` 是「the default behavior when the postinstall flag is not used」。所以本仓库的 `[Run]` 虽然没写 `runasoriginaluser`，默认**本该**是"以原始（非提权）用户身份启动"。
@@ -22,16 +24,23 @@ Inno 官方文档的 `[Run]` 章节写明：`runasoriginaluser` 是「the defaul
 
 ## 提案
 
-1. **先量后改（建议作为第一步）**：在组件启动早期读一次 `GetTokenInformation(TokenElevation)`，当命令行带 `RELAUNCHED_BY_UPDATE_ARG`（`src/config.rs:142`）时用 `log_event!` 记下"本次是否提权"（需用户开 `EnableDebugLog`，见 `src/util.rs:375-381`）。这条日志把本笔记的前提从"文档推断"变成"实测事实"，同时也给验收提供可观测点。
-2. **应用侧自去提权**：若自检为"已提权 + 由更新拉起"，重新以非提权身份启动自己（带同一 `--relaunched-by-update`）然后退出。机制与时序都要写对：**不能**对自身直接 `ShellExecuteW("open", self)`——那会继承当前（提权）token；要经 explorer 中转（例如 `ShellExecuteW(None, "open", "explorer.exe", "<自身路径>", ...)`），让 medium IL 的 shell 以交互登录用户身份启动它。时序上必须**先 `drop` 单例互斥量守卫**（`src/main.rs:253-256` 的 `_mutex_guard`）再拉起，否则新实例会撞上 `src/main.rs:195-203` 的"重复实例静默退出"（那是刻意的设计决定，不能绕过），结果是"两个都退"、组件反而没了；先放锁再拉起会留下一个极小的第三方抢跑窗口（另一实例恰好在此刻启动），这个取舍必须明写在代码注释里。注意这条依赖"交互登录用户 = 目标用户"：标准用户 + 管理员凭据提升的场景下，经 explorer 中转能回到交互用户，而"以当前用户身份直接重启"不能。
-3. **或：换掉 runas 动词**，让 Inno 的 SetupLdr 自己提权（stub 是 `asInvoker`，自提权时才有 pre-UAC 凭据）。代价明确：`src/update/installer.rs:317-321` 依赖的 `ERROR_CANCELLED` 检测会失效（默认动词下 UAC 取消发生在 stub 内部，`ShellExecuteExW` 会返回成功），因此选它之前必须先给出替代机制，而不是"顺手补一下"：默认动词下 stub 会自己提权、并**在安装结束后以 Inno 退出码收场**（0 = 成功；非 0 = 失败/取消/回滚），所以可行的替代是"让更新子进程持有 stub 的进程句柄并等它退出"——`SEE_MASK_NOCLOSEPROCESS` + `WaitForSingleObject` + `GetExitCodeProcess`（见 02-installer-abort-relaunch 的提案 1），它同时把"安装失败后谁拉起"一并解决，代价是更新子进程的寿命从"启动安装器即退"延长到"安装结束"，需要确认这与 AGENTS.md 第 4 条"短生命周期隔离边界"的兼容性。只换动词而不补等待：UAC 取消与安装失败都会变成"没人拉起"，比现状更糟。
-4. 方案 2 与 3 **互斥**，择一实施；无论选哪个，都在 `installer.iss:47-49` 显式写出 `runasoriginaluser`——文档说它在 caveat 场景下无效，但写上不花钱，且能把"非 runas 启动"路径上的意图钉住。
+1. **身份自检日志（已实施）**：组件启动早期读一次 `GetTokenInformation(TokenElevation)`（唯一实现：`util::current_process_is_elevated`），已提权时把结论用 `log_event!` 记下（需用户开 `EnableDebugLog`，见 `src/util.rs`）。这条日志是验收的可观测点。
+   **刻意不以 `RELAUNCHED_BY_UPDATE_ARG` 为门**：`installer.iss` 的 `[Run]` 条目不带任何参数，被它拉起的提权实例身上没有这个标记——按标记判定会正好漏掉需要修复的那一批机器。因此自检无条件做，标记只用于「由更新拉起且未提权」这一条正向证据。
+2. **应用侧自去提权（已实施）**：自检为已提权就经 explorer 中转重新以非提权身份启动自己，然后退出。机制与时序都要写对：
+   - **不能**对自身直接 `ShellExecuteW("open", self)`——那会继承当前（提权）token；要经 explorer 中转（`ShellExecuteW(None, "open", "explorer.exe", "<自身路径>", ...)`），让 medium IL 的 shell 以交互登录用户身份启动它。这条依赖"交互登录用户 = 目标用户"：标准用户 + 管理员凭据提升的场景下，经 explorer 中转能回到交互用户，而"以当前用户身份直接重启"不能。
+   - **中转只在「确定有未提权的 shell 可托付」时做**：任务栏窗口存在、且承载它的进程未提权，两个条件任一不满足就维持现状。这不只是保守：explorer 中转靠正在运行的 shell 代为启动，若那个 shell 自己就是提权的，中转不会降级，替代实例会继续以提权身份启动并再次触发自检——该判据从结构上排除了这条进程创建循环。
+   - **调用点在单例锁之前**（`main()` 里早于 `init_single_instance`），比原笔记的"先 drop 单例互斥量守卫再拉起"更简单：那时本进程还没持有互斥量，替代实例可以直接拿到锁，"先拉起后放锁会让新实例撞上重复实例静默退出"这个坑在结构上不存在，也就不需要任何一次性参数来防重入。
+   - **退出前确认替代实例真的接管**：`ShellExecuteW` 的返回值只说明 shell 接受了请求，不代表目标起来了；以「同名单例互斥量出现」为准（超时 5 秒，与另两处等待共用常量）。等不到就**继续以提权身份运行**，下次启动再试——所以"为了去提权把组件弄丢"在结构上不可能发生。
+   - 代价：explorer 的命令行不把参数转交给目标程序，替代实例不带 `--relaunched-by-update`，这一次"推迟首个自动检查周期"的优惠会丢失；影响面仅限提权实例去提权的这一次启动。
+3. **换掉 `runas` 动词（已实施）**：`update::installer::try_launch_installer` 改用默认动词（`lpVerb = NULL`）启动安装器，让 Inno 的 SetupLdr 自己提权（stub 的应用 manifest 是 `asInvoker`，`installer.iss` 未设 `PrivilegesRequired`、取默认 `admin`），于是它先以原始凭据跑过一段代码，`[Run]` 的 `runasoriginaluser` 才真正生效。代价明确：`ERROR_CANCELLED` 不再由 `ShellExecuteExW` 同步返回，替代机制正是 02 的提案 1（取进程句柄、等收场、读退出码），两篇同批实施，因此不存在"只换动词不补等待"的净退步。附带好处：拿到的句柄因此属于同一完整性等级的进程，省掉了跨等级等待与取退出码这一项不确定性。
+4. **方案 2 与 3 一起实施（修正原文的"互斥，择一实施"）**：原笔记认为两者解决同一个问题、择一即可；但两者覆盖面不同、缺一不可——方案 3 只**防复发**（新路径不再把组件拉成提权身份），修不了**已经**被旧版 `runas` 安装器拉起的提权实例：那次交接跑的是旧代码，它落地的下一版组件必然是提权的，而旧 `[Run]` 又不传任何参数，方案 2 若按标记判定同样认不出它（见提案 1）。两者互不冲突：非提权路径下方案 2 是空操作，提权路径下"方案 3 拿不到原始凭据"这个洞由方案 2 兜住。
+5. 无论走哪条路径，都在 `installer.iss` 的 `[Run]` 条目显式写出 `runasoriginaluser`——文档说它在 caveat 场景下无效，但写上不花钱，且能把"非 runas 启动"路径上的意图钉住。
 
 ## 明确不在本次范围
 
 - **不要去掉 `postinstall`。** 官方文档对它唯一定义是"在 Setup Completed 向导页创建复选框"，它的另一个效果就是把默认身份定为 `runasoriginaluser`；去掉它会把默认翻成 `runascurrentuser`（安装器自己的管理员 token），正好加重本条问题。
 - 不改 `installer.iss` 的 `AppMutex` / `RequestGracefulExit` / `ForceKillRemnant`（`installer.iss:5`、`:86-158`），它们与身份无关且已被归档笔记论证过。
-- 不改 `src/update/installer.rs:231-252` 的 `relaunch_main_app` 语义（它服务失败路径，见另一篇笔记）。
+- 不改 `update::installer::relaunch_main_app` 的语义（它服务安装交接结束后的重新拉起，见另一篇笔记）；自去提权是组件启动期自己做的事，不复用也不改它。
 - 不动 `build.rs` 的 manifest（组件自己不该提权；在上面加 `requireAdministrator` 是把 bug 变成设计）。
 
 ## 为什么不保留？
@@ -44,15 +53,17 @@ Inno 官方文档的 `[Run]` 章节写明：`runasoriginaluser` 是「the defaul
 
 ## 验收标准
 
-- `grep -n "runasoriginaluser" installer.iss` 命中 1 处；`grep -rn "runas" src/update/installer.rs` 的用法与所选方案一致（选方案 3 则不再出现 `to_wide("runas")`）。
-- 真机实测（方案 2 或 3 都必须做）：完整走一次"发现新版本 → 点是 → 主程序退出 → 安装器静默装完"，用任务管理器的"已提升"列（或对组件进程 `whoami /groups` 查完整性级别）确认新实例是 **medium**，不是 high。
-- 身份自检日志可 grep（`grep -n "提权\|TokenElevation" src/main.rs` 命中 1 处）。
-- 现有回退路径不回归：`installer.iss` 的 UAC 取消仍由 `src/update/mod.rs:506-512` 重新拉起主程序；`src/smoke.rs` 的 4 个 `#[ignore]` 冒烟用例仍可跑通。
-- `cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings` 全绿。
+- `grep -n "Flags:.*runasoriginaluser" installer.iss` 命中 1 次；`src/update/installer.rs` 的启动路径不再把 `lpVerb` 指向 `runas` 动词（现为 `lpVerb: PCWSTR::null()`，`runas` 只出现在解释理由的注释里）。
+- `grep -n "提权" src/main.rs` 命中（自检与自去提权的判据、日志）；令牌读取的唯一实现在 `src/util.rs`（`current_process_is_elevated` / `window_process_is_elevated`）。
+- **真机实测（本次交付未做，见风险）**：完整走一次"发现新版本 → 点是 → 主程序退出 → 安装器静默装完"，确认 ①组件自动回到任务栏 ②新实例是 **medium**（任务管理器"已提升"列，或对组件进程 `whoami /groups` 查完整性级别）。
+- **真机实测（本次交付未做）**：从一个已被提权的组件出发（右击 exe"以管理员身份运行"，或从上一次提权状态出发），确认它经 explorer 中转后回到 medium，任务栏组件仍在（不是"两个都退"，也没有反复创建进程）。
+- 现有回退路径不回归：安装器启动失败/UAC 取消仍重新拉起主程序；`src/smoke.rs` 的 4 个 `#[ignore]` 冒烟用例仍可跑通。
+- `cargo fmt -- --check`、`cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings` 全绿。
 
 ## 风险
 
-- 方案 1 是纯观测，无风险；但它依赖用户开日志，"没开日志就等于没验"，所以验收必须在开日志的机器上做一次。
-- 方案 2 引入一次进程更替：需要处理"新实例起的瞬间旧实例还没退、单例互斥量已存在"的窗口（应当先退出再拉起，或让新实例的互斥量等待逻辑兜住），并接受托盘图标有一次重建。去提权依赖 explorer 在运行（任务栏组件本来就依赖它）。
-- 方案 3 的 UAC 取消兜底如上所述必须同批替换，否则是净退步。
-- **可证伪项**：若实测发现组件在 runas 启动的安装器下**仍是** medium IL，则本条前提被证伪（说明 Inno 在该路径上仍能拿到原始用户 token），此时只保留"显式写 `runasoriginaluser`"与那条自检日志即可，不做方案 2/3。
+- 提案 1 是纯观测，无风险；但它依赖用户开日志，"没开日志就等于没验"，所以验收必须在开日志的机器上做一次。
+- 提案 2 引入一次进程更替：托盘图标会有一次重建；`--relaunched-by-update` 在中转这一跳丢失（影响面见提案 2）。去提权依赖 explorer 在运行——中转判据显式要求"任务栏窗口存在且其进程未提权"，不满足就维持现状，不会把组件弄丢。
+- 中转期间本进程尚未持有单例锁：那个窗口里第三方启动的实例可能抢到锁，本进程随后据"互斥量已出现"让位退出，因此不会出现两个常驻实例；代价是这次自去提权没生效（下次启动再试）。
+- **未实测项（交付时的事实）**：explorer 中转是否在目标 Windows 11 版本上都落成 medium IL、"等替代实例接管"的 5 秒上限在冷启动 + 杀软扫描下是否够用、"旧 `[Run]` 拉起的提权实例能否被无条件自检修复"这整条首次升级路径，都只做过静态推理，需真机各验一次。
+- **可证伪项**：若实测发现组件在 `runas` 启动的安装器下**仍是** medium IL，则提案 3 的前提被证伪（说明 Inno 在该路径上仍能拿到原始用户 token）。此时提案 3 退化为冗余，但提案 2 仍应保留——它防的是"任何原因导致的提权启动"，不只 `runas` 这一条。

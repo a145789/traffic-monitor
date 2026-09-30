@@ -1,15 +1,18 @@
-//! 安装器管线：缓存复用、流式下载、提权启动、主进程退出等待。
+//! 安装器管线：缓存复用、流式下载、以默认动词启动安装器、等待它收场并读退出码、
+//! 主进程退出等待。
 //! 不变量：构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希
 //! （`compute_sha256_hex_locked`），不按路径另开文件。
 
 use std::time::Instant;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
-    ERROR_SHARING_VIOLATION,
+    ERROR_SHARING_VIOLATION, HANDLE, WAIT_OBJECT_0,
 };
-use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, INFINITE, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+};
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
@@ -34,9 +37,54 @@ pub(super) struct VerifiedInstaller {
     _file_lock: std::fs::File,
 }
 
+/// 已启动的安装器进程（`SEE_MASK_NOCLOSEPROCESS` 取回）：Drop 关闭句柄，
+/// [`wait_for_exit_code`](Self::wait_for_exit_code) 等它收场。
+///
+/// 为什么必须由更新子进程持有并等待：更新走静默安装，`installer.iss` 的 `[Run]` 条目
+/// 已带 `skipifsilent`，安装成功后不再有人拉起组件；而「安装器起来了但没能成功收尾」
+/// （复制阶段失败、目标文件被杀软占用、安装器崩溃/回滚）时 `[Run]` 根本不执行，旧实例
+/// 早在 EXIT_MAIN 时已退出让出 exe 映像——没有人再拉起组件，用户看到的是「刚点了
+/// 『是』，程序就人间蒸发」。等它收场并拿到退出码，这次交接才有确定的落点。
+pub(super) struct InstallerProcess(HANDLE);
+
+impl InstallerProcess {
+    /// 等安装器收场并读 Inno 退出码；`None` 表示等待或取码失败（结果未知）。
+    ///
+    /// 无超时的 `INFINITE` 是刻意的：安装器未收场前重新拉起组件没有意义——那时它正处在
+    /// `ssInstall`（`installer.iss` 的 `CurStepChanged`）会主动终止同名实例，提前拉起
+    /// 只会被杀掉，反而留下「装完之后组件不在」。官方退出码表：0 = 成功跑完；其余任何值
+    /// 都表示没跑完（初始化失败 / 取消 / 致命错误 / 回滚）；调用方对「非 0」与
+    /// 「取不到」同一处置。
+    pub(super) fn wait_for_exit_code(self) -> Option<u32> {
+        // SAFETY: 句柄由成功的 ShellExecuteExW + SEE_MASK_NOCLOSEPROCESS 唯一取得，本类型
+        // 是它的唯一持有者（Drop 中关闭一次，此处不关闭）。两个 API 都只读该句柄指向的
+        // 进程状态，不消费句柄；`code` 为本地 u32。
+        unsafe {
+            if WaitForSingleObject(self.0, INFINITE) != WAIT_OBJECT_0 {
+                return None;
+            }
+            let mut code = 0u32;
+            GetExitCodeProcess(self.0, &mut code).ok()?;
+            Some(code)
+        }
+    }
+}
+
+impl Drop for InstallerProcess {
+    fn drop(&mut self) {
+        // SAFETY: 句柄来自成功的 ShellExecuteExW，且本类型是它的唯一持有者，仅关闭一次。
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// 启动安装器失败的三种归因；成功的一侧由 [`InstallerProcess`] 承载。
+///
+/// 刻意不含「已启动」这样的单位变体：启动成功后调用方拿到的是进程句柄，于是
+/// 「拿到了启动成功却忘了等它收场」在类型上就写不出来。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum InstallerLaunch {
-    Started,
     Cancelled,
     Failed(u32),
     /// 启动失败但 `Err` 不带裸 Win32 码（HRESULT 非 `FACILITY_WIN32`，或裸码恰为 0）。
@@ -259,14 +307,19 @@ pub(super) fn relaunch_main_app() {
 /// 启动安装器，对「文件正被外部进程占用」类瞬态错误（典型为杀软实时扫描
 /// 刚写完的安装包）做有限次重试；只读锁保持到最后一次尝试结束后才释放，
 /// 它不与映像加载器冲突，重试只针对外部占用者。
-pub(super) fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
+///
+/// 只覆盖「启动」这一段：成功后返回进程句柄，等待收场由调用方按
+/// [`InstallerProcess::wait_for_exit_code`] 进行，因此重试判据里不含任何等待时长。
+pub(super) fn launch_installer(
+    verified: VerifiedInstaller,
+) -> Result<InstallerProcess, InstallerLaunch> {
     let mut attempt = 1;
     let result = loop {
         match try_launch_installer(&verified.path) {
-            InstallerLaunch::Started => break InstallerLaunch::Started,
-            other => {
+            Ok(process) => break Ok(process),
+            Err(other) => {
                 if !is_transient_launch_error(&other) || attempt >= INSTALLER_LAUNCH_MAX_ATTEMPTS {
-                    break other;
+                    break Err(other);
                 }
             }
         }
@@ -275,6 +328,9 @@ pub(super) fn launch_installer(verified: VerifiedInstaller) -> InstallerLaunch {
             INSTALLER_LAUNCH_RETRY_DELAY_MS,
         ));
     };
+    // 影像加载器已在本进程创建成功时就拿到了文件，此后不必继续持有只读锁；
+    // 尤其不把它带进接下来的「等安装器收场」——那段时间可能长达数秒到数分钟，
+    // 没有理由让已校验的安装包在这期间被本进程锁住。
     drop(verified);
     result
 }
@@ -287,18 +343,28 @@ fn is_transient_launch_error(launch: &InstallerLaunch) -> bool {
     )
 }
 
-fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
+fn try_launch_installer(path: &std::path::Path) -> Result<InstallerProcess, InstallerLaunch> {
     let path_wide = os_to_wide(path.as_os_str());
-    let verb_wide = to_wide("runas");
     let params_wide = to_wide("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
 
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        // 失败时抑制 Shell 自带错误框（如「另一个程序正在使用此文件」）：
-        // 重试期间会连弹多个标准错误框，且与子进程的 show_error 形成双重
-        // 弹窗；统一由子进程报告错误码。
-        fMask: SEE_MASK_FLAG_NO_UI,
-        lpVerb: PCWSTR(verb_wide.as_ptr()),
+        // NOCLOSEPROCESS：取回安装器进程句柄，等它收场并读退出码（见 InstallerProcess）。
+        // 失败时抑制 Shell 自带错误框（如「另一个程序正在使用此文件」）：重试期间会连弹
+        // 多个标准错误框，且与子进程的 show_error 形成双重弹窗；统一由子进程报告错误码。
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS,
+        // 刻意不给 lpVerb（用默认动词）。"runas" 会让安装器从第一条指令起就是提权态，
+        // Inno 的 SetupLdr 因此没有机会用原始凭据跑过任何代码，`[Run]` 的
+        // `runasoriginaluser`（postinstall 的默认身份）随之失效——组件被安装器的管理员
+        // token 拉起成 high IL，UIPI 切断它与 explorer 之间全部窗口消息交互
+        // （TaskbarCreated 广播、WM_SETTINGCHANGE、--quit 的 PostMessageW），看门狗机制
+        // 整体失效。默认动词下由 SetupLdr 自己提权（`installer.iss` 未设
+        // PrivilegesRequired，取默认 admin；stub 的应用 manifest 是 asInvoker），它先以
+        // 原始凭据跑过一段代码，`runasoriginaluser` 才真正生效。
+        // 代价：UAC 取消不再由 ShellExecuteExW 同步返回 ERROR_CANCELLED——它发生在
+        // SetupLdr 内部，改由「等进程退出 + 非 0 退出码」这条路径覆盖（见
+        // update::complete_update_interaction）。
+        lpVerb: PCWSTR::null(),
         lpFile: PCWSTR(path_wide.as_ptr()),
         lpParameters: PCWSTR(params_wide.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
@@ -306,14 +372,21 @@ fn try_launch_installer(path: &std::path::Path) -> InstallerLaunch {
     };
 
     // SAFETY:
-    // path_wide、verb_wide 和 params_wide 都是 NUL 终止的 UTF-16 缓冲区，并在
-    // ShellExecuteExW 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体
-    // 实际大小一致；fMask 仅含 SEE_MASK_FLAG_NO_UI，不含需要调用方提供额外
-    // 指针或接管进程句柄的掩码。
+    // path_wide 和 params_wide 都是 NUL 终止的 UTF-16 缓冲区，并在 ShellExecuteExW
+    // 同步读取 SHELLEXECUTEINFOW 期间保持存活。cbSize 与结构体实际大小一致；fMask 不含
+    // 需要调用方提供额外指针的掩码，NOCLOSEPROCESS 要求调用方接管 hProcess，由
+    // InstallerProcess 的 Drop 关闭。
     match unsafe { ShellExecuteExW(&mut sei) } {
-        Ok(()) => InstallerLaunch::Started,
+        // 成功但不返回进程句柄（NOCLOSEPROCESS 下理论上只可能出现在「复用既有实例」的
+        // 转发路径上）：不能等、也就无从判断收场结果，按启动失败归因并留痕；调用方对它的
+        // 处置与其它启动失败一致（重新拉起主程序），不会留下「无人拉起」。
+        Ok(()) if sei.hProcess.is_invalid() => {
+            log_event!("安装器启动返回成功但未提供进程句柄，无法等待其收场");
+            Err(InstallerLaunch::FailedWithoutCode)
+        }
+        Ok(()) => Ok(InstallerProcess(sei.hProcess)),
         // 失败分类读 Err 自带的码，不再裸读 last-error（见 classify_launch_hresult）。
-        Err(e) => classify_launch_hresult(e.code().0 as u32),
+        Err(e) => Err(classify_launch_hresult(e.code().0 as u32)),
     }
 }
 
@@ -364,7 +437,8 @@ mod tests {
 
     #[test]
     fn test_permanent_launch_errors_are_not_retried() {
-        assert!(!is_transient_launch_error(&InstallerLaunch::Started));
+        // 「启动成功不重试」这一条不再在这里断言：它已由类型接管——`InstallerLaunch`
+        // 只描述启动失败，启动成功返回的是 `InstallerProcess`，压根进不了本判据。
         assert!(!is_transient_launch_error(&InstallerLaunch::Cancelled));
         assert!(!is_transient_launch_error(&InstallerLaunch::Failed(5)));
         assert!(!is_transient_launch_error(&InstallerLaunch::Failed(2)));
@@ -404,6 +478,29 @@ mod tests {
         assert_eq!(
             classify_launch_hresult(0x8007_0000),
             InstallerLaunch::FailedWithoutCode
+        );
+    }
+
+    // ===== 安装器收场等待 =====
+
+    /// 用真实进程钉死「等收场 + 读退出码」这条 API 路径。
+    ///
+    /// 安装器本体没法在单测里跑（要真机、要 UAC），但 `InstallerProcess` 的等待与取码
+    /// 不依赖安装器：任意已退出进程都覆盖同一段代码，同时钉住两点——退出码**原样**取回
+    /// （非 0 正是「未成功收场」那条日志分支的判据），以及句柄所有权真的归本类型
+    /// （`into_raw_handle` 移交后由 Drop 唯一关闭）。
+    #[test]
+    fn test_wait_for_exit_code_reads_real_process_status() {
+        use std::os::windows::io::IntoRawHandle;
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "7"])
+            .spawn()
+            .expect("必须能启动 cmd.exe");
+        let process = InstallerProcess(HANDLE(child.into_raw_handle()));
+        assert_eq!(
+            process.wait_for_exit_code(),
+            Some(7),
+            "已退出进程的退出码必须原样取回"
         );
     }
 
