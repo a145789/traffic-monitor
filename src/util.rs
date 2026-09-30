@@ -1,12 +1,12 @@
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Memory::{GetProcessHeaps, HEAP_FLAGS, HeapCompact};
 use windows::Win32::System::Power::HPOWERNOTIFY;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW, OpenMutexW, OpenProcess,
-    OpenProcessToken, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    CreateMutexW, GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW, OpenMutexW,
+    OpenProcess, OpenProcessToken, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
     PROCESS_QUERY_LIMITED_INFORMATION, ProcessMemoryPriority, ProcessPowerThrottling,
     SYNCHRONIZATION_SYNCHRONIZE, SetProcessInformation, SetProcessWorkingSetSize,
@@ -170,6 +170,49 @@ fn token_is_elevated(token: HANDLE) -> Option<bool> {
         .ok()?;
     }
     Some(info.TokenIsElevated != 0)
+}
+
+/// 创建并独占一个命名互斥量；同名已存在（另一进程持有）或创建失败都返回 `None`。
+///
+/// 全项目唯一的 `CreateMutexW` 调用点，收口这条 API 非直觉的判重协议：命中「同名已
+/// 存在」时它返回的是 `Ok`，`ERROR_ALREADY_EXISTS` 由紧接其后读取的 last-error
+/// 带外输出，**不在** `Err` 分支上——因此判定必须紧贴创建调用，中间不得插入其它会
+/// 覆盖 last-error 的 Win32 调用。
+///
+/// 两种失败成因（已存在 / 创建失败）返回值相同，语义差异由 `on_create_error` 在调用点
+/// 表达：主进程单例锁创建失败弹框后致命退出，更新子进程互斥量创建失败只记日志并按
+/// 「已被占用」静默收尾。`name` 参数化是为了让测试用专属名字覆盖「第二次申请必须报
+/// 占用」，而不与真实运行中的进程抢同一个会话级对象。
+///
+/// `name` 须以 NUL 结尾：`config` 中的常量自带尾 NUL，测试名由 `format!` 显式补上。
+pub fn acquire_exclusive_mutex(
+    name: &str,
+    on_create_error: impl FnOnce(windows::core::Error),
+) -> Option<crate::ffi_guard::MutexGuard> {
+    debug_assert!(name.ends_with('\0'), "互斥量名必须以 NUL 结尾");
+    let mutex_name: Vec<u16> = name.encode_utf16().collect();
+    // SAFETY: mutex_name 以 NUL 结尾，且在本函数返回前保持存活与不可变；CreateMutexW
+    // 只同步读取缓冲区，不保留指针。成功返回的句柄是全新取得的独占所有权，经下面互斥的
+    // 两条分支移入 MutexGuard 或就地关闭，各只执行一次。
+    let handle = match unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) } {
+        Ok(handle) => handle,
+        Err(e) => {
+            on_create_error(e);
+            return None;
+        }
+    };
+    // SAFETY: 紧接 CreateMutexW 读取 last-error，中间无其它可覆盖它的 Win32 调用。
+    // 勿改为读返回的 Err：ERROR_ALREADY_EXISTS 是这条 API 文档指定的带外输出通道，
+    // 命中「已有实例」时 CreateMutexW 恰恰返回 Ok，Err 分支上根本没有它。
+    let last = unsafe { GetLastError() };
+    if last == ERROR_ALREADY_EXISTS {
+        // 重复路径：句柄不交给 MutexGuard，须在此自行关闭，避免「拿到句柄却不归还」
+        // 这条与 RAII 归属相反的路径。
+        // SAFETY: handle 由紧邻的 CreateMutexW 成功返回，仅关闭一次。
+        let _ = unsafe { CloseHandle(handle) };
+        return None;
+    }
+    Some(crate::ffi_guard::MutexGuard(handle))
 }
 
 /// 单例互斥量当前是否存在：组件实例是否在跑的唯一探针。

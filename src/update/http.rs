@@ -266,10 +266,15 @@ pub(super) fn fetch_url(
 /// 本函数不产出校验结论：安装包是否可信的唯一裁决是锁定句柄的重算哈希
 ///（`installer::fetch_verified_installer`），下载期不做第二份比对。
 /// 失败返回结构化错误：抓取段（建连/发送/接收/状态码/查询/读取/超限）为
-/// `Download`（可回落代理），写入段为 `Local`（磁盘本地故障，不回落，
-/// 避免空耗整包流量），取消为独立变体 [`FetchFileError::Cancelled`]（不得回落、
-/// 不得重试）。文案均带中文 `op`，调用方按变体映射到回落决策，
-/// 不要匹配文案猜来源。
+/// `Download`，写入段为 `Local`，取消为独立变体 [`FetchFileError::Cancelled`]。
+/// 文案均带中文 `op`，调用方按变体映射到回落决策，不要匹配文案猜来源。
+///
+/// 回落决策（按变体映射的唯一消费方是 `update::do_update_check`）：
+/// - `Download`：可回落第三方代理重下。
+/// - `Local`：本地故障（创建、流式写盘、锁定、锁柄重验），直接返回不再回落——
+///   否则持续的本地磁盘故障会为空耗整包流量再失败一次。哪些失败算本地由构造点
+///   表达（`installer::fetch_verified_installer` 自行构造 `Local`），不靠枚举名区分来源。
+/// - `Cancelled`：既不是网络失败也不是本地失败，不回落、不重试，调用方静默放弃。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FetchFileError {
     Download(String),
