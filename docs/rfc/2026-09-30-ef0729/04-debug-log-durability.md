@@ -40,7 +40,7 @@ Status: proposed
 - 去重用例（唯一必须项）：`reembed` 的去重逻辑纯函数化后离线可测（同名 `test_*_dedup` 语义：同一失败原因连续 N 次只产出 1 条记录，原因变化产出新记录）；`grep -n "只记首条\|上次失败" src/window.rs` 能看出该意图。
 - 若将来解冻提案 2/3：`grep -n "OnceLock\|Mutex<Option<File>>" src/util.rs` 与 `grep -n "ReplaceFileW\|fs::rename" src/util.rs` 各自能定位实现，且 `grep -n "metadata" src/util.rs` 必须仍然命中长度检查（不得退化为进程内计数）。
 - 新增用例：`reembed` 的去重逻辑纯函数化后离线可测（同名 `test_*_dedup` 语义：同一失败原因连续 N 次只产出 1 条记录，原因变化产出新记录）。
-- 人工清单补一条：两个进程同时写日志并触发截断（开日志 + 竖排任务栏复现刷屏），事后检查 `debug.log` 无半行、且另一进程的行不是被整段吞掉。
+- 人工清单补一条（属**暂缓**的提案 2/3，本笔记实施时不做）：两个进程同时写日志并触发截断（开日志 + 竖排任务栏复现刷屏），事后检查 `debug.log` 无半行、且另一进程的行不是被整段吞掉。
 - `cargo test --locked`、`cargo clippy --all-targets --locked -- -D warnings` 全绿；`README.md` 中"超过 256 KB 只保留尾部一半""连续 3 次写盘失败自动停写"两句无需改动即可继续成立。
 
 ## 风险

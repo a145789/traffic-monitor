@@ -75,6 +75,29 @@ pub fn dpi_scaled(base: i32, dpi: u32) -> i32 {
     ((base as f64) * (dpi as f64) / 96.0).round() as i32
 }
 
+/// 把 `windows::core::Error` 携带的 `HRESULT` 折回裸 Win32 错误码。
+///
+/// `HRESULT_FROM_WIN32(code)` 的形状是 `0x8007_0000 | code`，故只有高位是
+/// `FACILITY_WIN32` 前缀时才有裸码可取；其余（如 `E_HANDLE`、`E_INVALIDARG`）返回
+/// `None`。必须经它比较，不能直接拿 `HRESULT` 去比 `ERROR_*` 常量——两者不是同一个
+/// 数值空间。
+///
+/// 唯一用途：让 `Err` 自带的错误码成为唯一来源，调用点不再裸读 `GetLastError()`。
+/// 裸读会把「crate 内部不会插入其它 Win32 调用」这个没有任何人承诺过的前提变成
+/// 正确性依赖；`Err` 已经带了码，再读一次是同一事实的重复表示。
+pub fn win32_code_from_hresult(code: u32) -> Option<u32> {
+    const FACILITY_WIN32_HRESULT_PREFIX: u32 = 0x8007_0000;
+    (code & 0xFFFF_0000 == FACILITY_WIN32_HRESULT_PREFIX).then_some(code & 0xFFFF)
+}
+
+/// 取错误码用于日志：能折回裸 Win32 码就用裸码，否则回落到 `HRESULT` 原文——
+/// 取不到码时也不能让日志空掉（`win32_code_from_hresult` 为 `None` 的那一类
+/// `Err` 正是最需要原样留痕的）。
+pub fn win32_error_code(err: &windows::core::Error) -> u32 {
+    let hresult = err.code().0 as u32;
+    win32_code_from_hresult(hresult).unwrap_or(hresult)
+}
+
 /// `HWND` 的原子存储：「0 为空位」约定与内存序配对收口一处。
 ///
 /// - `store`（Release）：发布新句柄。
@@ -640,5 +663,17 @@ mod tests {
         assert!(kept.ends_with(b"tail\n"), "截断后本次行必须保留");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_win32_code_from_hresult_folds_only_facility_win32() {
+        // ERROR_CANCELLED(1223) / ERROR_FILE_NOT_FOUND(2) 的 HRESULT 必须折回裸码：
+        // 三个调用点靠裸码比较分支，折不出来就会落进保守分支。
+        assert_eq!(win32_code_from_hresult(0x8007_04C7), Some(1223));
+        assert_eq!(win32_code_from_hresult(0x8007_0002), Some(2));
+        // 非 FACILITY_WIN32 的 HRESULT 无裸码可取，必须返回 None 而不是 0
+        // （当作 0 会被误判成某个具体分支）。
+        assert_eq!(win32_code_from_hresult(0x8000_4005), None); // E_FAIL
+        assert_eq!(win32_code_from_hresult(0x8007_0000), Some(0));
     }
 }

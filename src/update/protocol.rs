@@ -33,7 +33,7 @@ use windows::core::PCWSTR;
 
 use crate::config::{PARENT_PID_ARG, PARENT_START_ARG, UPDATE_MUTEX_NAME, WM_USER_UPDATE_ACTION};
 use crate::state::UPDATE_IN_PROGRESS;
-use crate::util::log_event;
+use crate::util::{log_event, win32_code_from_hresult, win32_error_code};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UpdateAction {
@@ -295,6 +295,8 @@ fn acquire_named_mutex(name: &str) -> Option<crate::ffi_guard::MutexGuard> {
         }
     };
     // SAFETY: 紧接 CreateMutexW 读取 last-error，中间无其他可覆盖它的 Win32 调用。
+    // 勿改为读返回的 Err：ERROR_ALREADY_EXISTS 是这条 API 文档指定的带外输出通道，
+    // 命中「已有实例」时 CreateMutexW 恰恰返回 Ok，Err 分支上根本没有它。
     let last = unsafe { GetLastError() };
     if last == ERROR_ALREADY_EXISTS {
         // 重复路径：句柄不交给 MutexGuard，须在此自行关闭（与单例锁同一写法）。
@@ -364,17 +366,22 @@ impl ParentProbe {
         let opened = unsafe { OpenProcess(access, false, pid) };
         let handle = match opened {
             Ok(handle) => handle,
-            Err(_) => {
-                // SAFETY: 紧接失败的 OpenProcess 读取 last-error，中间无其他 Win32 调用。
-                let last = unsafe { GetLastError() };
+            Err(e) => {
+                // 错误码取自 Err 自带的那份（crate 在 `BOOL → Err` 时已读过 last-error），
+                // 不再裸读一次；取不到裸码（None）落在下面的保守侧。
                 return Self {
-                    state: if last == ERROR_INVALID_PARAMETER {
+                    state: if win32_code_from_hresult(e.code().0 as u32)
+                        == Some(ERROR_INVALID_PARAMETER.0)
+                    {
                         // 号段不存在：父进程已消失。
                         ParentState::Gone
                     } else {
                         // 无权限等原因无法判定：保守按「仍在」处理。判错方向的代价不对称——
                         // 误判「已消失」会让一次用户/系统已发起的更新被静默放弃。
-                        log_event!("父身份探测失败 (0x{:08X})，本次不做父进程存活检查", last.0);
+                        log_event!(
+                            "父身份探测失败 (0x{:08X})，本次不做父进程存活检查",
+                            win32_error_code(&e)
+                        );
                         ParentState::Unbound
                     },
                 };

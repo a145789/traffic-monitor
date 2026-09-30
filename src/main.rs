@@ -182,7 +182,7 @@ fn quit_existing_instance() {
     }
 }
 
-/// 创建单例互斥量。已存在实例（重复启动）静默返回 None；创建本身失败弹框后
+/// 获取单实例锁。已存在实例（重复启动）静默返回 None；锁创建本身失败弹框后
 /// 返回 None。两种情况 `main()` 都直接退出，与提取前的早退路径一一对应。
 fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
     // MUTEX_NAME 常量已含尾 NUL。
@@ -193,6 +193,8 @@ fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
     match mutex_handle {
         Ok(handle) => {
             // SAFETY: 紧接 CreateMutexW 读取 last-error，避免被中间调用覆盖。
+            // 勿改为读返回的 Err：ERROR_ALREADY_EXISTS 是这条 API 文档指定的带外输出，
+            // 命中「已有实例」时 CreateMutexW 恰恰返回 Ok，Err 分支上根本没有它。
             let last_error = unsafe { GetLastError() };
             if last_error == ERROR_ALREADY_EXISTS {
                 // 重复实例：句柄不会交给 MutexGuard，须在此自行关闭，避免
@@ -204,7 +206,10 @@ fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
             Some(crate::ffi_guard::MutexGuard(handle))
         }
         Err(_) => {
-            show_error("创建单例互斥量失败");
+            // 这一支到不了「已有实例」的情况（那支在 Ok 分支里静默返回 None），所以文案
+            // 不能写成「程序已在运行」——那会把用户指向一个没有用的动作。只说创建失败与
+            // 下一步；「互斥量」是实现名词，用户无法据此行动，换成人话。
+            show_error("无法启动程序：创建单例锁失败，请重新启动程序；若反复出现请重启系统");
             None
         }
     }
@@ -280,6 +285,7 @@ fn main() {
     let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     if taskbar_msg == 0 {
         // SAFETY: 紧随 RegisterWindowMessageW，未插入其他可改写 last-error 的调用。
+        // 勿改为读返回的 Err：该 API 返回 u32 且以 0 表示失败，没有 Err 可取。
         let last = unsafe { GetLastError() };
         show_error(&format!("注册 TaskbarCreated 消息失败: 0x{:08X}", last.0));
     }
@@ -373,6 +379,7 @@ fn run_message_loop() {
             match GetMessageW(&mut msg, None, 0, 0).0 {
                 0 => break,
                 -1 => {
+                    // 勿改为读返回的 Err：GetMessageW 返回 BOOL，失败以 -1 表达，没有 Err 可取。
                     let last = GetLastError();
                     show_error(&format!("消息循环 GetMessageW 致命错误: 0x{:08X}", last.0));
                     break;

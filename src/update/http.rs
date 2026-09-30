@@ -10,7 +10,7 @@ use windows::Win32::Networking::WinHttp::*;
 use windows::core::{PCWSTR, w};
 
 use crate::config::{APP_TITLE, HTTP_READ_CHUNK_BYTES, HTTP_TIMEOUT_MS};
-use crate::util::to_wide;
+use crate::util::{to_wide, win32_code_from_hresult};
 
 const HTTP_OK: u32 = 200;
 
@@ -36,11 +36,6 @@ impl Drop for WinHttpHandles {
             }
         }
     }
-}
-
-fn win32_code_from_hresult(code: u32) -> Option<u32> {
-    const FACILITY_WIN32_HRESULT_PREFIX: u32 = 0x8007_0000;
-    (code & 0xFFFF_0000 == FACILITY_WIN32_HRESULT_PREFIX).then_some(code & 0xFFFF)
 }
 
 fn friendly_error(op: &str, err: windows::core::Error) -> String {
