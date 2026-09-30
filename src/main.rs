@@ -16,11 +16,8 @@ mod util;
 mod window;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
-};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -297,35 +294,16 @@ fn relay_via_shell() -> bool {
 
 /// 获取单实例锁。已存在实例（重复启动）静默返回 None；锁创建本身失败弹框后
 /// 返回 None。两种情况 `main()` 都直接退出，与提取前的早退路径一一对应。
+///
+/// 判重协议本身收口在 `util::acquire_exclusive_mutex`（全项目唯一的 `CreateMutexW`
+/// 调用点）；本函数只保留「创建失败＝致命，弹框后退出」这一处置。
 fn init_single_instance() -> Option<crate::ffi_guard::MutexGuard> {
-    // MUTEX_NAME 常量已含尾 NUL。
-    let mutex_name: Vec<u16> = crate::config::MUTEX_NAME.encode_utf16().collect();
-    // SAFETY: mutex_name 以 NUL 结尾；句柄由 MutexGuard 关闭。
-    let mutex_handle = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) };
-
-    match mutex_handle {
-        Ok(handle) => {
-            // SAFETY: 紧接 CreateMutexW 读取 last-error，避免被中间调用覆盖。
-            // 勿改为读返回的 Err：ERROR_ALREADY_EXISTS 是这条 API 文档指定的带外输出，
-            // 命中「已有实例」时 CreateMutexW 恰恰返回 Ok，Err 分支上根本没有它。
-            let last_error = unsafe { GetLastError() };
-            if last_error == ERROR_ALREADY_EXISTS {
-                // 重复实例：句柄不会交给 MutexGuard，须在此自行关闭，避免
-                // 「拿到句柄却不归还」这条与 RAII 归属相反的路径。
-                // SAFETY: handle 由紧邻的 CreateMutexW 成功返回，仅关闭一次。
-                let _ = unsafe { CloseHandle(handle) };
-                return None;
-            }
-            Some(crate::ffi_guard::MutexGuard(handle))
-        }
-        Err(_) => {
-            // 这一支到不了「已有实例」的情况（那支在 Ok 分支里静默返回 None），所以文案
-            // 不能写成「程序已在运行」——那会把用户指向一个没有用的动作。只说创建失败与
-            // 下一步；「互斥量」是实现名词，用户无法据此行动，换成人话。
-            show_error("无法启动程序：创建单例锁失败，请重新启动程序；若反复出现请重启系统");
-            None
-        }
-    }
+    crate::util::acquire_exclusive_mutex(crate::config::MUTEX_NAME, |_e| {
+        // 这一支到不了「已有实例」的情况（那支静默返回 None），所以文案不能写成
+        // 「程序已在运行」——那会把用户指向一个没有用的动作。只说创建失败与下一步；
+        // 「互斥量」是实现名词，用户无法据此行动，换成人话。
+        show_error("无法启动程序：创建单例锁失败，请重新启动程序；若反复出现请重启系统");
+    })
 }
 
 fn main() {

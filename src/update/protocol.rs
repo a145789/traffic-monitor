@@ -20,20 +20,17 @@ use std::os::windows::process::CommandExt;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, FILETIME, GetLastError, HANDLE,
-    LPARAM, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, LPARAM, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateMutexW, GetCurrentProcess, GetProcessTimes, OpenProcess,
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZATION_SYNCHRONIZE,
-    WaitForSingleObject,
+    CREATE_NO_WINDOW, GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-use windows::core::PCWSTR;
 
 use crate::config::{PARENT_PID_ARG, PARENT_START_ARG, UPDATE_MUTEX_NAME, WM_USER_UPDATE_ACTION};
 use crate::state::UPDATE_IN_PROGRESS;
-use crate::util::{log_event, win32_code_from_hresult, win32_error_code};
+use crate::util::{acquire_exclusive_mutex, log_event, win32_code_from_hresult, win32_error_code};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UpdateAction {
@@ -270,41 +267,15 @@ fn post_update_action_to_watchdog() -> bool {
 /// 子进程启动即申请跨进程更新互斥量：同一会话内只允许一个更新子进程。
 ///
 /// `None` 有两种成因，调用方都按「已被占用」处理（输出 `BUSY` 并以 0 退出）：
-/// 一是 `ERROR_ALREADY_EXISTS`（另一处更新子进程确实在跑），二是互斥量创建本身失败
-/// （环境异常，已在 [`acquire_named_mutex`] 内记日志）。两者的处置方向相同，
-/// 但排查时以日志区分。句柄须活到进程结束——它正是「本进程是唯一更新者」的存活证明。
+/// 一是同名互斥量已被另一处更新子进程持有，二是互斥量创建本身失败（环境异常，
+/// 下面记日志留痕）。两者的处置方向相同，但排查时以日志区分。
+/// 句柄须活到进程结束——它正是「本进程是唯一更新者」的存活证明。
 pub(crate) fn acquire_update_mutex() -> Option<crate::ffi_guard::MutexGuard> {
-    acquire_named_mutex(UPDATE_MUTEX_NAME)
-}
-
-/// 申请一个会话级命名互斥量的独占持有；同名已存在时返回 `None`。
-///
-/// 名字由调用方给出，便于用测试专属名字覆盖「第二次申请必须报占用」这条性质，
-/// 而不去和真实运行中的更新子进程抢同一个会话级对象。
-/// 互斥量创建本身失败同样按「已被占用」收尾：无法确认独占时继续空跑一次完整检查
-/// （还可能弹框）比放弃本轮更糟，且错误冷却会在数分钟后重试；失败原因写日志留痕。
-fn acquire_named_mutex(name: &str) -> Option<crate::ffi_guard::MutexGuard> {
-    // 名字以 NUL 结尾：常量自带尾 NUL，测试用 format! 显式补上。
-    let name_wide: Vec<u16> = name.encode_utf16().collect();
-    // SAFETY: name_wide 以 NUL 结尾；成功时句柄交由 MutexGuard 关闭。
-    let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name_wide.as_ptr())) } {
-        Ok(handle) => handle,
-        Err(e) => {
-            log_event!("创建更新互斥量失败: {e}");
-            return None;
-        }
-    };
-    // SAFETY: 紧接 CreateMutexW 读取 last-error，中间无其他可覆盖它的 Win32 调用。
-    // 勿改为读返回的 Err：ERROR_ALREADY_EXISTS 是这条 API 文档指定的带外输出通道，
-    // 命中「已有实例」时 CreateMutexW 恰恰返回 Ok，Err 分支上根本没有它。
-    let last = unsafe { GetLastError() };
-    if last == ERROR_ALREADY_EXISTS {
-        // 重复路径：句柄不交给 MutexGuard，须在此自行关闭（与单例锁同一写法）。
-        // SAFETY: handle 由紧邻的 CreateMutexW 成功返回，仅关闭一次。
-        let _ = unsafe { CloseHandle(handle) };
-        return None;
-    }
-    Some(crate::ffi_guard::MutexGuard(handle))
+    // 创建失败也按「已被占用」收尾：无法确认独占时继续空跑一次完整检查（还可能弹框）
+    // 比放弃本轮更糟，且错误冷却会在数分钟后重试。
+    acquire_exclusive_mutex(UPDATE_MUTEX_NAME, |e| {
+        log_event!("创建更新互斥量失败: {e}");
+    })
 }
 
 /// `GetProcessTimes` 的 `FILETIME` 转 `u64`（高 32 位在前）。
@@ -727,14 +698,15 @@ mod tests {
         // ffi_guard 内无互斥量用例），以下断言精确，不受并行测试干扰。
         // 计数只证明 Drop 恰好执行一次；OS 层面的真正释放由末尾“释放后可重取”证明。
         let drops_before = crate::ffi_guard::MUTEX_GUARD_DROPS.load(Ordering::SeqCst);
-        let first = acquire_named_mutex(&name).expect("首次申请应成功");
+        let first = acquire_exclusive_mutex(&name, |e| panic!("创建测试互斥量失败: {e}"))
+            .expect("首次申请应成功");
         assert_eq!(
             crate::ffi_guard::MUTEX_GUARD_DROPS.load(Ordering::SeqCst),
             drops_before,
             "持有期间不得发生释放"
         );
         assert!(
-            acquire_named_mutex(&name).is_none(),
+            acquire_exclusive_mutex(&name, |e| panic!("创建测试互斥量失败: {e}")).is_none(),
             "同名互斥量已存在时必须报占用（这就是 BUSY 的来源）"
         );
 
@@ -745,6 +717,9 @@ mod tests {
             drops_before + 1,
             "MutexGuard::drop 必须恰好执行一次"
         );
-        assert!(acquire_named_mutex(&name).is_some(), "释放后应可重新取得");
+        assert!(
+            acquire_exclusive_mutex(&name, |e| panic!("创建测试互斥量失败: {e}")).is_some(),
+            "释放后应可重新取得"
+        );
     }
 }

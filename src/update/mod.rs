@@ -30,9 +30,9 @@ use crate::util::{
 };
 
 use cache::get_temp_installer_path;
-use http::fetch_url;
+use http::{FetchFileError, fetch_url};
 use installer::{
-    FetchFailure, InstallerLaunch, VerifiedInstaller, fetch_verified_installer, launch_installer,
+    InstallerLaunch, VerifiedInstaller, fetch_verified_installer, launch_installer,
     relaunch_main_app, try_reuse_cached_installer, wait_main_instance_gone,
 };
 use protocol::{UpdateContext, reset_update_progress_after_check, run_check_subprocess};
@@ -321,7 +321,7 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
         &still_wanted,
     ) {
         Ok(verified) => CheckResult::InstalledReady(verified),
-        Err(FetchFailure::Download(e)) => {
+        Err(FetchFileError::Download(e)) => {
             let proxy_path = format!("/{GITHUB_REPOSITORY_URL}/{asset_path}");
             match fetch_verified_installer(
                 &temp_path,
@@ -332,20 +332,20 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
                 &still_wanted,
             ) {
                 Ok(verified) => CheckResult::InstalledReady(verified),
-                Err(FetchFailure::Download(pe)) => {
+                Err(FetchFileError::Download(pe)) => {
                     CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
                 }
                 // 主源下载已失败，代理本地失败：两段都报出，不只报后者。
-                Err(FetchFailure::Local(pe)) => {
+                Err(FetchFileError::Local(pe)) => {
                     CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
                 }
                 // 两段都只在父进程消失时取消：静默放弃，不报「代理源失败」的假错误。
-                Err(FetchFailure::Cancelled) => CheckResult::Abandoned,
+                Err(FetchFileError::Cancelled) => CheckResult::Abandoned,
             }
         }
-        Err(FetchFailure::Local(e)) => CheckResult::Error(e),
+        Err(FetchFileError::Local(e)) => CheckResult::Error(e),
         // 取消不是失败：不再回落代理、不再重试。
-        Err(FetchFailure::Cancelled) => CheckResult::Abandoned,
+        Err(FetchFileError::Cancelled) => CheckResult::Abandoned,
     }
 }
 
