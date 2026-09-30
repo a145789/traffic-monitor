@@ -1,6 +1,6 @@
 # Agent Note:收口 CreateMutexW 单例判别协议的双份实现
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

@@ -1,6 +1,6 @@
 # Agent Note:合并 update 模块同构的错误枚举 FetchFileError 与 FetchFailure
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
