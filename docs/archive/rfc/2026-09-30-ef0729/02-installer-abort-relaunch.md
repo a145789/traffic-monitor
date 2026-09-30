@@ -1,6 +1,6 @@
 # Agent Note：安装器没装完就没人再拉起组件——让更新子进程等安装器收场，并把"装完之后"写进验收
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

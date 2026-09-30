@@ -1,6 +1,6 @@
 # Agent Note：固定更新后实例的完整性等级——别让安装器的 [Run] 用管理员 token 拉起组件
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
