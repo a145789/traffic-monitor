@@ -24,6 +24,8 @@ docs/rfc/
 
     Status: proposed      ← 未实施，待办清单
     Status: implemented   ← 已实施，且用户已确认功能可用
+    Status: rejected      ← 复核后否决，不实施（与 implemented 一样移入 docs/archive/）
+    Status: superseded    ← 内容被其它笔记取代或拆分（同样移入 docs/archive/）
 
 （上面是**缩进的示例文本**，故意不写成行首，以免被下面的查询误命中。）
 
