@@ -1,6 +1,6 @@
 # Agent Note：把安装未收场的失败报告给用户
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -22,8 +22,8 @@ Status: proposed
 
 ## 提案
 
-1. `relaunch_main_app_at`（`src/update/installer.rs:356-386`）改为返回 `bool`：它现在只在最后一次尝试失败时 `log_event!`（`:375-381`），返回值即「shell 是否接受了拉起请求」（`>32` 判据在 `:371-374`）。调用点共 8 处——`run_install_handoff` 内 4 处（`:497`、`:505`、`:510`、`:518`）、`src/update/mod.rs` 3 处（`:430`、`:435`、`:455`）、`relaunch_main_app` 转发 1 处（`installer.rs:344`）——新增返回值后各调用点显式消费或以 `let _ =` 显式忽略，不得静默依赖旧签名。
-2. 在 `src/update/installer.rs:492-495` 的「非 0 / 结果未知」分支补一次可见提示，文案只陈述可证明的事实与已做的动作，例如「安装器未跑完（退出码 N）。已尝试重新启动组件，如未出现请手动打开」；拉起失败时改成「安装器未跑完（退出码 N），且组件未能自动重新启动，请手动打开」。
+1. `relaunch_main_app_at`（`src/update/installer.rs:356-386`）改为返回 `bool`：它现在只在最后一次尝试失败时 `log_event!`（`:375-381`），返回值即「shell 是否接受了拉起请求」（`>32` 判据在 `:371-374`）。调用点共 8 处——`run_install_handoff` 内 4 处（`:497`、`:505`、`:510`、`:518`）、`src/update/mod.rs` 3 处（`:430`、`:435`、`:455`）、`relaunch_main_app` 转发 1 处（`installer.rs:344`）——新增返回值后各调用点显式消费或以 `let _ =` 显式忽略，不得静默依赖旧签名。实施后该函数的调用点共 10 处：交接里那处共享调用（`:497`）按去向拆成 3 处（`Some(0)` 静默拉起、非 0 与结果未知各消费返回值以决定文案），`run_install_handoff` 内因此是 6 处（含 `:505`、`:510`、`:518` 三处改用 `let _ =`），10 处全部显式消费或显式忽略。
+2. 在 `src/update/installer.rs:492-495` 的「非 0 / 结果未知」分支补一次可见提示，文案只陈述可证明的事实与已做的动作，例如「安装器未跑完（退出码 N）。已尝试重新启动组件，如未出现请手动打开」；拉起失败时改成「安装器未跑完（退出码 N），且组件未能自动重新启动，请手动打开」。结果未知（`None`：等待超时或取码失败）时没有可陈述的退出码，文案改为陈述该事实（「未取得安装器退出码（等待超时或取码失败）」），不得拼成「退出码 0」——那会被读成「已经跑完了」，与「非 0 才表示未跑完」的判据直接矛盾。
 3. `InstallerLaunch::Cancelled`（`:500-506`）保持静默：默认动词 + asInvoker stub 下这一支近乎不可达（UAC 取消实际走非 0 那支并拿到中性提示），保留静默只是不改变现状、防语义不同的启动期取消。
 4. `Some(0)` 且组件已在跑的成功路径（`:487-489`）继续保持完全静默，不新增任何提示。
 
@@ -45,7 +45,7 @@ Status: proposed
 ## 验收标准
 
 - `grep -n "show_error(" src/update/installer.rs` 命中数由 1 处（`:511`）增至 ≥2 处，且新增处在 `:492-495` 的 `Some(code)` / `None` 分支内。
-- `grep -n "fn relaunch_main_app_at" src/update/installer.rs` 的签名返回 `bool`，且 `run_install_handoff` 内 4 处调用点（`:497`、`:505`、`:510`、`:518`）都消费了返回值。
+- `grep -n "fn relaunch_main_app_at" src/update/installer.rs` 的签名返回 `bool`，且 `run_install_handoff` 内 6 处调用点全部显式消费返回值或以 `let _ =` 显式忽略（`Some(0)`、`Cancelled`、启动失败两支忽略，非 0 与结果未知两支消费返回值以决定文案）。
 - 真机两例：①点「是」后在 UAC 上取消 → 组件回来，且有中性提示；②制造一次静默回滚（安装期间用外部进程占住 `{app}\traffic-monitor.exe`）→ 组件回来且提示写明未跑完。
 - 文案审查：不得出现「安装未完成/没装成/已恢复成功/已修复」这类不可证明的断言；`src/smoke.rs:21-29` 的人工清单补一条「安装未跑完时有可见提示」。
 - 四条门禁全绿（`cargo fmt -- --check`、`cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings`）。

@@ -427,12 +427,12 @@ pub fn install_handoff_main(
     let app_exe = std::path::PathBuf::from(app_exe);
     let Some(installer_path) = installer_path else {
         log_event!("安装交接缺少安装包路径参数，恢复主程序");
-        relaunch_main_app_at(&app_exe);
+        let _ = relaunch_main_app_at(&app_exe);
         return 1;
     };
     let Some(expected_hash_hex) = installer_hash else {
         log_event!("安装交接缺少安装包哈希参数，恢复主程序");
-        relaunch_main_app_at(&app_exe);
+        let _ = relaunch_main_app_at(&app_exe);
         return 1;
     };
 
@@ -452,7 +452,7 @@ pub fn install_handoff_main(
         // 先拉起再弹框：show_error 是模态的，组件不该等用户点掉框才回来。
         // 本分支可达（杀软隔离/占用安装包、缓存被清理），且用户刚在确认框点过「是」，
         // 必须给一个可见交代——只落 debug.log 等于「点了『是』却什么都没发生」。
-        relaunch_main_app_at(&app_exe);
+        let _ = relaunch_main_app_at(&app_exe);
         show_error("更新安装包校验失败，已取消本次安装。\n组件已重新启动，请稍后重试更新。");
         return 1;
     };

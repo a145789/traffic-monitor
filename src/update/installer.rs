@@ -341,7 +341,7 @@ pub(super) fn relaunch_main_app() {
             return;
         }
     };
-    relaunch_main_app_at(&exe);
+    let _ = relaunch_main_app_at(&exe);
 }
 
 /// 以给定路径重新拉起常驻主程序（EXIT_MAIN 发出后安装未能继续，或安装器收场后
@@ -353,7 +353,12 @@ pub(super) fn relaunch_main_app() {
 /// 日志里查不到原因」。`ShellExecuteW` 返回值 ≤32 是它自己的 SE_ERR_* 码
 /// （不是 last-error，故原样记录）；失败重试覆盖「exe 刚写完被杀软实时扫描占用」
 /// 这类可自愈的瞬态，与安装器启动同一对常量。
-pub(super) fn relaunch_main_app_at(exe: &std::path::Path) {
+///
+/// 返回值是「shell 是否接受了拉起请求」（现判据即 `>32`）：`true` = 接受，`false` =
+/// 有限次重试后仍未接受。**它只证明请求被接受，不证明组件真的起来了**，因此调用方
+/// 不得由它推出「已恢复成功」；它的用途是区分「已尽力拉起」与「连拉起请求都没被
+/// 接受，用户只能手动打开」（见 [`settle_failure_message`]）。
+pub(super) fn relaunch_main_app_at(exe: &std::path::Path) -> bool {
     let path_wide = os_to_wide(exe.as_os_str());
     let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
     for attempt in 1..=INSTALLER_LAUNCH_MAX_ATTEMPTS {
@@ -370,19 +375,22 @@ pub(super) fn relaunch_main_app_at(exe: &std::path::Path) {
         };
         // >32 即 shell 接受了请求（该 API 的返回值约定）。
         if result.0 as isize > 32 {
-            return;
+            return true;
         }
         if attempt == INSTALLER_LAUNCH_MAX_ATTEMPTS {
             log_event!(
                 "重新拉起主程序失败: ShellExecuteW 返回 {}（组件不会自动回来）",
                 result.0 as isize
             );
-            return;
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(
             INSTALLER_LAUNCH_RETRY_DELAY_MS,
         ));
     }
+    // `INSTALLER_LAUNCH_MAX_ATTEMPTS` 为 0 时上面一次都没尝试：没有请求被发出，
+    // 就没有请求被接受，按未接受上报（常量现为 3，此支是常量取 0 时的保守落点）。
+    false
 }
 
 /// 把安装交接移交给临时目录里的自身副本进程（模块头说明了为什么必须移交）。
@@ -475,6 +483,11 @@ fn is_transient_sharing_error(e: &std::io::Error) -> bool {
 ///
 /// `app_exe` 是补拉起目标：交接副本传命令行载荷里的主程序安装路径，绝不传
 /// `current_exe()`（副本自身在临时目录）。
+///
+/// 未收场的两种去向（非 0 退出码、结果未知）各弹一次中性提示（措辞见
+/// [`settle_failure_message`]）：它们同时覆盖用户的 UAC 取消与安装器静默回滚，
+/// 而用户刚在确认框点过「是」，只留 debug.log 等于「点了『是』却什么都没发生」。
+/// 收场判据不变，仍以「组件是否在跑」这一客观事实为准。
 pub(super) fn run_install_handoff(verified: VerifiedInstaller, app_exe: &std::path::Path) {
     match launch_installer(verified) {
         Ok(process) => {
@@ -488,26 +501,39 @@ pub(super) fn run_install_handoff(verified: VerifiedInstaller, app_exe: &std::pa
                 log_event!("安装器已成功收场，组件已由安装器拉起，不再重复拉起");
             } else {
                 match exit_code {
-                    Some(0) => log_event!("安装器已成功收场但组件未在跑，重新拉起主程序"),
-                    Some(code) => {
-                        log_event!("安装器未成功收场 (退出码: {code})，重新拉起主程序")
+                    Some(0) => {
+                        // 退出码 0 = 安装器确实跑完了，只是组件没在跑：补拉一次即可，
+                        // 没有可陈述的失败，保持静默。
+                        log_event!("安装器已成功收场但组件未在跑，重新拉起主程序");
+                        let _ = relaunch_main_app_at(app_exe);
                     }
-                    None => log_event!("安装器收场结果未知，重新拉起主程序"),
+                    Some(code) => {
+                        // 非 0 = Setup 没跑完（官方退出码表），用户取消与静默回滚都在这里。
+                        log_event!("安装器未成功收场 (退出码: {code})，重新拉起主程序");
+                        // 先拉起再弹框：show_error 是模态的，组件不该等用户点掉框才回来。
+                        let relaunched = relaunch_main_app_at(app_exe);
+                        show_error(&settle_failure_message(Some(code), relaunched));
+                    }
+                    None => {
+                        log_event!("安装器收场结果未知，重新拉起主程序");
+                        let relaunched = relaunch_main_app_at(app_exe);
+                        show_error(&settle_failure_message(None, relaunched));
+                    }
                 }
-                relaunch_main_app_at(app_exe);
             }
         }
         Err(InstallerLaunch::Cancelled) => {
             // 默认动词下 UAC 取消发生在 SetupLdr 内部，表现为非 0 退出码（走上面
-            // 那一支）；本支保留给 ShellExecuteExW 自身仍返回 ERROR_CANCELLED 的
-            // 场合。主程序已按约定退出，重新拉起应用，避免组件凭空消失。
+            // 那一支并拿到中性提示）；本支保留给 ShellExecuteExW 自身仍返回
+            // ERROR_CANCELLED 的场合，保持静默只是不改变现状。主程序已按约定退出，
+            // 重新拉起应用，避免组件凭空消失。
             log_event!("安装器启动被取消，重新拉起主程序");
-            relaunch_main_app_at(app_exe);
+            let _ = relaunch_main_app_at(app_exe);
         }
         Err(InstallerLaunch::Failed(code)) => {
             log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
             // 先拉起再弹框：show_error 是模态的，组件不该等用户点掉框才回来。
-            relaunch_main_app_at(app_exe);
+            let _ = relaunch_main_app_at(app_exe);
             show_error(&format!("启动安装程序失败 (错误码: {code})"));
         }
         Err(InstallerLaunch::FailedWithoutCode) => {
@@ -515,8 +541,29 @@ pub(super) fn run_install_handoff(verified: VerifiedInstaller, app_exe: &std::pa
             // 用户拿不到任何信息也无法据此行动，所以这一支只写现场日志；
             // 恢复动作（重新拉起主程序）与 `Failed` 完全一致。
             log_event!("安装器启动失败（Err 不带 Win32 错误码），重新拉起主程序");
-            relaunch_main_app_at(app_exe);
+            let _ = relaunch_main_app_at(app_exe);
         }
+    }
+}
+
+/// 安装器未收场时给用户看的提示文案（纯函数，便于钉住措辞）。
+///
+/// 只陈述**可证明的事实与已做的动作**：「未跑完」由非 0 退出码证明（Inno 官方退出码表：
+/// 任何非 0 都表示 Setup 没跑完），拉起一侧的依据是 `ShellExecuteW` 是否接受请求
+/// （见 [`relaunch_main_app_at`]）。因此不写「安装未完成」「已恢复成功」这类断言——
+/// 「非 0 而实际已装成功」的边角存在（接管判据仍以组件是否在跑为准），而请求被接受
+/// 也不等于组件真的起来了。
+fn settle_failure_message(exit_code: Option<u32>, relaunched: bool) -> String {
+    let cause = match exit_code {
+        Some(code) => format!("安装器未跑完（退出码 {code}）"),
+        // 不编造退出码：`None` 的两个成因（等待超时、取码失败）都在括号里说明；
+        // 写成「退出码 0」会被读成「已经跑完了」，与「非 0 才表示未跑完」直接矛盾。
+        None => "未取得安装器退出码（等待超时或取码失败）".to_string(),
+    };
+    if relaunched {
+        format!("{cause}。已尝试重新启动组件，如未出现请手动打开")
+    } else {
+        format!("{cause}，且组件未能自动重新启动，请手动打开")
     }
 }
 
@@ -720,6 +767,34 @@ mod tests {
             classify_launch_hresult(0x8007_0000),
             InstallerLaunch::FailedWithoutCode
         );
+    }
+
+    // ===== 安装未收场的提示文案 =====
+
+    /// 未收场的提示必须带上退出码，并在 shell 没接受拉起请求时点名「只能手动打开」——
+    /// 「已尝试拉起」与「连请求都没被接受」是两支唯一可行动的差别（弹框本身是模态的，
+    /// 不在单测覆盖范围）。
+    #[test]
+    fn settle_failure_message_carries_exit_code_and_relaunch_outcome() {
+        assert_eq!(
+            settle_failure_message(Some(2), true),
+            "安装器未跑完（退出码 2）。已尝试重新启动组件，如未出现请手动打开"
+        );
+        assert_eq!(
+            settle_failure_message(Some(2), false),
+            "安装器未跑完（退出码 2），且组件未能自动重新启动，请手动打开"
+        );
+    }
+
+    /// 结果未知（等待超时/取码失败）不得编造退出码：拼成「退出码 0」会被读成
+    /// 「已经跑完了」，与「非 0 才表示未跑完」的判据直接矛盾。
+    #[test]
+    fn settle_failure_message_does_not_invent_exit_code_when_unknown() {
+        for relaunched in [true, false] {
+            let msg = settle_failure_message(None, relaunched);
+            assert!(!msg.contains("（退出码"), "取不到码时不得拼出退出码: {msg}");
+            assert!(msg.contains("未取得安装器退出码"), "{msg}");
+        }
     }
 
     // ===== 安装器收场等待 =====
