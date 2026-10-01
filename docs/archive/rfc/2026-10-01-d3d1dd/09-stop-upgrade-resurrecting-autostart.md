@@ -1,10 +1,10 @@
 # Agent Note：升级不再复活被用户关闭的开机自启
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
-开机自启的 Run 值有两个写方：安装器的 `[Registry]` 条目（`installer.iss:44`，写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TrafficMonitor`，受 `:41` 的 `startup` 任务控制）与应用的托盘开关（读 `src/tray.rs:277-278`、删 `:282`、写 `:283-290`；路径常量 `src/config.rs:50`，菜单 ID `src/config.rs:224`，分发 `src/tray.rs:266`）。Inno 默认开启 `UsePreviousTasks`（官方：Setup 启动时查注册表判断同一应用是否已安装，是则用上次安装的任务勾选状态作为本次默认），于是：用户在托盘里关掉开机自启（值被删除）→ 下次升级向导里 `startup` 勾选框按记忆仍是勾选 → 用户照常点完向导 → Run 值被重新写回。**用户显式关闭的设置被升级悄悄复活**，对关掉自启的用户每次升级都复现；自动更新走 `/VERYSILENT`（`src/update/installer.rs:564`），静默升级同样按记忆处理任务，复活发生在无人看到的路径上。
+开机自启的 Run 值有两个写方：安装器的 `[Registry]` 条目（`installer.iss:44`，写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TrafficMonitor`，受 `:41` 的 `startup` 任务控制）与应用的托盘开关（读 `src/tray.rs:277-278`、删 `:282`、写 `:283-290`；路径常量 `src/config.rs:50`，菜单 ID `src/config.rs:224`，分发 `src/tray.rs:266`）。Inno 默认开启 `UsePreviousTasks`（官方：Setup 启动时查注册表判断同一应用是否已安装，是则用上次安装的任务勾选状态作为本次默认），于是：用户在托盘里关掉开机自启（值被删除）→ 下次升级向导里 `startup` 勾选框按记忆仍是勾选 → 用户照常点完向导 → Run 值被重新写回。**用户显式关闭的设置被升级悄悄复活**，对关掉自启的用户每次升级都复现；自动更新走 `/VERYSILENT`（`src/update/installer.rs:611`），静默升级同样按记忆处理任务，复活发生在无人看到的路径上。
 
 附带背景（不在本次范围）：该值由提权安装器写 `HKCU`，在「标准用户 + 管理员凭据」场景会落到提权账户的 hive（`installer.iss:21-23` 已用 `UsedUserAreasWarning=no` 抑制 IS 警告并注明知情取舍）。
 

@@ -38,7 +38,7 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"
-Name: "startup"; Description: "开机自动启动"; GroupDescription: "启动选项:"
+Name: "startup"; Description: "开机自动启动"; GroupDescription: "启动选项:"; Flags: checkedonce
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TrafficMonitor"; ValueData: """{app}\traffic-monitor.exe"""; Flags: uninsdeletevalue; Tasks: startup
