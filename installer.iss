@@ -60,10 +60,16 @@ Flags: nowait postinstall runasoriginaluser
 
 [Code]
 // 安装交接实行“先礼后兵”：拷贝阶段前先请求旧实例优雅退出并等待其消失，
-// 仅在超时后才对残留实例做有限次强制终止；强杀永远是兜底而非首选。
-// 顺序证据：拷贝阶段前“优雅退出等待→超时才强杀”——CurStepChanged(ssInstall)
-// 依次调用 RequestGracefulExit、WaitForSingleInstanceGone，
-// 仅当等待超时才调用 ForceKillRemnant。
+// 随后无条件对残留实例做有限次强制终止；强杀永远是兜底而非首选。
+// 顺序证据：拷贝阶段前“优雅退出等待→无条件强杀”——CurStepChanged(ssInstall)
+// 依次调用 RequestGracefulExit、WaitForSingleInstanceGone、ForceKillRemnant。
+// 强杀必须无条件执行而不能以“互斥量仍在”为门：单例互斥量消失只证明主实例退出，
+// 不证明 {app} 下的 exe 映像已无人占用——旧版更新协调者（--check-update 子进程）
+// 刻意不持有单例互斥量，却与主程序共用同一个 exe 映像，它若在复制阶段仍存活，
+// 覆写主程序必然失败（v1.7.1→v1.7.2 升级失败的根因）。新版协调者在把交接移交
+// 给临时副本后早已退出，这一步对它是空操作。
+// 知情代价：无条件执行意味着每次安装/升级（含全新安装）都多跑一轮强杀脚本
+// （无残留时是纯枚举空跑，约 0.5–2 秒）；这是为覆盖旧版协调者残留支付的固定成本。
 const
   // 优雅退出等待上限（毫秒）：与 src/config.rs 的 MAIN_EXIT_WAIT_TIMEOUT_MS 同值同源语义，
   // 两处 Rust 等待（main.rs 的 quit_existing_instance、update 的 wait_main_instance_gone）
@@ -128,12 +134,15 @@ end;
 // 超时兜底：调用外置筛选器（installer\kill-remnant.ps1）终止残留实例，最多重复
 // ForceKillMaxAttempts 轮。按进程名筛选仍覆盖全机器所有同名进程，真正的收窄来自
 // 脚本里的三个必要条件：可执行文件完整路径等于本次升级的 {app}、进程会话等于安装器
-// 所在会话、命令行取得到且不含 --check-update（同目录的更新协调者 re-exec 必须留下）。
+// 所在会话、命令行取得到（命令行内容不参与筛选——旧版更新协调者不持单例互斥量却
+// 占用着待覆写的 exe 映像，必须在复制阶段前一并清掉，见模块头说明）。
 // 本过程只做「少杀」，不做跨会话清理——异会话残留退回安装器原生文件占用提示。
 // 刻意不用 /T 树杀，避免连带其子进程。
 // 脚本路径与 -Expected 只作为参数传给 -File，不拼进 PowerShell 源码，避免引号、
-// %FOO%、中文、8.3 短路径的多层转义。每轮后复查互斥量即为终止结果检查；
-// 若最终仍有残留则直接返回，交由安装器原生文件占用提示处理，本过程不弹框。
+// %FOO%、中文、8.3 短路径的多层转义。每轮的完成判定来自脚本退出码：脚本强杀后
+// 重新枚举自检，仍有匹配残留即非零退出——单例互斥量在这里当不了完成信号（旧版
+// 协调者不持互斥量却占着映像，互斥量消失不代表可以复制）。轮次耗尽仍非零也照常
+// 放行，交由安装器原生文件占用提示处理，本过程不弹框。
 procedure ForceKillRemnant;
 var
   Attempt: Integer;
@@ -150,7 +159,7 @@ begin
   begin
     SetInstallStatus('旧版本无响应，正在结束残留进程…');
     Exec(ExpandConstant('{cmd}'), KillCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    if WaitForSingleInstanceGone(1000) then
+    if ResultCode = 0 then
       Exit;
   end;
 end;
@@ -162,8 +171,10 @@ begin
   if CurStep = ssInstall then
   begin
     RequestGracefulExit;
-    if WaitForSingleInstanceGone(GracefulWaitTimeoutMs) then
-      Exit;
+    // 返回值必须被使用（也顺手把超时告知向导）：优雅等待超时说明旧实例没退干净，
+    // 接下来的强杀轮次是真正在做事，不是空跑。
+    if not WaitForSingleInstanceGone(GracefulWaitTimeoutMs) then
+      SetInstallStatus('旧版本未响应，正在结束残留进程…');
     ForceKillRemnant;
   end;
 end;

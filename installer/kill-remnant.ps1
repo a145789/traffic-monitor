@@ -1,4 +1,4 @@
-﻿# 安装器兜底强杀筛选器：installer.iss 的 ForceKillRemnant 在优雅退出超时后调用。
+﻿# 安装器兜底强杀筛选器：installer.iss 的 ForceKillRemnant 在优雅退出等待后调用。
 #
 # 本文件必须以 UTF-8 BOM 保存：安装器用 Windows PowerShell 5.1（powershell.exe）执行，
 # 无 BOM 时它按 ANSI 代码页解码本文件，中文会变成乱码（且可能吃掉引号）。
@@ -7,7 +7,11 @@
 # 同时满足三个必要条件的进程，任一条件取不到数据一律跳过（保守方向 = 少杀）：
 #   1. 可执行文件的完整路径等于 -Expected，即本次正在升级的那个安装目录；
 #   2. 进程所在会话等于安装器所在会话，挡掉异会话里同路径的实例；
-#   3. 命令行取得到且不含 --check-update——同目录的更新协调者 re-exec 必须保留。
+#   3. 命令行取得到（取不到身份的进程一律不碰）。
+# 命令行内容**不**参与筛选：旧版更新协调者（--check-update 子进程）不持有单例
+# 互斥量，却与主程序共用同一个 exe 映像——它若在复制阶段仍存活，安装器永远无法
+# 覆写主程序（v1.7.1→v1.7.2 升级失败的根因），必须一并清掉；新版协调者在把交接
+# 移交给临时副本后早已退出，本筛选器对它是空操作。
 # 与旧实现（按映像名 + 命令行排除）相比，误伤面从「全机器同名进程」收窄到
 # 「本次升级目标的同会话实例」。本脚本只做「少杀」不做跨会话清理：异会话残留退回
 # 安装器原生的「文件被占用」提示，属预期行为。
@@ -49,8 +53,7 @@ else {
 $targets = @($candidates | Where-Object {
         ($_.ExecutablePath -eq $Expected) -and
         ($_.SessionId -eq $currentSession) -and
-        ($null -ne $_.CommandLine) -and
-        ($_.CommandLine -notlike '*--check-update*')
+        ($null -ne $_.CommandLine)
     })
 
 if ($targets.Count -eq 0) {
@@ -69,3 +72,31 @@ foreach ($target in $targets) {
         taskkill /F /PID $target.ProcessId | Out-Null
     }
 }
+
+# 演练只列清单，不杀也就无需自检。
+if ($DryRun) {
+    exit 0
+}
+
+# 强杀后自检：留出进程对象销毁时间（映像锁随对象销毁释放）再重新枚举一次，
+# 仍有匹配残留即以非零码退出——安装器的重试轮次以此退出码为唯一判定依据。
+# 单例互斥量在这里当不了完成信号：旧版更新协调者不持互斥量却占用着待覆写的
+# exe 映像，互斥量消失不代表可以开始复制。复查枚举失败同样按「未清干净」上报
+# （保守方向），交安装器重试；轮次耗尽仍有残留由安装器原生文件占用提示收场。
+Start-Sleep -Milliseconds 500
+try {
+    $remaining = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            ($_.ExecutablePath -eq $Expected) -and
+            ($_.SessionId -eq $currentSession) -and
+            ($null -ne $_.CommandLine)
+        })
+}
+catch {
+    Write-Output '筛选器：复查枚举失败，按仍有残留上报。'
+    exit 1
+}
+if ($remaining.Count -gt 0) {
+    Write-Output ('筛选器：强杀后仍有 {0} 个残留进程。' -f $remaining.Count)
+    exit 1
+}
+exit 0

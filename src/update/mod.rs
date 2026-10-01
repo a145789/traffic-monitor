@@ -1,5 +1,10 @@
 //! 自动/手动检查更新、下载新版本安装包、SHA-256 校验、UAC 提权覆盖安装。
 //!
+//! 安装交接由临时目录里的自身副本执行（见 [`installer::spawn_install_helper`]）：
+//! 协调者与主程序共用同一 exe 映像，必须先退出让出映像，安装器才能覆写主程序；
+//! 「重验安装包→启动安装器→等收场→按需补拉起」整体在副本进程内完成
+//! （`--update-install` 分支，入口 [`install_handoff_main`]）。
+//!
 
 mod cache;
 mod crypto;
@@ -18,24 +23,27 @@ use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_YESN
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD,
-    INSTALLER_SETTLE_TAKEOVER_WAIT_MS, MAIN_EXIT_POLL_INTERVAL_MS, REG_PATH_APP,
-    UPDATE_FETCH_RETRY_DELAY_MS, UPDATE_WORKER_STACK_BYTES, VERSION, VERSION_METADATA_MAX_BYTES,
+    AUTO_CHECK_COOLDOWN_SECS, AUTO_CHECK_ERROR_COOLDOWN_SECS, DEV_BUILD, MAIN_EXIT_WAIT_TIMEOUT_MS,
+    REG_PATH_APP, UPDATE_FETCH_RETRY_DELAY_MS, UPDATE_WORKER_STACK_BYTES, VERSION,
+    VERSION_METADATA_MAX_BYTES,
 };
 use crate::state::{ENABLE_AUTO_UPDATE, UPDATE_IN_PROGRESS};
 use crate::util::{
     compact_and_trim, configure_background_process, log_event, message_box, refresh_debug_log_flag,
     reg_read_dword, reg_read_string, reg_write_dword, reg_write_string, show_error, show_info,
-    to_wide, wait_main_instance_appear,
+    to_wide,
 };
 
 use cache::get_temp_installer_path;
 use http::{FetchFileError, fetch_url};
 use installer::{
-    InstallerLaunch, VerifiedInstaller, fetch_verified_installer, launch_installer,
-    relaunch_main_app, try_reuse_cached_installer, wait_main_instance_gone,
+    VerifiedInstaller, fetch_verified_installer, relaunch_main_app, relaunch_main_app_at,
+    reverify_installer_for_handoff, run_install_handoff, spawn_install_helper,
+    try_reuse_cached_installer, wait_main_instance_gone,
 };
-use protocol::{UpdateContext, reset_update_progress_after_check, run_check_subprocess};
+use protocol::{
+    ParentProbe, UpdateContext, reset_update_progress_after_check, run_check_subprocess,
+};
 /// 子进程侧协议出口：`--check-update` 分支（`main.rs`）需要自己申请跨进程更新互斥
 /// 并用 `BUSY` 收尾，故这两项提到 `update` 模块边界之外可见。
 pub(crate) use protocol::{acquire_update_mutex, emit_protocol_line};
@@ -353,10 +361,11 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
 ///
 /// stdout 单行协议：
 /// - `DONE`：子进程已处理完毕，主进程继续运行。
-/// - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
-///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才
-///   运行安装器（默认动词启动，提权由 SetupLdr 自己完成），从源头消除「文件正在使用」
-///   竞态；安装器内 taskkill 仅作兜底。
+/// - `EXIT_MAIN`：用户确认安装。必须在子进程移交安装交接**之前**发出——主进程
+///   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后
+///   把安装交接移交给临时目录里的自身副本（协调者与主程序共用同一 exe 映像，不退出
+///   就无法让安装器覆写主程序；默认动词启动，提权由 SetupLdr 自己完成），从源头
+///   消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 /// - 无协议行：R1 静默放弃（父进程已消失且用户未确认），退出码非零。
 ///
 /// 退出码：0 = 检查流程成功完成（含 `EXIT_MAIN` 交接），1 = 检查失败或 R1 静默放弃。
@@ -387,6 +396,101 @@ pub fn subprocess_main(is_manual: bool, parent_pid: Option<u32>, parent_start: O
         // （错误冷却），不会把「没执行」记成「已检查过」。
         SubprocessEnd::Abandoned => 1,
     }
+}
+
+/// `--update-install` 分支入口：安装交接副本进程。
+///
+/// 由 [`spawn_install_helper`] 以临时目录里的自身副本 re-exec，交接载荷（安装包
+/// 路径、期望哈希、补拉起目标）与协调者身份（`--parent-pid`/`--parent-start`）
+/// 经命令行传入。副本不输出协议行、不做 R1 存活检查——R1/R2 不适用：用户已在
+/// 确认框点「是」（R2 已成立），父身份在这里只用于等待协调者退出（见下）。
+///
+/// 退出码：0 = 交接流程走完（安装成功与否都算——失败侧已按客观事实补拉起主程序）；
+/// 1 = 载荷残缺或安装包重验失败（有补拉起目标时已先恢复主程序）。
+pub fn install_handoff_main(
+    installer_path: Option<std::ffi::OsString>,
+    installer_hash: Option<String>,
+    app_exe: Option<std::ffi::OsString>,
+    parent_pid: Option<u32>,
+    parent_start: Option<u64>,
+) -> i32 {
+    configure_background_process();
+    refresh_debug_log_flag();
+
+    // 补拉起目标最先解出：载荷其余部分残缺时也要先把主程序还回来，不能让
+    // 「点完『是』的组件」凭空消失。协调者与副本永远来自同一 exe（副本是协调者
+    // 刚复制出去的自身），载荷残缺只可能来自命令行被外部改动，属防御性分支。
+    let Some(app_exe) = app_exe else {
+        log_event!("安装交接缺少补拉起目标参数，放弃交接");
+        return 1;
+    };
+    let app_exe = std::path::PathBuf::from(app_exe);
+    let Some(installer_path) = installer_path else {
+        log_event!("安装交接缺少安装包路径参数，恢复主程序");
+        relaunch_main_app_at(&app_exe);
+        return 1;
+    };
+    let Some(expected_hash_hex) = installer_hash else {
+        log_event!("安装交接缺少安装包哈希参数，恢复主程序");
+        relaunch_main_app_at(&app_exe);
+        return 1;
+    };
+
+    // 身份绑定不可省略：协调者的校验发生在另一个进程里，本副本若按路径直接启动
+    // 安装器，等于重新打开 TOCTOU 窗口（AGENTS.md：校验后不得仅按路径另开文件
+    // 重新建立信任）。对锁定句柄重算哈希并与期望值比对，验过才持锁启动。
+    //
+    // 这一步刻意排在「等协调者退出」之前：协调者若仍存活，它持有的安装包只读共享锁
+    // 会把第三方写者挡在门外，这次打开因此能落在一个没有写者的窗口里。这只覆盖
+    // 「协调者还没退完」的那一小段时序，不是保证；真正的兜底是
+    // `reverify_installer_for_handoff` 内部的有限次重试。
+    let Some(verified) = reverify_installer_for_handoff(
+        std::path::PathBuf::from(installer_path),
+        &expected_hash_hex,
+    ) else {
+        log_event!("安装交接: 安装包重验失败（缺失/占用/哈希不符），恢复主程序");
+        // 先拉起再弹框：show_error 是模态的，组件不该等用户点掉框才回来。
+        // 本分支可达（杀软隔离/占用安装包、缓存被清理），且用户刚在确认框点过「是」，
+        // 必须给一个可见交代——只落 debug.log 等于「点了『是』却什么都没发生」。
+        relaunch_main_app_at(&app_exe);
+        show_error("更新安装包校验失败，已取消本次安装。\n组件已重新启动，请稍后重试更新。");
+        return 1;
+    };
+    log_event!("安装交接: 安装包重验通过，等待协调者让出 exe 映像");
+
+    // 客观事实门：协调者退出即 {app} 下 exe 映像锁释放。副本等到这一事实再移交
+    // 安装器，不依赖「UAC 弹框留出秒级余量」这类时序假设（UAC 关闭或协调者已提权
+    // 时不成立）。等待有上界：协调者若异常滞留，照常移交，由安装器侧
+    // ForceKillRemnant 与原生文件占用提示兜底；绝不无限等——那会让交接卡死。
+    {
+        let probe = ParentProbe::bind(parent_pid, parent_start);
+        if !probe.is_bound() {
+            // `Unbound`（无身份可查）与 `Gone`（已退出）都会走到这里：两者都无需等待，
+            // 文案不宣称是其中哪一种。
+            log_event!("安装交接: 协调者不在或不可查，不等待，直接移交安装器");
+        } else if probe.wait_for_exit(MAIN_EXIT_WAIT_TIMEOUT_MS as u32) {
+            // 该常量编译期为 5000（见 config），远小于 u32 上限，收窄无损；
+            // WaitForSingleObject 的超时参数本就是 u32（同 INSTALLER_EXIT_WAIT_TIMEOUT_MS
+            // 取 u32 的理由）。
+            log_event!("安装交接: 协调者已退出，exe 映像锁已释放");
+        } else {
+            log_event!("安装交接: 等待协调者退出超时，照常移交安装器（安装器侧兜底）");
+        }
+    }
+
+    // 跨进程更新互斥刻意在「协调者已退出」之后申请：协调者此刻才释放它，这里是确定
+    // 可得；提前到 `main()` 里申请只会拿到「已被占用」（副本还要先加载映像、读注册表，
+    // 协调者多半尚未退完），让整段安装过程都失去这层保护。与 `--check-update` 同一把，
+    // 防止交接窗口内并发的更新检查再启动第二套安装流程。占用/创建失败时交接照常继续
+    // ——本进程是用户确认后的唯一交接者，因互斥量让位等于让已退出的主程序无人接管
+    // （组件蒸发）。guard 活到本函数返回（即交接收尾，进程随即 exit），覆盖的正是安装窗口。
+    let _update_mutex = acquire_update_mutex();
+    if _update_mutex.is_none() {
+        log_event!("安装交接: 更新互斥量被占用或创建失败，继续交接");
+    }
+
+    run_install_handoff(verified, &app_exe);
+    0
 }
 
 /// 子进程本次检查的收尾方式（与协议行 `UpdateAction` 分开：R1 不产出协议行）。
@@ -500,56 +604,25 @@ fn complete_update_interaction(
             }
             wait_main_instance_gone();
 
-            // 「谁负责拉起」由**客观事实**裁决：组件是不是已经在跑（单例互斥量在不在），
-            // 不由安装器退出码也不由 `[Run]` 条目在静默模式下的语义裁决——后两者都没有
-            // 逐字保证，而组件在不在跑这件事在两种语义下都给出正确答案。
-            // 退出码只用来省一次探测：非 0 时 `[Run]` 必然没执行（官方退出码表：任何非 0
-            // 都表示 Setup 没跑完），不必等；0 时才需要确认它在不在。
-            match launch_installer(verified) {
-                Ok(process) => {
-                    let exit_code = process.wait_for_exit_code();
-                    let instance_present = exit_code == Some(0)
-                        && wait_main_instance_appear(
-                            INSTALLER_SETTLE_TAKEOVER_WAIT_MS,
-                            MAIN_EXIT_POLL_INTERVAL_MS,
-                        );
-                    if instance_present {
-                        log_event!("安装器已成功收场，组件已由安装器拉起，不再重复拉起");
-                    } else {
-                        match exit_code {
-                            Some(0) => log_event!("安装器已成功收场但组件未在跑，重新拉起主程序"),
-                            Some(code) => {
-                                log_event!("安装器未成功收场 (退出码: {code})，重新拉起主程序")
-                            }
-                            None => log_event!("安装器收场结果未知，重新拉起主程序"),
-                        }
-                        relaunch_main_app();
-                    }
-                    SubprocessEnd::ExitMain
-                }
-                Err(InstallerLaunch::Cancelled) => {
-                    // 默认动词下 UAC 取消发生在 SetupLdr 内部，表现为非 0 退出码（走上面
-                    // 那一支）；本支保留给 ShellExecuteExW 自身仍返回 ERROR_CANCELLED 的
-                    // 场合。主进程已按约定退出，重新拉起应用，避免组件凭空消失。
-                    log_event!("安装器启动被取消，重新拉起主程序");
+            // 安装交接移交：协调者与主程序是**同一个 exe** 的两个进程，若留在原地等
+            // 安装器收场，复制阶段必然撞上本进程的映像占用（运行中的进程映像不可覆写，
+            // v1.7.1→v1.7.2 升级「装完还是旧版」的根因）。把「重验安装包→启动安装器→
+            // 等收场→按需补拉起」整体移交给临时目录里的自身副本，本进程随即退出让出
+            // 映像；「谁负责拉起」的裁决随移交一起搬进副本（见
+            // `installer::run_install_handoff`）。
+            match spawn_install_helper(&verified) {
+                Ok(()) => log_event!("安装交接已移交给临时副本进程，协调者退出让出 exe 映像"),
+                Err(e) => {
+                    // 副本没起来就没有任何人继续交接：主程序已按约定退出，必须在这里
+                    // 把它还回来。先拉起再弹框——show_error 是模态的，顺序反了会让
+                    // 组件在用户点掉框之前一直缺席。弹框与安装器启动失败同风格，
+                    // 这是本次交接失败的唯一可见提示，不能删。
+                    log_event!("安装交接副本启动失败 ({e})，重新拉起主程序");
                     relaunch_main_app();
-                    SubprocessEnd::ExitMain
-                }
-                Err(InstallerLaunch::Failed(code)) => {
-                    log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
-                    show_error(&format!("启动安装程序失败 (错误码: {code})"));
-                    relaunch_main_app();
-                    SubprocessEnd::ExitMain
-                }
-                Err(InstallerLaunch::FailedWithoutCode) => {
-                    // 取不到裸 Win32 码时 `Failed(0)` 会把这个框拼成「错误码: 0」——
-                    // 用户拿不到任何信息也无法据此行动，所以这一支只写现场日志；
-                    // 恢复动作（重新拉起主程序）与 `Failed` 完全一致。
-                    log_event!("安装器启动失败（Err 不带 Win32 错误码），重新拉起主程序");
-                    relaunch_main_app();
-                    SubprocessEnd::ExitMain
+                    show_error(&format!("启动更新交接失败: {e}"));
                 }
             }
+            SubprocessEnd::ExitMain
         }
         CheckResult::Error(message) => {
             log_event!("更新检查失败: {message}");

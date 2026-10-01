@@ -1,9 +1,11 @@
 //! 子进程协议：stdout 单行动作扫描、EXIT_MAIN 转发、收尾复位判定、父身份绑定与 R1/R2 判定。
 //! stdout 单行协议：
 //! - `DONE`：子进程已处理完毕，主进程继续运行。
-//! - `EXIT_MAIN`：用户确认安装。必须在子进程启动安装器**之前**发出——主进程
-//!   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后才提权
-//!   运行安装器，从源头消除「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
+//! - `EXIT_MAIN`：用户确认安装。必须在子进程移交安装交接**之前**发出——主进程
+//!   看门狗收到并处理后，主进程退出并释放 exe 映像句柄；子进程等单实例互斥量消失后
+//!   把安装交接移交给临时目录里的自身副本（协调者与主程序共用同一 exe 映像，不退出
+//!   就无法让安装器覆写主程序，见 `installer::spawn_install_helper`），从源头消除
+//!   「文件正在使用」竞态；安装器内 taskkill 仅作兜底。
 //! - `BUSY`：另一处更新子进程已持有更新互斥量，本次未执行任何检查。是「有效动作」
 //!   但**不是**成功完成：父侧据此不推进一小时的正常冷却（见 `should_use_error_cooldown`）。
 //!
@@ -147,7 +149,9 @@ pub(super) fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
 /// 取不到自身创建时刻就两参数都不传：子进程必须能复核「打开的是不是同一个进程」，
 /// 只传 PID 反而会让它拿到复用号段的陌生进程并把「父还在」判错（见 [`ParentProbe`]）。
 /// 参数缺失时子进程退化为「无父可查」，不影响手工 `--check-update --manual`。
-fn bind_parent_identity(command: &mut std::process::Command) {
+/// `pub(super)`：安装交接副本的 spawn（`installer::spawn_install_helper`）同样需要
+/// 绑定协调者身份——副本要等协调者退出后才移交安装器（见 `ParentProbe::wait_for_exit`）。
+pub(super) fn bind_parent_identity(command: &mut std::process::Command) {
     // SAFETY: GetCurrentProcess 只返回本进程的伪句柄，不失败、也不需要关闭。
     let this = unsafe { GetCurrentProcess() };
     let Some(start) = process_creation_time(this) else {
@@ -401,6 +405,32 @@ impl ParentProbe {
             // SAFETY: 句柄由 OpenProcess 成功返回且尚未关闭；0 毫秒超时只做一次状态查询，不阻塞。
             ParentState::Bound(handle) => unsafe {
                 WaitForSingleObject(*handle, 0) != WAIT_OBJECT_0
+            },
+        }
+    }
+
+    /// 是否持有已复核身份的父进程句柄（[`Self::bind`] 进入 `Bound` 态）。
+    ///
+    /// 安装交接副本用它区分「等得到协调者」与「无身份可等」：后者（参数缺失或
+    /// 打开失败）没有可等待的对象，日志必须如实说「跳过等待」而不是「已退出」。
+    pub(super) fn is_bound(&self) -> bool {
+        matches!(self.state, ParentState::Bound(_))
+    }
+
+    /// 等待父进程退出，返回是否**观察到**退出。
+    ///
+    /// 安装交接副本专用：协调者退出是「{app} 下 exe 映像锁已释放」的客观事实，
+    /// 副本等到这一事实再移交安装器，不依赖「UAC 弹框留出秒级余量」这类时序假设。
+    /// `Unbound`（无身份可查）与 `Gone`（已退出）无需等待，恒返回 true；
+    /// `Bound` 按句柄阻塞等待，超时返回 false，调用方按「未观察到」自行取舍
+    /// （照常移交，由安装器侧兜底），绝不无限等——那会让交接卡死、组件缺席。
+    pub(super) fn wait_for_exit(&self, timeout_ms: u32) -> bool {
+        match &self.state {
+            ParentState::Unbound | ParentState::Gone => true,
+            // SAFETY: 句柄由 OpenProcess 成功返回且尚未关闭；带超时等待只读进程
+            // 状态，不消费句柄（Drop 统一关闭）。
+            ParentState::Bound(handle) => unsafe {
+                WaitForSingleObject(*handle, timeout_ms) == WAIT_OBJECT_0
             },
         }
     }

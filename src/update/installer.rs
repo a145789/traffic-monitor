@@ -1,15 +1,26 @@
 //! 安装器管线：缓存复用、流式下载、以默认动词启动安装器、等待它收场并读退出码、
-//! 主进程退出等待。
+//! 主进程退出等待、安装交接向临时副本进程的移交。
 //! 不变量：构造 `VerifiedInstaller` 的唯一依据是锁定句柄的重算哈希
 //! （`compute_sha256_hex_locked`），不按路径另开文件。
+//!
+//! 交接移交（[`spawn_install_helper`]）的存在理由：更新协调者与主程序是**同一个
+//! exe 文件**的两个进程，而安装器的复制阶段必须覆写该 exe；运行中的进程映像不可
+//! 覆写也不可删除，协调者若留在原地等安装器收场，复制阶段必然撞上文件占用，
+//! `/VERYSILENT /SUPPRESSMSGBOXES` 下安装器静默失败、旧版本被重新拉起——
+//! v1.7.1→v1.7.2 升级「装完还是旧版」的根因。因此协调者必须在启动安装器前把
+//! 「重验安装包→启动安装器→等收场→按需补拉起」整体移交给临时目录里的自身副本，
+//! 并立即退出让出映像。
 
+use std::os::windows::process::CommandExt;
+use std::process::Stdio;
 use std::time::Instant;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
     ERROR_SHARING_VIOLATION, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    CREATE_NO_WINDOW, GetExitCodeProcess, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
@@ -18,11 +29,15 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
 use crate::config::{
-    INSTALLER_EXIT_WAIT_TIMEOUT_MS, INSTALLER_LAUNCH_MAX_ATTEMPTS, INSTALLER_LAUNCH_RETRY_DELAY_MS,
-    INSTALLER_MAX_BYTES, MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS,
-    RELAUNCHED_BY_UPDATE_ARG,
+    APP_EXE_ARG, INSTALLER_EXIT_WAIT_TIMEOUT_MS, INSTALLER_HASH_ARG, INSTALLER_LAUNCH_MAX_ATTEMPTS,
+    INSTALLER_LAUNCH_RETRY_DELAY_MS, INSTALLER_MAX_BYTES, INSTALLER_PATH_ARG,
+    INSTALLER_SETTLE_TAKEOVER_WAIT_MS, MAIN_EXIT_POLL_INTERVAL_MS, MAIN_EXIT_WAIT_TIMEOUT_MS,
+    RELAUNCHED_BY_UPDATE_ARG, UPDATE_INSTALL_ARG,
 };
-use crate::util::{log_event, os_to_wide, to_wide, win32_code_from_hresult, win32_error_code};
+use crate::util::{
+    log_event, os_to_wide, show_error, to_wide, wait_main_instance_appear, win32_code_from_hresult,
+    win32_error_code,
+};
 
 use super::cache::{create_locked_installer, open_locked_installer};
 use super::crypto::compute_sha256_hex_locked;
@@ -32,6 +47,10 @@ use super::http::{FetchFileError, fetch_to_file};
 pub(super) struct VerifiedInstaller {
     pub(super) version: String,
     path: std::path::PathBuf,
+    /// 校验本安装包所依据的期望哈希（hex，来自 version.txt 元数据）。安装交接移交
+    /// 给临时副本时随路径一并传递，副本据此对同一文件重验身份（AGENTS.md：安装包
+    /// 信任必须绑定到最终启动的同一对象身份）。
+    expected_hash_hex: String,
     // 保持只读共享句柄直到 ShellExecuteExW 返回：拒绝其他进程改写或替换已
     // 校验文件，且不与映像加载器的 FILE_SHARE_READ|FILE_SHARE_DELETE 打开
     // 方式冲突（加载器不容纳并存句柄的写访问权，持写句柄启动必失败 32）。
@@ -41,11 +60,12 @@ pub(super) struct VerifiedInstaller {
 /// 已启动的安装器进程（`SEE_MASK_NOCLOSEPROCESS` 取回）：Drop 关闭句柄，
 /// [`wait_for_exit_code`](Self::wait_for_exit_code) 等它收场。
 ///
-/// 为什么必须由更新子进程持有并等待：更新走静默安装，`installer.iss` 的 `[Run]` 条目
-/// 已带 `skipifsilent`，安装成功后不再有人拉起组件；而「安装器起来了但没能成功收尾」
-/// （复制阶段失败、目标文件被杀软占用、安装器崩溃/回滚）时 `[Run]` 根本不执行，旧实例
-/// 早在 EXIT_MAIN 时已退出让出 exe 映像——没有人再拉起组件，用户看到的是「刚点了
-/// 『是』，程序就人间蒸发」。等它收场并拿到退出码，这次交接才有确定的落点。
+/// 为什么必须由交接进程持有并等待：`installer.iss` 的 `[Run]` 条目刻意**不带**
+/// `skipifsilent`（手动静默安装/升级也要有人拉起组件），安装成功收尾时由它拉起；
+/// 而「安装器起来了但没能成功收尾」（复制阶段失败、目标文件被杀软占用、安装器
+/// 崩溃/回滚）时 `[Run]` 根本不执行，旧实例早在 EXIT_MAIN 时已退出让出 exe 映像
+/// ——没有人再拉起组件，用户看到的是「刚点了『是』，程序就人间蒸发」。等它收场
+/// 并拿到退出码，这次交接才有确定的落点。
 pub(super) struct InstallerProcess(HANDLE);
 
 impl InstallerProcess {
@@ -94,6 +114,40 @@ pub(super) enum InstallerLaunch {
     FailedWithoutCode,
 }
 
+/// 锁定句柄重验的失败归因：**打不开**与**内容不符**必须分开——前者可能是杀软实时
+/// 扫描以写方式持有文件（`ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION`，可自愈、
+/// 值得重试），后者重试同一个文件没有意义。
+enum VerifyFailure {
+    /// 打开失败（内容尚未读到）：`io::Error` 自带裸码，交调用方判是否值得重试。
+    Open(std::io::Error),
+    /// 内容层失败：读哈希出错，或哈希与期望值不符。
+    Content,
+}
+
+/// 锁定句柄重验的唯一构造路径：打开路径为只读共享锁，对锁定句柄重算哈希并与期望值
+/// 比对，一致才构造持锁体。不探针 `exists()`（加锁与哈希以 Err 表达缺失）；失败归因
+/// 见 [`VerifyFailure`]。锁随 `VerifiedInstaller` 持有至安装器启动返回
+/// （见 `launch_installer`）。
+fn verify_locked_installer(
+    path: std::path::PathBuf,
+    version: &str,
+    expected_hash_hex: &str,
+) -> Result<VerifiedInstaller, VerifyFailure> {
+    let mut file_lock = open_locked_installer(&path).map_err(VerifyFailure::Open)?;
+    // 对已锁定句柄哈希：验的就是将要持有的同一句柄，验后换文件无窗口。
+    let existing_hash =
+        compute_sha256_hex_locked(&mut file_lock).map_err(|_| VerifyFailure::Content)?;
+    if existing_hash.to_uppercase() != expected_hash_hex {
+        return Err(VerifyFailure::Content);
+    }
+    Ok(VerifiedInstaller {
+        version: version.to_string(),
+        expected_hash_hex: expected_hash_hex.to_string(),
+        path,
+        _file_lock: file_lock,
+    })
+}
+
 /// 缓存复用：先加只读共享锁，再对锁定句柄哈希——同一句柄验证与持有。
 /// 不变量：不按路径另开文件做验证，不探针 `exists()`（加锁与哈希以 Err 表达缺失）；
 /// 哈希不匹配/读取失败返回 `None`，调用方删文件后重下。锁随 `VerifiedInstaller`
@@ -103,17 +157,38 @@ pub(super) fn try_reuse_cached_installer(
     version: &str,
     expected_hash_hex: &str,
 ) -> Option<VerifiedInstaller> {
-    let mut file_lock = open_locked_installer(&path).ok()?;
-    // 对已锁定句柄哈希：验的就是将要持有的同一句柄，验后换文件无窗口。
-    let existing_hash = compute_sha256_hex_locked(&mut file_lock).ok()?;
-    if existing_hash.to_uppercase() != expected_hash_hex {
-        return None;
+    verify_locked_installer(path, version, expected_hash_hex).ok()
+}
+
+/// 安装交接副本的重验入口：判据与缓存复用同一处（[`verify_locked_installer`]），比对
+/// 基准是协调者经命令行传来的期望哈希。version 仅用于确认框文案，交接路径没有确认框，
+/// 留空。
+///
+/// 与缓存复用唯一的差别是**打开失败会有限次重试**：这次打开发生在协调者释放安装包
+/// 只读共享锁之后（旧设计全程只打开一次，不存在这次打开），而「刚下载完的安装包被杀软
+/// 实时扫描以写方式持有」会让带 `FILE_SHARE_READ` 的打开直接失败——那是可自愈的瞬态，
+/// 不该变成一次静默的更新放弃。内容不符是终局，不重试。
+pub(super) fn reverify_installer_for_handoff(
+    path: std::path::PathBuf,
+    expected_hash_hex: &str,
+) -> Option<VerifiedInstaller> {
+    let mut attempt = 1;
+    loop {
+        match verify_locked_installer(path.clone(), "", expected_hash_hex) {
+            Ok(verified) => return Some(verified),
+            Err(VerifyFailure::Content) => return None,
+            Err(VerifyFailure::Open(e)) => {
+                if !is_transient_sharing_error(&e) || attempt >= INSTALLER_LAUNCH_MAX_ATTEMPTS {
+                    return None;
+                }
+                log_event!("安装包重验打开失败 ({e})，重试");
+            }
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(
+            INSTALLER_LAUNCH_RETRY_DELAY_MS,
+        ));
     }
-    Some(VerifiedInstaller {
-        version: version.to_string(),
-        path,
-        _file_lock: file_lock,
-    })
 }
 
 /// 单源流式下载并加锁重验：创建写锁文件 → 流式抓取（边读边写）→ 降级只读锁
@@ -202,6 +277,7 @@ pub(super) fn fetch_verified_installer(
     }
     Ok(VerifiedInstaller {
         version: version.to_string(),
+        expected_hash_hex: expected_hash_hex.to_string(),
         path: temp_path.to_path_buf(),
         _file_lock: file_lock,
     })
@@ -252,15 +328,11 @@ pub(super) fn wait_main_instance_gone() {
     }
 }
 
-/// 重新拉起常驻主程序（EXIT_MAIN 发出后安装未能继续，或安装器收场后确认组件不在跑）。
-/// 携带一次性参数让新进程推迟首个自动检查冷却周期：更新确认框刚被用户
-/// 决策过，立刻再弹同一版本的确认框属于骚扰；下个冷却周期恢复正常。
+/// 重新拉起常驻主程序，以更新协调者自身的 exe 为目标。
 ///
-/// **失败必须留痕、并做有限次重试**：静默更新交接里本函数是唯一的拉起点（另一处
-/// `[Run]` 只在安装成功收尾时执行），静默失败就等于「组件永久消失，而日志里查不到
-/// 原因」——正是本次改动要消灭的现场。`ShellExecuteW` 返回值 ≤32 是它自己的 SE_ERR_*
-/// 码（不是 last-error，故原样记录）；失败重试覆盖「exe 刚写完被杀软实时扫描占用」
-/// 这类可自愈的瞬态，与安装器启动同一对常量。
+/// 仅限检查路径（协调者就运行在主程序 exe 上）的恢复使用；安装交接副本必须用
+/// 命令行载荷里的安装路径（[`relaunch_main_app_at`]）——副本自身在临时目录，
+/// `current_exe()` 不是主程序，拉起它等于把组件装进临时目录。
 pub(super) fn relaunch_main_app() {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -269,6 +341,19 @@ pub(super) fn relaunch_main_app() {
             return;
         }
     };
+    relaunch_main_app_at(&exe);
+}
+
+/// 以给定路径重新拉起常驻主程序（EXIT_MAIN 发出后安装未能继续，或安装器收场后
+/// 确认组件不在跑）。携带一次性参数让新进程推迟首个自动检查冷却周期：更新确认框
+/// 刚被用户决策过，立刻再弹同一版本的确认框属于骚扰；下个冷却周期恢复正常。
+///
+/// **失败必须留痕、并做有限次重试**：静默更新交接里本函数是唯一的兜底拉起点
+/// （另一处 `[Run]` 只在安装成功收尾时执行），静默失败就等于「组件永久消失，而
+/// 日志里查不到原因」。`ShellExecuteW` 返回值 ≤32 是它自己的 SE_ERR_* 码
+/// （不是 last-error，故原样记录）；失败重试覆盖「exe 刚写完被杀软实时扫描占用」
+/// 这类可自愈的瞬态，与安装器启动同一对常量。
+pub(super) fn relaunch_main_app_at(exe: &std::path::Path) {
     let path_wide = os_to_wide(exe.as_os_str());
     let args_wide = to_wide(RELAUNCHED_BY_UPDATE_ARG);
     for attempt in 1..=INSTALLER_LAUNCH_MAX_ATTEMPTS {
@@ -297,6 +382,141 @@ pub(super) fn relaunch_main_app() {
         std::thread::sleep(std::time::Duration::from_millis(
             INSTALLER_LAUNCH_RETRY_DELAY_MS,
         ));
+    }
+}
+
+/// 把安装交接移交给临时目录里的自身副本进程（模块头说明了为什么必须移交）。
+///
+/// 副本身份：与协调者同一 exe，命令行带 [`UPDATE_INSTALL_ARG`]，在 `main()` 单例锁
+/// 之前被拦截（与 `--check-update` 同一位置），不会被误判为重复实例，也刻意不持有
+/// 单例互斥量——否则安装器 `[Run]` 拉起的新实例会被单例门挡掉。命令行同时携带
+/// 协调者自身的父身份参数（[`super::protocol::bind_parent_identity`]）：副本在移交
+/// 安装器前要等协调者退出，见 `update::install_handoff_main`。
+///
+/// 时序：副本在启动安装器**之前**等待「协调者已退出」这一客观事实（父身份经
+/// `--parent-pid`/`--parent-start` 绑定并复核创建时刻），不依赖「UAC 弹框留出秒级
+/// 余量」这类时序假设——UAC 关闭或协调者已提权时该假设不成立。等待有上界
+/// （`MAIN_EXIT_WAIT_TIMEOUT_MS`）：协调者若异常滞留，照常移交，由安装器侧
+/// `ForceKillRemnant` 与原生文件占用提示兜底。
+///
+/// 失败语义：落盘（删残留 + 复制）或 spawn 最终失败时返回 `Err`，此时没有任何人
+/// 继续交接，调用方必须按交接失败恢复主程序。两段面对同一类瞬态占用（刚写完的
+/// 副本被杀软实时扫描持有、上一次交接的副本进程仍在跑——其安装器等待窗口可达
+/// 数分钟），收进同一个有限次重试回路（与安装器启动同一对常量、同一判据）。
+pub(super) fn spawn_install_helper(verified: &VerifiedInstaller) -> std::io::Result<()> {
+    let self_exe = std::env::current_exe()?;
+    let helper_path = super::cache::get_update_helper_path();
+    if let Some(parent) = helper_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut command = std::process::Command::new(&helper_path);
+    command
+        .arg(UPDATE_INSTALL_ARG)
+        .arg(INSTALLER_PATH_ARG)
+        .arg(&verified.path)
+        .arg(INSTALLER_HASH_ARG)
+        .arg(&verified.expected_hash_hex)
+        .arg(APP_EXE_ARG)
+        .arg(&self_exe);
+    super::protocol::bind_parent_identity(&mut command);
+    command
+        .creation_flags(CREATE_NO_WINDOW.0)
+        // 副本不输出协议行（父进程即将退出，无人读取），stdio 全部落到 null，
+        // 防止继承协调者的 stdout 管道写端或控制台输入。
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // 落盘与 spawn 收进同一个重试回路：删残留 → 复制 → spawn 任一步撞上瞬态占用
+    // 都整段重来（复制成功而 spawn 失败时，副本文件未被映射成映像，可安全删除重写）。
+    // Child 句柄即刻丢弃即「脱离」：std 的 Child Drop 不终止进程，副本的生命周期
+    // 由它自己的交接流程收束。
+    let mut attempt = 1;
+    loop {
+        // 上一次交接的残留副本先删（副本进程已退出时才删得掉；删不掉则复制同样
+        // 失败，交给本回路下一轮）。复制本身会整体覆写目标。
+        let _ = std::fs::remove_file(&helper_path);
+        let outcome = std::fs::copy(&self_exe, &helper_path).and_then(|_| command.spawn());
+        match outcome {
+            Ok(_child) => return Ok(()),
+            Err(e) => {
+                if !is_transient_sharing_error(&e) || attempt >= INSTALLER_LAUNCH_MAX_ATTEMPTS {
+                    return Err(e);
+                }
+            }
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(
+            INSTALLER_LAUNCH_RETRY_DELAY_MS,
+        ));
+    }
+}
+
+/// 交接路径上「文件被占用」类瞬态失败的共同判据：与安装器启动的
+/// `is_transient_launch_error` 同一语义；落在这里的失败都以 `io::Error` 报错
+/// （副本落盘/复制、`Command::spawn`、副本重验时打开安装包），裸码取自
+/// `raw_os_error`。
+fn is_transient_sharing_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(code)
+            if code == ERROR_SHARING_VIOLATION.0 as i32 || code == ERROR_LOCK_VIOLATION.0 as i32
+    )
+}
+
+/// 启动安装器并等它收场，按「组件是否已在跑」的客观事实决定是否补拉起。
+///
+/// 「谁负责拉起」由**客观事实**裁决：组件是不是已经在跑（单例互斥量在不在），
+/// 不由安装器退出码也不由 `[Run]` 条目在静默模式下的语义裁决——后两者都没有
+/// 逐字保证，而组件在不在跑这件事在两种语义下都给出正确答案。
+/// 退出码只用来省一次探测：非 0 时 `[Run]` 必然没执行（官方退出码表：任何非 0
+/// 都表示 Setup 没跑完），不必等；0 时才需要确认它在不在。
+///
+/// `app_exe` 是补拉起目标：交接副本传命令行载荷里的主程序安装路径，绝不传
+/// `current_exe()`（副本自身在临时目录）。
+pub(super) fn run_install_handoff(verified: VerifiedInstaller, app_exe: &std::path::Path) {
+    match launch_installer(verified) {
+        Ok(process) => {
+            let exit_code = process.wait_for_exit_code();
+            let instance_present = exit_code == Some(0)
+                && wait_main_instance_appear(
+                    INSTALLER_SETTLE_TAKEOVER_WAIT_MS,
+                    MAIN_EXIT_POLL_INTERVAL_MS,
+                );
+            if instance_present {
+                log_event!("安装器已成功收场，组件已由安装器拉起，不再重复拉起");
+            } else {
+                match exit_code {
+                    Some(0) => log_event!("安装器已成功收场但组件未在跑，重新拉起主程序"),
+                    Some(code) => {
+                        log_event!("安装器未成功收场 (退出码: {code})，重新拉起主程序")
+                    }
+                    None => log_event!("安装器收场结果未知，重新拉起主程序"),
+                }
+                relaunch_main_app_at(app_exe);
+            }
+        }
+        Err(InstallerLaunch::Cancelled) => {
+            // 默认动词下 UAC 取消发生在 SetupLdr 内部，表现为非 0 退出码（走上面
+            // 那一支）；本支保留给 ShellExecuteExW 自身仍返回 ERROR_CANCELLED 的
+            // 场合。主程序已按约定退出，重新拉起应用，避免组件凭空消失。
+            log_event!("安装器启动被取消，重新拉起主程序");
+            relaunch_main_app_at(app_exe);
+        }
+        Err(InstallerLaunch::Failed(code)) => {
+            log_event!("安装器启动失败 (错误码: {code})，重新拉起主程序");
+            // 先拉起再弹框：show_error 是模态的，组件不该等用户点掉框才回来。
+            relaunch_main_app_at(app_exe);
+            show_error(&format!("启动安装程序失败 (错误码: {code})"));
+        }
+        Err(InstallerLaunch::FailedWithoutCode) => {
+            // 取不到裸 Win32 码时 `Failed(0)` 会把这个框拼成「错误码: 0」——
+            // 用户拿不到任何信息也无法据此行动，所以这一支只写现场日志；
+            // 恢复动作（重新拉起主程序）与 `Failed` 完全一致。
+            log_event!("安装器启动失败（Err 不带 Win32 错误码），重新拉起主程序");
+            relaunch_main_app_at(app_exe);
+        }
     }
 }
 
@@ -413,6 +633,47 @@ mod tests {
         assert!(is_transient_launch_error(&InstallerLaunch::Failed(
             ERROR_LOCK_VIOLATION.0
         )));
+    }
+
+    #[test]
+    fn test_transient_sharing_errors_are_retried() {
+        // 副本落盘/复制、spawn、重验打开与安装器启动面对同一类瞬态（刚写完的文件被
+        // 杀软实时扫描占用），但报错形态不同：io::Error 的裸码取自 raw_os_error（i32）。
+        let sharing = std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.0 as i32);
+        assert!(is_transient_sharing_error(&sharing));
+        let lock = std::io::Error::from_raw_os_error(ERROR_LOCK_VIOLATION.0 as i32);
+        assert!(is_transient_sharing_error(&lock));
+        // 访问拒绝不是「稍后重试就能好」的占用形态，必须立即按失败上报。
+        let denied = std::io::Error::from_raw_os_error(5);
+        assert!(!is_transient_sharing_error(&denied));
+    }
+
+    /// 重验的失败归因必须区分「打不开」与「内容不符」：前者可重试（见
+    /// `reverify_installer_for_handoff`），后者是终局。这里只钉住归因本身，不真跑重试
+    /// （重试要占住安装包 400ms×N，属时序成本，不适合进单测）。
+    #[test]
+    fn test_verify_failure_distinguishes_open_from_content() {
+        let missing = cache_test_path("verify-missing");
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            matches!(
+                verify_locked_installer(missing, "", "00"),
+                Err(VerifyFailure::Open(_))
+            ),
+            "文件不存在必须归因到「打不开」"
+        );
+
+        let tampered = cache_test_path("verify-tampered");
+        let _ = std::fs::remove_file(&tampered);
+        std::fs::write(&tampered, b"tampered-installer-payload").unwrap();
+        assert!(
+            matches!(
+                verify_locked_installer(tampered.clone(), "", "00"),
+                Err(VerifyFailure::Content)
+            ),
+            "哈希不符必须归因到「内容层」，不得因可重试而被反复打开"
+        );
+        let _ = std::fs::remove_file(&tampered);
     }
 
     #[test]
@@ -561,12 +822,14 @@ mod tests {
     }
 
     /// 确定性筛选器验收：脚本不参与 cargo 构建，用构造记录直接跑 `-Processes` + `-DryRun`，
-    /// 钉死「目标路径 + 当前会话 + 非更新协调者」三项收窄。旧实现在安装器内联 PowerShell，
+    /// 钉死「目标路径 + 当前会话 + 可识别命令行」三项收窄。旧实现在安装器内联 PowerShell，
     /// 没有任何一次真实执行的验收；本用例取代它，且不依赖「真的进入强杀分支」。
     ///
-    /// 构造记录覆盖 6 个边界：(a) 三条全中 ⇒ 必须列出；(b) 命令行含 `--check-update`、
-    /// (c) 异会话、(d) 命令行取不到、(e) 另一目录的同名 exe、(f) 可执行文件路径取不到
-    /// ⇒ 都必须不列出。(f) 是 `提案` 3 明列的 `ExecutablePath` 为 `$null` 边界。
+    /// 构造记录覆盖 6 个边界：(a) 三条全中 ⇒ 必须列出；(b) 命令行含 `--check-update`
+    /// （旧版更新协调者残留：不持单例互斥量却占用待覆写的 exe 映像，必须清掉）⇒
+    /// 必须列出；(c) 异会话、(d) 命令行取不到、(e) 另一目录的同名 exe、
+    /// (f) 可执行文件路径取不到 ⇒ 都必须不列出。(f) 是 `提案` 3 明列的
+    /// `ExecutablePath` 为 `$null` 边界。
     /// 缺口（未实测，见提交说明）：`-DryRun` 之外的真杀路径与真实跨会话/跨目录进程
     /// 需要真机安装才能验证，本用例只钉死筛选判据。
     #[test]
@@ -628,11 +891,13 @@ mod tests {
             "目标路径 + 当前会话 + 普通命令行必须被列出 (a)：{}",
             String::from_utf8_lossy(&stdout)
         );
+        assert!(
+            listed(434343),
+            "旧版更新协调者残留（--check-update，同路径同会话）必须被列出 (b)：\
+             它占用着待覆写的 exe 映像，豁免它等于让复制阶段必然失败；{}",
+            String::from_utf8_lossy(&stdout)
+        );
         for (pid, why) in [
-            (
-                434343,
-                "更新协调者（命令行含 --check-update）不得被列出 (b)",
-            ),
             (444444, "异会话的同路径进程不得被列出 (c)"),
             (454545, "命令行取不到时不得被列出 (d)"),
             (464646, "另一目录的同名 exe 不得被列出 (e)"),

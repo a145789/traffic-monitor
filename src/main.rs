@@ -53,7 +53,7 @@ use crate::suspend::{
 use crate::tray::{create_tray_icon, remove_tray_icon};
 use crate::update::{
     acquire_update_mutex, defer_initial_auto_check, emit_protocol_line, init_cleanup_temp,
-    load_auto_update_enabled, start_auto_check, subprocess_main,
+    install_handoff_main, load_auto_update_enabled, start_auto_check, subprocess_main,
 };
 use crate::util::{
     AtomicHwnd, current_process_is_elevated, diag, log_event, main_instance_exists, os_to_wide,
@@ -83,15 +83,21 @@ pub(crate) fn current_main_hwnd() -> Option<HWND> {
     CURRENT_MAIN_HWND.load()
 }
 
-/// 启动参数一次性解析结果：`--quit` / `--check-update` / `--manual` / 更新拉起标记
-/// / 父身份绑定参数（`--parent-pid` 后的 PID 与 `--parent-start` 后的 FILETIME）。
+/// 启动参数一次性解析结果：`--quit` / `--check-update` / `--update-install` /
+/// `--manual` / 更新拉起标记 / 父身份绑定参数（`--parent-pid` 后的 PID 与
+/// `--parent-start` 后的 FILETIME）/ 安装交接载荷（`--installer-path`、
+/// `--installer-hash`、`--app-exe`）。
 ///
 /// 单一事实来源：`main()` 只扫描一次 `args_os`。优先级由 `main()` 开头的
-/// 检查顺序钉死（`--quit` 先于 `--check-update`），不再散落于多次线性扫描中。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 检查顺序钉死（`--quit` 先于 `--check-update` 先于 `--update-install`），
+/// 不再散落于多次线性扫描中。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct CliArgs {
     quit: bool,
     check_update: bool,
+    /// 安装交接副本模式：由更新协调者以临时目录里的自身副本 re-exec，
+    /// 携带下方三项载荷（见 `update::install_handoff_main`）。
+    update_install: bool,
     manual: bool,
     relaunched_by_update: bool,
     /// 父进程 PID；值为 `Option`：缺失或非数字时保持 `None`，子进程据此退化为
@@ -100,12 +106,19 @@ struct CliArgs {
     /// 父进程创建时刻（`GetProcessTimes` 的 FILETIME）。只传 PID 不足以判定父身份：
     /// 长时间开机的机器上 PID 会被复用，必须靠创建时刻复核。
     parent_start: Option<u64>,
+    /// 交接载荷：已校验安装包路径 / 期望 SHA-256（hex）/ 补拉起目标（主程序安装
+    /// 路径）。路径用 `OsString` 承载：不要求 UTF-8 可解码，非 Unicode 可表示的
+    /// 路径必须原样保留，有损中转会指向另一个路径。
+    installer_path: Option<std::ffi::OsString>,
+    installer_hash: Option<String>,
+    app_exe: Option<std::ffi::OsString>,
 }
 
 /// 一次遍历解析启动参数。`args_os` 不要求参数为合法 Unicode，
 /// 含非 UTF-8/非 UTF-16 可表示字符的无关参数只会被忽略，不再 panic。
 /// 比较为精确匹配：`--quit=1` 这类缀接形式判否，与旧 `==` 语义一致；
-/// `--parent-pid` / `--parent-start` 取紧随其后的一个参数为值，值不合形状即当缺席。
+/// `--parent-pid` / `--parent-start` / 交接载荷三参数取紧随其后的一个参数为值，
+/// 值不合形状即当缺席。
 fn parse_cli_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliArgs {
     use std::ffi::OsStr;
     let mut cli = CliArgs::default();
@@ -116,6 +129,8 @@ fn parse_cli_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliArgs
             cli.quit = true;
         } else if s == OsStr::new("--check-update") {
             cli.check_update = true;
+        } else if s == OsStr::new(crate::config::UPDATE_INSTALL_ARG) {
+            cli.update_install = true;
         } else if s == OsStr::new("--manual") {
             cli.manual = true;
         } else if s == OsStr::new(RELAUNCHED_BY_UPDATE_ARG) {
@@ -124,9 +139,38 @@ fn parse_cli_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliArgs
             cli.parent_pid = take_parent_value(&mut args);
         } else if s == OsStr::new(crate::config::PARENT_START_ARG) {
             cli.parent_start = take_parent_value(&mut args);
+        } else if s == OsStr::new(crate::config::INSTALLER_PATH_ARG) {
+            cli.installer_path = take_value_os(&mut args);
+        } else if s == OsStr::new(crate::config::INSTALLER_HASH_ARG) {
+            // 哈希是 ASCII hex，to_str 无损；与路径类载荷共用 take_value_os 的
+            // 「标志形态候选值不消费」语义，不复用父身份参数的十进制解析入口。
+            cli.installer_hash =
+                take_value_os(&mut args).and_then(|value| value.to_str().map(str::to_string));
+        } else if s == OsStr::new(crate::config::APP_EXE_ARG) {
+            cli.app_exe = take_value_os(&mut args);
         }
     }
     cli
+}
+
+/// 取当前标志紧随其后的一个参数值（`OsString`，不要求 UTF-8 可解码：交接载荷里的
+/// 路径可能含非 Unicode 可表示字符，有损中转会指向另一个路径）。
+///
+/// 值不合形状（下一个参数本身是标志、或不存在）按缺席处理，且标志形态的候选值
+/// **不消费**：否则手打的 `--installer-path --app-exe x` 会把 `--app-exe` 吃掉，
+/// 静默改变后续参数的语义（理由同 [`take_parent_value`]）。
+fn take_value_os(
+    args: &mut std::iter::Peekable<impl Iterator<Item = std::ffi::OsString>>,
+) -> Option<std::ffi::OsString> {
+    // 非 UTF-8 参数不可能以 ASCII 的 "--" 开头，按「非标志形态」消费是安全的。
+    let flag_shaped = args
+        .peek()
+        .and_then(|next| next.to_str())
+        .is_some_and(|text| text.starts_with("--"));
+    if flag_shaped {
+        return None;
+    }
+    args.next()
 }
 
 /// 取父身份参数紧随其后的十进制值。
@@ -339,6 +383,26 @@ fn main() {
         };
         std::process::exit(subprocess_main(
             cli.manual,
+            cli.parent_pid,
+            cli.parent_start,
+        ));
+    }
+
+    // 必须在单例 Mutex 之前拦截 --update-install（与 --check-update 同一位置）：
+    // 交接副本刻意不持有单例锁——它若持锁，安装器 [Run] 拉起的新实例会被单例门
+    // 误判为重复实例退出，装完的组件就没了。
+    if cli.update_install {
+        // 调试日志开关要在第一处可能写日志的调用之前加载（与 --check-update 同理；
+        // install_handoff_main 内的再次加载幂等，代价仅一次注册表读）。
+        refresh_debug_log_flag();
+
+        // 跨进程更新互斥不在这里申请：协调者此刻多半仍持有它（本进程刚启动，还没
+        // 等到协调者退出），提前申请只会拿到「已被占用」而让整段安装失去这层保护。
+        // install_handoff_main 在等到「协调者已退出」之后再申请，那时它是确定可得的。
+        std::process::exit(install_handoff_main(
+            cli.installer_path,
+            cli.installer_hash,
+            cli.app_exe,
             cli.parent_pid,
             cli.parent_start,
         ));
@@ -902,10 +966,14 @@ mod tests {
             [
                 "--quit=1",
                 "--check-update=1",
+                "--update-install=1",
                 "--manual=1",
                 "--relaunched-by-update=1",
                 "--parent-pid=1",
                 "--parent-start=2",
+                "--installer-path=1",
+                "--installer-hash=1",
+                "--app-exe=1",
             ]
             .into_iter()
             .map(std::ffi::OsString::from),
@@ -915,11 +983,87 @@ mod tests {
             super::CliArgs {
                 quit: false,
                 check_update: false,
+                update_install: false,
                 manual: false,
                 relaunched_by_update: false,
                 parent_pid: None,
                 parent_start: None,
+                installer_path: None,
+                installer_hash: None,
+                app_exe: None,
             }
+        );
+    }
+
+    #[test]
+    fn cli_args_parse_install_handoff_payload() {
+        let cli = parse_cli_args(
+            [
+                "--update-install",
+                "--installer-path",
+                "C:\\Program Files\\Traffic Monitor\\TrafficMonitor-Setup-1.7.2.exe",
+                "--installer-hash",
+                "abc123",
+                "--app-exe",
+                "C:\\Program Files\\Traffic Monitor\\traffic-monitor.exe",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        );
+        assert!(cli.update_install);
+        assert_eq!(
+            cli.installer_path.as_deref(),
+            Some(std::ffi::OsStr::new(
+                "C:\\Program Files\\Traffic Monitor\\TrafficMonitor-Setup-1.7.2.exe"
+            ))
+        );
+        assert_eq!(cli.installer_hash.as_deref(), Some("abc123"));
+        assert_eq!(
+            cli.app_exe.as_deref(),
+            Some(std::ffi::OsStr::new(
+                "C:\\Program Files\\Traffic Monitor\\traffic-monitor.exe"
+            ))
+        );
+    }
+
+    #[test]
+    fn cli_args_handoff_payload_degrades_without_consuming_flags() {
+        // 值位置出现标志形态时不吞掉后续标志：--installer-path 按缺席处理，
+        // --installer-hash 仍取到它自己的值（与父身份参数同一约定）。
+        let cli = parse_cli_args(
+            [
+                "--update-install",
+                "--installer-path",
+                "--installer-hash",
+                "abc123",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        );
+        assert!(cli.update_install);
+        assert_eq!(cli.installer_path, None);
+        assert_eq!(cli.installer_hash.as_deref(), Some("abc123"));
+        assert_eq!(cli.app_exe, None);
+    }
+
+    #[test]
+    fn cli_args_handoff_paths_survive_non_utf8_values() {
+        use std::os::windows::ffi::OsStringExt;
+        // 路径载荷不要求 UTF-8 可解码：非 UTF-8 的路径必须以 OsString 原样保留，
+        // 走 to_string 的有损中转会替换成 U+FFFD 从而指向另一个路径。
+        let non_utf8 = std::ffi::OsString::from_wide(&[0xD800u16]);
+        let cli = parse_cli_args([
+            std::ffi::OsString::from("--update-install"),
+            std::ffi::OsString::from("--installer-path"),
+            non_utf8.clone(),
+            std::ffi::OsString::from("--app-exe"),
+            std::ffi::OsString::from("C:\\app.exe"),
+        ]);
+        assert!(cli.update_install);
+        assert_eq!(cli.installer_path, Some(non_utf8));
+        assert_eq!(
+            cli.app_exe.as_deref(),
+            Some(std::ffi::OsStr::new("C:\\app.exe"))
         );
     }
 

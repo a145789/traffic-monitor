@@ -33,6 +33,19 @@ pub const UPDATE_MUTEX_NAME: &str = "TrafficMonitor_Mutex_Update\0";
 /// 创建时刻就无法判断 `OpenProcess` 打开的是不是自己的父进程。
 pub const PARENT_PID_ARG: &str = "--parent-pid";
 pub const PARENT_START_ARG: &str = "--parent-start";
+/// 安装交接副本进程的模式参数：更新协调者在启动安装器前把自身复制到临时目录并以此
+/// 参数 re-exec，随后立即退出让出主程序 exe 映像（运行中的进程映像不可被安装器覆写，
+/// 协调者留在原地等安装器收场会让复制阶段必然失败，见 `update::installer`）。
+/// 载荷由下面三个参数承载，在 `main()` 单例锁之前被拦截（与 `--check-update` 同一位置）。
+pub const UPDATE_INSTALL_ARG: &str = "--update-install";
+/// 交接载荷：已校验安装包的路径。副本必须对它重验哈希后才启动安装器（身份绑定不可
+/// 按路径跳过）。
+pub const INSTALLER_PATH_ARG: &str = "--installer-path";
+/// 交接载荷：安装包的期望 SHA-256（hex，来自 version.txt 元数据），副本重验的比对基准。
+pub const INSTALLER_HASH_ARG: &str = "--installer-hash";
+/// 交接载荷：补拉起目标（主程序安装路径）。副本自身在临时目录，`current_exe()` 不是
+/// 主程序，补拉起必须用这个显式路径。
+pub const APP_EXE_ARG: &str = "--app-exe";
 pub const REG_PATH_APP: &str = "Software\\Traffic Monitor";
 pub const REG_PATH_RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 pub const REG_PATH_PERSONALIZE: &str =
@@ -173,6 +186,15 @@ pub const RELAUNCHED_BY_UPDATE_ARG: &str = "--relaunched-by-update";
 /// 哈希校验裁决（不匹配由 do_update_check 自行删除重下）；无条件删除会
 /// 摧毁有效缓存，迫使每次检查都重新下载。
 pub const INSTALLER_CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
+/// 交接副本残留的启动期清理门槛（秒）：副本文件 mtime 距今超过该值才删。
+/// 门控的不是「有效期」而是「活跃交接」：刚落盘的副本可能正处在协调者
+/// 「复制 → spawn」的窗口内，另一实例的启动期清理若恰好插入会让 spawn 撞上
+/// FILE_NOT_FOUND；保留数分钟即把该窗口完全排除在清理之外。真残留（交接结束
+/// 后的垃圾）不会在紧接着的那次启动就被清掉——交接失败会立刻重新拉起组件，
+/// 那次启动距落盘只有秒级，必然不足门槛；它在之后某次距落盘超过门槛的启动里
+/// 被清。副本进程仍在跑时文件被映像占用，删除失败静默忽略，不影响本门槛。
+pub const UPDATE_HELPER_STALE_SECS: u64 = 300;
 
 /// 自动更新的定时器轮询间隔。刻意远小于冷却时长：`sync_monitoring_timers` 在
 /// 息屏/锁屏/全屏等状态切换时会销毁重建全部定时器，若轮询周期≈冷却时长，
