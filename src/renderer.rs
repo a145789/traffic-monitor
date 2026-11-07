@@ -28,17 +28,11 @@ const ARROW_PADDED: &str = "\u{2191} ";
 
 /// 网速列宽度按**最宽可能文本**预留，不再用固定像素列宽。
 ///
-/// `format_speed_wide` 每个档位只有一个最宽形态（整数位最多 4 位、小数固定 1 位；
-/// MB 档在 1 GiB 边界前还会显示 `1024.0`），取这几条候选串宽度的最大值即网速文本
-/// 的上界：千分位 `1023.9 MB/s` 整条放得下，既不会被右对齐裁掉高位，也压不到箭头列。
-/// 改档位或精度必须同步这里；`speed_column_fits_every_tier` 用真实格式化结果复验。
-const SPEED_WIDTH_PROBES: [&str; 5] = [
-    "1023 B/s",
-    "1023.9 KB/s",
-    "1023.9 MB/s",
-    "1024.0 MB/s",
-    "4.0 GB/s",
-];
+/// `format_speed_wide` 每个档位只有一个最宽形态（值的上界是档位上限，整数位最多 4 位，
+/// 无小数位），取这几条候选串宽度的最大值即网速文本的上界：`1023 MB/s` 整条放得下，
+/// 既不会被右对齐裁掉高位，也压不到箭头列。改档位或单位必须同步这里；
+/// `speed_column_fits_every_tier` 用真实格式化结果复验。
+const SPEED_WIDTH_PROBES: [&str; 4] = ["1023 B/s", "1023 KB/s", "1023 MB/s", "4 GB/s"];
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
@@ -382,35 +376,31 @@ impl Renderer {
         buf
     }
 
+    /// 网速文本：整数 + 单位，不带小数位。
+    ///
+    /// 档位判定与取整全程整数（`+ divisor/2` 是「四舍五入」的定点写法）：渲染路径
+    /// 要能在测试里逐字节断言，不引入浮点。每档的值再钳到 1023，避免舍入把界内值
+    /// 顶到下一档的量级——`1023.9 KB/s` 显示 `1024 KB/s` 会紧接着跳到 `1 MB/s`，
+    /// 读起来像倒退；钳制后换档单调（`1023 KB/s` → `1 MB/s`）。
     fn format_speed_wide(buf: &mut Vec<u16>, bytes_per_sec: u32) -> &mut [u16] {
+        const KIB: u64 = 1024;
+        const MIB: u64 = KIB * 1024;
+        const GIB: u64 = MIB * 1024;
+
         buf.clear();
-        if bytes_per_sec < 1024 {
-            write_u32(buf, bytes_per_sec);
-            buf.extend(" B/s".encode_utf16());
+        let bytes = bytes_per_sec as u64;
+        let (value, unit): (u64, &str) = if bytes < KIB {
+            (bytes, " B/s")
+        } else if bytes < MIB {
+            (((bytes + KIB / 2) / KIB).min(1023), " KB/s")
+        } else if bytes < GIB {
+            (((bytes + MIB / 2) / MIB).min(1023), " MB/s")
         } else {
-            // 先算 KB 十分位定点值；满 1024.0 KB/s（x >= 10240，十分位即 1.0 MB/s）
-            // 再按更大量级重新舍入，避免各档各自重复格式化。档位判定与舍入全程整数
-            // （`+512`、`+524288`、`+1024^3/2` 都是「除数的一半」同构写法）：渲染路径
-            // 要能在测试里逐字节断言，不引入浮点。
-            let mut x = ((bytes_per_sec as u64 * 10 + 512) / 1024) as u32;
-            let unit: &str = if x >= 10240 {
-                if bytes_per_sec as u64 >= 1024 * 1024 * 1024 {
-                    // 万兆链路满速是 1.25e9 B/s：没有这一档就只能显示成 4 位数的 MB。
-                    x = ((bytes_per_sec as u64 * 10 + 1024 * 1024 * 1024 / 2)
-                        / (1024 * 1024 * 1024)) as u32;
-                    " GB/s"
-                } else {
-                    x = ((bytes_per_sec as u64 * 10 + 524288) / (1024 * 1024)) as u32;
-                    " MB/s"
-                }
-            } else {
-                " KB/s"
-            };
-            write_u32(buf, x / 10);
-            buf.push(b'.' as u16);
-            buf.push((b'0' + (x % 10) as u8) as u16);
-            buf.extend(unit.encode_utf16());
-        }
+            // 万兆链路满速是 1.25e9 B/s：没有这一档就只能显示成 4 位数的 MB。
+            ((bytes + GIB / 2) / GIB, " GB/s")
+        };
+        write_u32(buf, value as u32);
+        buf.extend(unit.encode_utf16());
         buf.push(0);
         buf
     }
@@ -476,7 +466,9 @@ impl Renderer {
         let down_val = Self::format_speed_wide(&mut self.buf, values.speed_down);
         draw_text(self.hdc_mem, down_val, &mut rc_down_val, DT_RIGHT);
 
-        // CPU/MEM 列：标签左对齐（静态，两行同一起点），数值右对齐（动态，`%` 同列）。
+        // CPU/MEM 列：标签**右**对齐（`:` 是标签的最后一个字形，右对齐即让上下两个
+        // 冒号落在同一列），数值也右对齐（`%` 同列）。两列各自定宽，故数字位数变化
+        // 时冒号列与百分号列都不动。
         let cpu_label = Self::format_label_wide(&mut self.buf, "CPU");
         let mut rc_cpu_label = RECT {
             left: layout.label_left,
@@ -484,7 +476,7 @@ impl Renderer {
             right: layout.label_right,
             bottom: layout.half_height,
         };
-        draw_text(self.hdc_mem, cpu_label, &mut rc_cpu_label, DT_LEFT);
+        draw_text(self.hdc_mem, cpu_label, &mut rc_cpu_label, DT_RIGHT);
 
         let cpu_value = Self::format_percent_wide(&mut self.buf, values.cpu);
         let mut rc_cpu_value = RECT {
@@ -502,7 +494,7 @@ impl Renderer {
             right: layout.label_right,
             bottom: self.height,
         };
-        draw_text(self.hdc_mem, mem_label, &mut rc_mem_label, DT_LEFT);
+        draw_text(self.hdc_mem, mem_label, &mut rc_mem_label, DT_RIGHT);
 
         let mem_value = Self::format_percent_wide(&mut self.buf, values.mem);
         let mut rc_mem_value = RECT {
@@ -626,15 +618,16 @@ impl Drop for Renderer {
 
 /// 双列布局（物理像素），三处边界的锚点各不相同，改之前先读这里：
 ///
-/// - **标签**（`CPU:` / `MEM:`）左对齐锚在 `label_left`：静态文本，两行必须同一起点；
+/// - **标签**（`CPU:` / `MEM:`）**右**对齐锚在 `label_right`：`:` 是标签的最后一个
+///   字形，右对齐即让上下两个冒号落在同一列，代价是两行首字母左边缘不齐；
 /// - **数值**（`0%`~`100%`）右对齐锚在 `value_right`，字段宽度按最宽数值 `100%` 预留：
 ///   动态文本变宽只向左长，`%` 始终停在同一列；
 /// - **网速列**右锚在 `speed_right`，列宽 = 箭头列 + 最宽速率文本（[`SPEED_WIDTH_PROBES`]），
-///   故 `arrow_right` 起的速率矩形恰好装得下千分位文本，永远压不到箭头。
+///   故 `arrow_right` 起的速率矩形恰好装得下 `1023 MB/s`，永远压不到箭头。
 ///
 /// 标签块左锚、网速列右锚，两列之间剩下的空间全部留在中间：它随 DPI 变化是因为
 /// 「位图宽度取整」与「字号取整」不同步（字号先跳一档、宽度只涨几个百分点）。96-DPI
-/// 基准下中间距 12px，最紧的 dpi 100 是 6px；下限由 `layout_has_no_overlap_across_dpi`
+/// 基准下中间距 22px，最紧的 dpi 100 是 17px；下限由 `layout_has_no_overlap_across_dpi`
 /// 在整个 DPI 范围上钉死。
 ///
 /// `width` 必须取已舍入的实际宽度（`dpi_scaled(DISPLAY_WIDTH, dpi)` 的输出），
@@ -785,50 +778,74 @@ mod tests {
         );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024)),
-            "1.0 KB/s"
+            "1 KB/s"
         );
+        // 档内四舍五入：1.5 KiB/s 进位到 2。
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 102)),
-            "1023.9 KB/s"
+            wide_to_string(Renderer::format_speed_wide(&mut buf, 1536)),
+            "2 KB/s"
         );
+        // 档内上界钳制：1023.9 KB/s 舍入后是 1024，但 1024 已是 MB 档的量级，
+        // 显示成 "1024 KB/s" 会紧接 "1 MB/s" 像倒退；钳到 1023 保持单调。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 1)),
-            "1.0 MB/s"
+            "1023 KB/s"
         );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024)),
-            "1.0 MB/s"
+            "1 MB/s"
         );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(
                 &mut buf,
                 1024 * 1024 * 10 + 1024 * 512
             )),
-            "10.5 MB/s"
+            "11 MB/s"
         );
-        // 跨档边界：差 1 字节仍走 MB 档（四舍五入后是 1024.0，不是 1023.9），正好
-        // 1 GiB 才跳 GB 档。阶梯式单位的固有跳变，这里把它固定成已知行为而不是消除。
+        // 同样钳制在 MB 档：差 1 字节到 1 GiB 时显示 1023 而不是 1024。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(
                 &mut buf,
                 1024 * 1024 * 1024 - 1
             )),
-            "1024.0 MB/s"
+            "1023 MB/s"
         );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 * 1024)),
-            "1.0 GB/s"
+            "1 GB/s"
         );
-        // 万兆链路满速（1.25e9 B/s）：没有 GB 档时这里是 4 位数的 "1192.1 MB/s"。
+        // 万兆链路满速（1.25e9 B/s）：没有 GB 档时这里是 4 位数的 "1192 MB/s"。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, 1_250_000_000)),
-            "1.2 GB/s"
+            "1 GB/s"
         );
-        // u32 上限 = 4 GiB/s - 1 字节，四舍五入后正好 4.0（不是溢出）。
+        // u32 上限 = 4 GiB/s - 1 字节，四舍五入后正好 4（不是溢出）。
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(&mut buf, u32::MAX)),
-            "4.0 GB/s"
+            "4 GB/s"
         );
+    }
+
+    /// 换档处显示值必须单调：任何速率都不该显示成下一档的量级（`1024 KB/s` / `1024 MB/s`）。
+    #[test]
+    fn test_speed_display_is_monotonic_across_tiers() {
+        let limits = [
+            (1024u32, "KB/s"),
+            (1024 * 1024, "MB/s"),
+            (1024 * 1024 * 1024, "GB/s"),
+        ];
+        let mut buf = Vec::with_capacity(32);
+        for (boundary, _) in limits {
+            let below = wide_to_string(Renderer::format_speed_wide(&mut buf, boundary - 1));
+            let at = wide_to_string(Renderer::format_speed_wide(&mut buf, boundary));
+            let number =
+                |s: &str| -> u32 { s.split(' ').next().unwrap_or("").parse().unwrap_or(0) };
+            assert!(
+                number(&below) < 1024,
+                "{boundary} B/s 下方显示 {below}，越过了档位量级"
+            );
+            assert_eq!(number(&at), 1, "{boundary} B/s 处应显示 1：{at}");
+        }
     }
 
     #[test]
@@ -913,7 +930,7 @@ mod tests {
                     "dpi {dpi}: 数值矩形压到标签矩形"
                 );
                 assert!(
-                    layout.arrow_left - layout.value_right >= 4,
+                    layout.arrow_left - layout.value_right >= 8,
                     "dpi {dpi}: CPU/MEM 列与网速列之间只剩 {}px",
                     layout.arrow_left - layout.value_right
                 );
@@ -930,8 +947,8 @@ mod tests {
         }
     }
 
-    /// 网速列必须装得下**任何**取值格式化出来的文本：千分位、GB 档、以及 MB 档
-    /// 在 1 GiB 边界前那个 `1024.0`。用真实格式化结果复验，不做常量之间的自证。
+    /// 网速列必须装得下**任何**取值格式化出来的文本（四位数、GB 档、各档上界）。
+    /// 用真实格式化结果复验，不做常量之间的自证。
     #[test]
     fn speed_column_fits_every_tier() {
         let mut samples: Vec<u32> = vec![
