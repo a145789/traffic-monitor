@@ -62,9 +62,12 @@ pub const DISPLAY_WIDTH: i32 = 170;
 pub const DISPLAY_HEIGHT: i32 = 32;
 pub const GAP: i32 = -3;
 
-pub const LAYOUT_COL_GAP: i32 = 13;
+// 两列的宽度刻意不设常量：列宽由当前字体实测字宽算出（`renderer::Layout::measure`）。
+// 固定像素列宽在字号/DPI 变化时只有两种结局——留白过多，或把最后一个字形裁掉。
+/// 标签（`CPU:` / `MEM:`）左边界留白：96-DPI 基准，随实际 DPI 缩放。
+pub const LAYOUT_LEFT_MARGIN: i32 = 2;
+/// 网速文本右边界留白：96-DPI 基准，随实际 DPI 缩放。
 pub const LAYOUT_SPEED_MARGIN: i32 = 4;
-pub const LAYOUT_COL_WIDTH: i32 = 76;
 
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
 pub const WM_USER_NETWORK_RECONNECTED: u32 = WM_USER + 4;

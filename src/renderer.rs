@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE,
-    FONT_FACE_NAME, FONT_WEIGHT_NORMAL, LAYOUT_COL_GAP, LAYOUT_COL_WIDTH, LAYOUT_SPEED_MARGIN,
+    FONT_FACE_NAME, FONT_WEIGHT_NORMAL, LAYOUT_LEFT_MARGIN, LAYOUT_SPEED_MARGIN,
     REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
@@ -19,6 +19,26 @@ use crate::util::{copy_wide_truncated, diag, dpi_scaled, log_event, reg_read_dwo
 
 const ARROW_UP: [u16; 2] = [0x2191, 0];
 const ARROW_DOWN: [u16; 2] = [0x2193, 0];
+
+/// 测量箭头列宽度时用的文本：箭头字形 + 一个空格。
+///
+/// 实际只画 `↑`/`↓`（不带空格），净宽里多出的那个空格就是箭头与速率数字之间的
+/// 固定间隔；把它算进箭头列宽，速率列才能贴着箭头右对齐而不会碰到箭头。
+const ARROW_PADDED: &str = "\u{2191} ";
+
+/// 网速列宽度按**最宽可能文本**预留，不再用固定像素列宽。
+///
+/// `format_speed_wide` 每个档位只有一个最宽形态（整数位最多 4 位、小数固定 1 位；
+/// MB 档在 1 GiB 边界前还会显示 `1024.0`），取这几条候选串宽度的最大值即网速文本
+/// 的上界：千分位 `1023.9 MB/s` 整条放得下，既不会被右对齐裁掉高位，也压不到箭头列。
+/// 改档位或精度必须同步这里；`speed_column_fits_every_tier` 用真实格式化结果复验。
+const SPEED_WIDTH_PROBES: [&str; 5] = [
+    "1023 B/s",
+    "1023.9 KB/s",
+    "1023.9 MB/s",
+    "1024.0 MB/s",
+    "4.0 GB/s",
+];
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
@@ -73,7 +93,6 @@ pub struct Renderer {
     text_color: COLORREF,
     width: i32,
     height: i32,
-    arrow_width: i32,
     layout: Layout,
     buf: Vec<u16>,
 }
@@ -315,7 +334,7 @@ impl Renderer {
             let _ = SetBkMode(dc.0, TRANSPARENT);
         }
 
-        let arrow_width = measure_arrow_width(dc.0);
+        let layout = Layout::measure(dc.0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
         drop(screen_dc);
 
@@ -329,8 +348,7 @@ impl Renderer {
             text_color: COLORREF(COLOR_LIGHT_TEXT),
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
-            arrow_width,
-            layout: Layout::new(DISPLAY_WIDTH, DISPLAY_HEIGHT),
+            layout,
             buf: Vec::with_capacity(32),
         })
     }
@@ -343,12 +361,23 @@ impl Renderer {
         }
     }
 
-    fn format_cpu_mem_wide<'a>(buf: &'a mut Vec<u16>, label: &str, value: u32) -> &'a mut [u16] {
+    /// 标签段（`CPU:` / `MEM:`）：静态文本，左对齐绘制，两行共用同一左边界。
+    fn format_label_wide<'a>(buf: &'a mut Vec<u16>, label: &str) -> &'a mut [u16] {
         buf.clear();
         buf.extend(label.encode_utf16());
-        buf.extend(": ".encode_utf16());
-        write_u32(buf, value);
-        buf.extend("%".encode_utf16());
+        buf.push(b':' as u16);
+        buf.push(0);
+        buf
+    }
+
+    /// 数值段（`0%`~`100%`）：右对齐绘制，`%` 永远停在同一列。
+    ///
+    /// 上界钳到 100：数值列宽按 `100%` 的实测字宽预留，钳制让「字段一定装得下」
+    /// 由格式化本身保证，而不是依赖采集侧永不越界——越界会被右对齐裁掉高位数字。
+    fn format_percent_wide(buf: &mut Vec<u16>, value: u32) -> &mut [u16] {
+        buf.clear();
+        write_u32(buf, value.min(100));
+        buf.push(b'%' as u16);
         buf.push(0);
         buf
     }
@@ -397,7 +426,6 @@ impl Renderer {
         let values = DisplayValues::load();
 
         let layout = self.layout;
-        let arrow_right = layout.speed_left + self.arrow_width;
 
         // 填充画布背景为透明色键，并设置文字颜色。
         // SAFETY: self.hdc_mem 为本结构体独占的内存 DC，self.hbrush 为本结构体独占的刷子，
@@ -410,17 +438,19 @@ impl Renderer {
             SetTextColor(self.hdc_mem, self.text_color);
         }
 
+        // 网速列：箭头左对齐，速率从箭头列右边界起右对齐——速率矩形按最宽文本预留，
+        // 任何量级的数字都只在矩形内向左长，碰不到箭头。
         let mut rc_up_arrow = RECT {
-            left: layout.speed_left,
+            left: layout.arrow_left,
             top: 0,
-            right: arrow_right,
+            right: layout.arrow_right,
             bottom: layout.half_height,
         };
         let mut up_arrow = ARROW_UP;
         draw_text(self.hdc_mem, &mut up_arrow, &mut rc_up_arrow, DT_LEFT);
 
         let mut rc_up_val = RECT {
-            left: arrow_right,
+            left: layout.arrow_right,
             top: 0,
             right: layout.speed_right,
             bottom: layout.half_height,
@@ -429,16 +459,16 @@ impl Renderer {
         draw_text(self.hdc_mem, up_val, &mut rc_up_val, DT_RIGHT);
 
         let mut rc_down_arrow = RECT {
-            left: layout.speed_left,
+            left: layout.arrow_left,
             top: layout.half_height,
-            right: arrow_right,
+            right: layout.arrow_right,
             bottom: self.height,
         };
         let mut down_arrow = ARROW_DOWN;
         draw_text(self.hdc_mem, &mut down_arrow, &mut rc_down_arrow, DT_LEFT);
 
         let mut rc_down_val = RECT {
-            left: arrow_right,
+            left: layout.arrow_right,
             top: layout.half_height,
             right: layout.speed_right,
             bottom: self.height,
@@ -446,23 +476,42 @@ impl Renderer {
         let down_val = Self::format_speed_wide(&mut self.buf, values.speed_down);
         draw_text(self.hdc_mem, down_val, &mut rc_down_val, DT_RIGHT);
 
-        let cpu_wide = Self::format_cpu_mem_wide(&mut self.buf, "CPU", values.cpu);
-        let mut rc_cpu = RECT {
-            left: layout.cpu_left,
+        // CPU/MEM 列：标签左对齐（静态，两行同一起点），数值右对齐（动态，`%` 同列）。
+        let cpu_label = Self::format_label_wide(&mut self.buf, "CPU");
+        let mut rc_cpu_label = RECT {
+            left: layout.label_left,
             top: 0,
-            right: layout.cpu_right,
+            right: layout.label_right,
             bottom: layout.half_height,
         };
-        draw_text(self.hdc_mem, cpu_wide, &mut rc_cpu, DT_RIGHT);
+        draw_text(self.hdc_mem, cpu_label, &mut rc_cpu_label, DT_LEFT);
 
-        let mem_wide = Self::format_cpu_mem_wide(&mut self.buf, "MEM", values.mem);
-        let mut rc_mem = RECT {
-            left: layout.cpu_left,
+        let cpu_value = Self::format_percent_wide(&mut self.buf, values.cpu);
+        let mut rc_cpu_value = RECT {
+            left: layout.value_left,
+            top: 0,
+            right: layout.value_right,
+            bottom: layout.half_height,
+        };
+        draw_text(self.hdc_mem, cpu_value, &mut rc_cpu_value, DT_RIGHT);
+
+        let mem_label = Self::format_label_wide(&mut self.buf, "MEM");
+        let mut rc_mem_label = RECT {
+            left: layout.label_left,
             top: layout.half_height,
-            right: layout.cpu_right,
+            right: layout.label_right,
             bottom: self.height,
         };
-        draw_text(self.hdc_mem, mem_wide, &mut rc_mem, DT_RIGHT);
+        draw_text(self.hdc_mem, mem_label, &mut rc_mem_label, DT_LEFT);
+
+        let mem_value = Self::format_percent_wide(&mut self.buf, values.mem);
+        let mut rc_mem_value = RECT {
+            left: layout.value_left,
+            top: layout.half_height,
+            right: layout.value_right,
+            bottom: self.height,
+        };
+        draw_text(self.hdc_mem, mem_value, &mut rc_mem_value, DT_RIGHT);
 
         // 把内存 DC 内容一次性 blit 到目标窗口 DC。
         // SAFETY: hdc 为调用方在本次同步调用期间有效的目标 DC，self.hdc_mem 为本结构体独占的内存 DC；
@@ -542,10 +591,9 @@ impl Renderer {
 
         self.width = width;
         self.height = height;
-        self.layout = Layout::new(width, height);
+        self.layout = Layout::measure(self.hdc_mem, width, height);
 
         // hdc_mem 常驻：背景模式只需 new() 设一次，此处仅换位图/字体。
-        self.arrow_width = measure_arrow_width(self.hdc_mem);
         true
     }
 
@@ -576,33 +624,69 @@ impl Drop for Renderer {
     }
 }
 
-/// 双列布局（物理像素），随窗口宽度按 96-DPI 基准缩放。
+/// 双列布局（物理像素），三处边界的锚点各不相同，改之前先读这里：
+///
+/// - **标签**（`CPU:` / `MEM:`）左对齐锚在 `label_left`：静态文本，两行必须同一起点；
+/// - **数值**（`0%`~`100%`）右对齐锚在 `value_right`，字段宽度按最宽数值 `100%` 预留：
+///   动态文本变宽只向左长，`%` 始终停在同一列；
+/// - **网速列**右锚在 `speed_right`，列宽 = 箭头列 + 最宽速率文本（[`SPEED_WIDTH_PROBES`]），
+///   故 `arrow_right` 起的速率矩形恰好装得下千分位文本，永远压不到箭头。
+///
+/// 标签块左锚、网速列右锚，两列之间剩下的空间全部留在中间：它随 DPI 变化是因为
+/// 「位图宽度取整」与「字号取整」不同步（字号先跳一档、宽度只涨几个百分点）。96-DPI
+/// 基准下中间距 12px，最紧的 dpi 100 是 6px；下限由 `layout_has_no_overlap_across_dpi`
+/// 在整个 DPI 范围上钉死。
 ///
 /// `width` 必须取已舍入的实际宽度（`dpi_scaled(DISPLAY_WIDTH, dpi)` 的输出），
-/// 禁止经整数 DPI 中转二次舍入（96–384 实测 77 处差一像素）；改任一侧舍入
-/// 策略都要重新全范围对账。纯值类型：随 DPI 更新整体重算并缓存（`Renderer::layout`），
+/// 禁止经整数 DPI 中转二次舍入（96–384 实测 77 处差一像素）；改任一侧舍入策略
+/// 都要重新全范围对账。纯值类型：随 DPI 更新整体重算并缓存（`Renderer::layout`），
 /// 渲染热路径零分配纪律不变。
 #[derive(Clone, Copy)]
 struct Layout {
-    speed_left: i32,
+    label_left: i32,
+    label_right: i32,
+    value_left: i32,
+    value_right: i32,
+    arrow_left: i32,
+    arrow_right: i32,
     speed_right: i32,
-    cpu_left: i32,
-    cpu_right: i32,
     half_height: i32,
 }
 
 impl Layout {
-    fn new(width: i32, height: i32) -> Self {
+    /// 在已选入目标字体的 `hdc` 上实测字宽并算出整套边界。
+    ///
+    /// 文本矩形一律按实测 extent 定尺：测量与绘制共用同一个 DC 与字体，`DrawTextW`
+    /// 对齐时用的就是这个 extent，字形墨迹必然落在矩形内（左对齐看右边界、右对齐看
+    /// 左边界）。不额外加抗裁字余量——最紧的 DPI 上 1px 就会把列间距挤掉。
+    fn measure(hdc: HDC, width: i32, height: i32) -> Self {
         let scale = width as f64 / DISPLAY_WIDTH as f64;
+
+        let label_width = measure_str(hdc, "CPU:").max(measure_str(hdc, "MEM:"));
+        let value_width = measure_str(hdc, "100%");
+        let space_width = measure_str(hdc, " ");
+        let arrow_width = measure_str(hdc, ARROW_PADDED);
+        let speed_width = SPEED_WIDTH_PROBES
+            .iter()
+            .map(|probe| measure_str(hdc, probe))
+            .max()
+            .unwrap_or(0);
+
+        let label_left = (LAYOUT_LEFT_MARGIN as f64 * scale).round() as i32;
+        let label_right = label_left + label_width;
+        let value_left = label_right + space_width;
+        let value_right = value_left + value_width;
         let speed_right = width - (LAYOUT_SPEED_MARGIN as f64 * scale).round() as i32;
-        let speed_left = speed_right - (LAYOUT_COL_WIDTH as f64 * scale).round() as i32;
-        let cpu_right = speed_left - (LAYOUT_COL_GAP as f64 * scale).round() as i32;
-        let cpu_left = cpu_right - (LAYOUT_COL_WIDTH as f64 * scale).round() as i32;
+        let arrow_left = speed_right - (arrow_width + speed_width);
+
         Self {
-            speed_left,
+            label_left,
+            label_right,
+            value_left,
+            value_right,
+            arrow_left,
+            arrow_right: arrow_left + arrow_width,
             speed_right,
-            cpu_left,
-            cpu_right,
             half_height: height / 2,
         }
     }
@@ -620,14 +704,24 @@ fn draw_text(hdc: HDC, text: &mut [u16], rect: &mut RECT, align: DRAW_TEXT_FORMA
     }
 }
 
-fn measure_arrow_width(hdc: HDC) -> i32 {
-    let arrow_text = to_wide("\u{2191} ");
+/// 用 `hdc` 当前选入的字体测量文本宽度（物理像素）。
+///
+/// `text` 与 `DrawTextW` 的入参同形（NUL 结尾），测量时去掉尾 NUL：与渲染共用同一个
+/// DC 和字体，量出来的就是实际绘制宽度（`Layout` 的全部列边界都以此为准）。
+fn measure_wide(hdc: HDC, text: &[u16]) -> i32 {
+    let len = text.len().saturating_sub(1);
     let mut size = SIZE::default();
-    // SAFETY: hdc 有效；arrow_text 以 NUL 结尾；size 在栈上分配。
+    // SAFETY: hdc 有效且已选入被测量的字体；text 为 NUL 结尾的宽串，截掉尾 NUL 后
+    // 仍落在同一缓冲区内；size 在栈上，GetTextExtentPoint32W 不保留指针。
     unsafe {
-        let _ = GetTextExtentPoint32W(hdc, &arrow_text[..arrow_text.len() - 1], &mut size);
+        let _ = GetTextExtentPoint32W(hdc, &text[..len], &mut size);
     }
     size.cx
+}
+
+fn measure_str(hdc: HDC, text: &str) -> i32 {
+    let wide = to_wide(text);
+    measure_wide(hdc, &wide)
 }
 
 fn create_font(size: i32) -> HFONT {
@@ -751,6 +845,124 @@ mod tests {
             write_u32(&mut buf, input);
             assert_eq!(wide_to_string(&buf), expected);
         }
+    }
+
+    #[test]
+    fn test_format_label_and_percent_wide() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            wide_to_string(Renderer::format_label_wide(&mut buf, "CPU")),
+            "CPU:"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_label_wide(&mut buf, "MEM")),
+            "MEM:"
+        );
+        for (value, expected) in [(0, "0%"), (5, "5%"), (50, "50%"), (100, "100%")] {
+            assert_eq!(
+                wide_to_string(Renderer::format_percent_wide(&mut buf, value)),
+                expected
+            );
+        }
+        // 越界钳制：数值列宽按 `100%` 预留，超出只显示 100%，不裁掉高位数字。
+        assert_eq!(
+            wide_to_string(Renderer::format_percent_wide(&mut buf, 101)),
+            "100%"
+        );
+        assert_eq!(
+            wide_to_string(Renderer::format_percent_wide(&mut buf, u32::MAX)),
+            "100%"
+        );
+    }
+
+    /// 在给定字号的独立内存 DC 上执行 `f`，退出前把 stock 对象换回 DC。
+    ///
+    /// 换回是必须的：`DeleteObject` 对仍被选中的对象无效，只有换回后字体才随
+    /// `OwnedGdi` 的 Drop 真正释放（与 `Renderer::drop` 同一释放序）。
+    fn with_font<T>(font_size: i32, f: impl FnOnce(HDC) -> T) -> T {
+        let dc = OwnedGdi::new(unsafe { CreateCompatibleDC(None) }).expect("测试环境 GDI 不可用");
+        let font = OwnedGdi::new(create_font(font_size)).expect("测试环境 GDI 不可用");
+        // SAFETY: dc.0 为刚创建的有效内存 DC；font.0 为未被任何 DC 选中的独占对象。
+        let old = unsafe { SelectObject(dc.0, font.0.into()) };
+        assert!(!old.is_invalid(), "测试环境无法选入字体");
+        let result = f(dc.0);
+        // SAFETY: old 是本函数换出的原选中对象，仍然有效；换回后 font 才脱离 DC。
+        assert!(
+            !unsafe { SelectObject(dc.0, old) }.is_invalid(),
+            "测试环境无法还原 DC 的选中对象"
+        );
+        result
+    }
+
+    /// 跨 DPI 的布局不变量：静态标签与动态数值互不重叠、两列之间始终有间距、
+    /// 网速列整体不越出位图。
+    ///
+    /// 96–384 DPI 逐档扫（步长 1），因为这些边界是「位图宽度取整」与「字号取整」
+    /// 两套取整共同算出来的，极值只出现在个别 DPI 上（最紧的是 dpi 100）。
+    #[test]
+    fn layout_has_no_overlap_across_dpi() {
+        for dpi in 96..=384u32 {
+            with_font(dpi_scaled(FONT_BASE_SIZE, dpi), |hdc| {
+                let width = dpi_scaled(DISPLAY_WIDTH, dpi);
+                let height = dpi_scaled(DISPLAY_HEIGHT, dpi);
+                let layout = Layout::measure(hdc, width, height);
+
+                assert!(layout.label_left >= 0, "dpi {dpi}: 标签越出左边界");
+                assert!(
+                    layout.value_left > layout.label_right,
+                    "dpi {dpi}: 数值矩形压到标签矩形"
+                );
+                assert!(
+                    layout.arrow_left - layout.value_right >= 4,
+                    "dpi {dpi}: CPU/MEM 列与网速列之间只剩 {}px",
+                    layout.arrow_left - layout.value_right
+                );
+                assert!(
+                    layout.arrow_right > layout.arrow_left,
+                    "dpi {dpi}: 箭头列为空"
+                );
+                assert!(
+                    layout.speed_right <= width,
+                    "dpi {dpi}: 网速列越过位图右边界"
+                );
+                assert_eq!(layout.half_height, height / 2, "dpi {dpi}: 半高错位");
+            });
+        }
+    }
+
+    /// 网速列必须装得下**任何**取值格式化出来的文本：千分位、GB 档、以及 MB 档
+    /// 在 1 GiB 边界前那个 `1024.0`。用真实格式化结果复验，不做常量之间的自证。
+    #[test]
+    fn speed_column_fits_every_tier() {
+        let mut samples: Vec<u32> = vec![
+            0,
+            1,
+            1023,
+            1024,
+            1025,
+            1024 * 1024 - 1,
+            1024 * 1024,
+            1024 * 1024 * 1024 - 1,
+            1024 * 1024 * 1024,
+            u32::MAX,
+        ];
+        // 全域粗扫：步长取素数，避开档位边界的整数倍，才扫得到档内最宽形态。
+        samples.extend((0..=u32::MAX).step_by(65_537));
+
+        with_font(FONT_BASE_SIZE, |hdc| {
+            let layout = Layout::measure(hdc, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+            let field_width = layout.speed_right - layout.arrow_right;
+            let mut buf = Vec::with_capacity(32);
+            for value in samples {
+                let text = Renderer::format_speed_wide(&mut buf, value);
+                let shown = wide_to_string(text);
+                let text_width = measure_wide(hdc, text);
+                assert!(
+                    text_width <= field_width,
+                    "网速 {value} B/s 显示为 {shown}（{text_width}px）超过速率列宽 {field_width}px"
+                );
+            }
+        });
     }
 
     #[test]
