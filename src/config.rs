@@ -58,7 +58,7 @@ pub const DEBUG_LOG_MAX_BYTES: u64 = 256 * 1024;
 /// 连续写失败达此次数即在进程内自动关开关（注册表值不动，重启后重载）。
 pub const DEBUG_LOG_DISABLE_AFTER_FAILURES: u32 = 3;
 
-pub const DISPLAY_WIDTH: i32 = 170;
+pub const DISPLAY_WIDTH: i32 = 160;
 pub const DISPLAY_HEIGHT: i32 = 32;
 pub const GAP: i32 = -3;
 
