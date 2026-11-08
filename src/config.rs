@@ -68,6 +68,10 @@ pub const GAP: i32 = -3;
 pub const LAYOUT_LEFT_MARGIN: i32 = 2;
 /// 网速文本右边界留白：96-DPI 基准，随实际 DPI 缩放。
 pub const LAYOUT_SPEED_MARGIN: i32 = 4;
+/// 冒号与百分比数值列之间的间距：96-DPI 基准，随实际 DPI 缩放。
+pub const LAYOUT_VALUE_GAP: i32 = 1;
+/// 箭头与网速数值列之间的间距：96-DPI 基准，随实际 DPI 缩放。
+pub const LAYOUT_ARROW_GAP: i32 = 1;
 
 pub const WM_USER_NETWORK_DISCONNECTED: u32 = WM_USER + 3;
 pub const WM_USER_NETWORK_RECONNECTED: u32 = WM_USER + 4;

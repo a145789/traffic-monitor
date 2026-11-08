@@ -11,20 +11,14 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::{
     COLOR_DARK_TEXT, COLOR_KEY, COLOR_LIGHT_TEXT, DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE,
-    FONT_FACE_NAME, FONT_WEIGHT_NORMAL, LAYOUT_LEFT_MARGIN, LAYOUT_SPEED_MARGIN,
-    REG_PATH_PERSONALIZE,
+    FONT_FACE_NAME, FONT_WEIGHT_NORMAL, LAYOUT_ARROW_GAP, LAYOUT_LEFT_MARGIN, LAYOUT_SPEED_MARGIN,
+    LAYOUT_VALUE_GAP, REG_PATH_PERSONALIZE,
 };
 use crate::state::{CPU_USAGE, MEM_USAGE, NET_SPEED_DOWN, NET_SPEED_UP};
 use crate::util::{copy_wide_truncated, diag, dpi_scaled, log_event, reg_read_dword, to_wide};
 
 const ARROW_UP: [u16; 2] = [0x2191, 0];
 const ARROW_DOWN: [u16; 2] = [0x2193, 0];
-
-/// 测量箭头列宽度时用的文本：箭头字形 + 一个空格。
-///
-/// 实际只画 `↑`/`↓`（不带空格），净宽里多出的那个空格就是箭头与速率数字之间的
-/// 固定间隔；把它算进箭头列宽，速率列才能贴着箭头右对齐而不会碰到箭头。
-const ARROW_PADDED: &str = "\u{2191} ";
 
 /// 网速列宽度按**最宽可能文本**预留，不再用固定像素列宽。
 ///
@@ -355,7 +349,7 @@ impl Renderer {
         }
     }
 
-    /// 标签段（`CPU:` / `MEM:`）：静态文本，左对齐绘制，两行共用同一左边界。
+    /// 标签段（`CPU:` / `MEM:`）：静态文本，左对齐绘制，两行共用同一右缘（冒号同列）。
     fn format_label_wide<'a>(buf: &'a mut Vec<u16>, label: &str) -> &'a mut [u16] {
         buf.clear();
         buf.extend(label.encode_utf16());
@@ -466,8 +460,8 @@ impl Renderer {
         let down_val = Self::format_speed_wide(&mut self.buf, values.speed_down);
         draw_text(self.hdc_mem, down_val, &mut rc_down_val, DT_RIGHT);
 
-        // CPU/MEM 列：标签从各自实测起点左对齐画到同一个右缘（冒号同列），数值从
-        // 冒号后固定间隔起左对齐——位数变化只向右长，`2%` 不会浮在离标签很远的地方。
+        // CPU/MEM 列：标签从各自实测起点左对齐画到同一个右缘（冒号同列），数值在
+        // 固定宽度字段内右对齐——位数变化只向左长，`%` 永远停在同一列。
         let cpu_label = Self::format_label_wide(&mut self.buf, "CPU");
         let mut rc_cpu_label = RECT {
             left: layout.cpu_label_left,
@@ -484,7 +478,7 @@ impl Renderer {
             right: layout.value_right + 1,
             bottom: layout.half_height,
         };
-        draw_text(self.hdc_mem, cpu_value, &mut rc_cpu_value, DT_LEFT);
+        draw_text(self.hdc_mem, cpu_value, &mut rc_cpu_value, DT_RIGHT);
 
         let mem_label = Self::format_label_wide(&mut self.buf, "MEM");
         let mut rc_mem_label = RECT {
@@ -502,7 +496,7 @@ impl Renderer {
             right: layout.value_right + 1,
             bottom: self.height,
         };
-        draw_text(self.hdc_mem, mem_value, &mut rc_mem_value, DT_LEFT);
+        draw_text(self.hdc_mem, mem_value, &mut rc_mem_value, DT_RIGHT);
 
         // 把内存 DC 内容一次性 blit 到目标窗口 DC。
         // SAFETY: hdc 为调用方在本次同步调用期间有效的目标 DC，self.hdc_mem 为本结构体独占的内存 DC；
@@ -620,15 +614,15 @@ impl Drop for Renderer {
 /// - **标签**（`CPU:` / `MEM:`）以 `label_right` 为**右缘**、各自从实测起点
 ///   （`cpu_label_left` / `mem_label_left`）**左对齐**起画：两个冒号因此同列，
 ///   而 `CPU` 比 `MEM` 窄的那几像素自然表现为首字母不齐（冒号对齐的必然代价）；
-/// - **数值**（`0%`~`100%`）从 `value_left` 起**左对齐**，字段宽度按最宽数值 `100%`
-///   预留：数字位数变化只往右长，左边缘紧贴冒号不动；右对齐会把 `2%` 推到离标签
-///   很远的地方，所以这里不按右缘锚定；
+/// - **数值**（`0%`~`100%`）在 [`value_left`, `value_right`] 字段内**右对齐**，
+///   字段宽度按最宽数值 `100%` 预留：数字位数变化只往左长，`%` 永远停在同一列；
+///   个位数时数字与冒号之间会有字段内的留白，这是右对齐的必然代价；
 /// - **网速列**左锚在 `arrow_left`、右锚在 `speed_right`，列宽 = 箭头列 + 最宽速率
 ///   文本（[`SPEED_WIDTH_PROBES`]），故速率矩形恰好装得下 `1023 MB/s`，压不到箭头。
 ///
 /// 标签块左锚、网速列右锚，两列之间剩下的空间全部留在中间：它随 DPI 变化是因为
 /// 「位图宽度取整」与「字号取整」不同步（字号先跳一档、宽度只涨几个百分点）。96-DPI
-/// 基准下中间距 12px；下限由 `layout_has_no_overlap_across_dpi` 在整个 DPI 范围上钉死。
+/// 基准下中间距 18px；下限由 `layout_has_no_overlap_across_dpi` 在整个 DPI 范围上钉死。
 ///
 /// `width` 必须取已舍入的实际宽度（`dpi_scaled(DISPLAY_WIDTH, dpi)` 的输出），
 /// 禁止经整数 DPI 中转二次舍入（96–384 实测 77 处差一像素）；改任一侧舍入策略
@@ -650,11 +644,11 @@ struct Layout {
 impl Layout {
     /// 在已选入目标字体的 `hdc` 上实测字宽并算出整套边界。
     ///
-    /// 每段文本都按**左对齐 + 实测起点**绘制，矩形右边界额外放 1px：
-    /// `DT_RIGHT` 要求矩形宽度不小于字形 advance，一旦量宽与绘制取整差一像素，
-    /// 字形左缘就会被矩形裁掉（`MEM:` 的 `M` 会缺左竖）。左对齐从实测起点起画，
-    /// 越界只可能发生在右侧，1px 余量足够；这样两个标签共用同一右边界（冒号同列）
-    /// 又不会互相牵连。
+    /// 矩形右边界额外放 1px：`DT_RIGHT` 要求矩形宽度不小于字形 advance，一旦量宽
+    /// 与绘制取整差一像素，字形左缘就会被矩形裁掉（`MEM:` 的 `M` 会缺左竖）。
+    /// 标签按**左对齐 + 实测起点**绘制，越界只可能发生在右侧，1px 余量足够；
+    /// 这样两个标签共用同一右边界（冒号同列）又不会互相牵连。数值与网速字段
+    /// 宽度按各自最宽文本预留，同样靠这 1px 余量兜住取整差。
     fn measure(hdc: HDC, width: i32, height: i32) -> Self {
         let scale = width as f64 / DISPLAY_WIDTH as f64;
 
@@ -662,8 +656,9 @@ impl Layout {
         let mem_label_width = measure_str(hdc, "MEM:");
         let label_width = cpu_label_width.max(mem_label_width);
         let value_width = measure_str(hdc, "100%");
-        let space_width = measure_str(hdc, " ");
-        let arrow_width = measure_str(hdc, ARROW_PADDED);
+        // 箭头列宽 = 字形实测宽 + 固定间距：间距算进列宽，右对齐的速率字段才不会碰到箭头。
+        let arrow_width =
+            measure_wide(hdc, &ARROW_UP) + (LAYOUT_ARROW_GAP as f64 * scale).round() as i32;
         let speed_width = SPEED_WIDTH_PROBES
             .iter()
             .map(|probe| measure_str(hdc, probe))
@@ -671,7 +666,7 @@ impl Layout {
             .unwrap_or(0);
 
         let label_right = (LAYOUT_LEFT_MARGIN as f64 * scale).round() as i32 + label_width;
-        let value_left = label_right + space_width;
+        let value_left = label_right + (LAYOUT_VALUE_GAP as f64 * scale).round() as i32;
         let value_right = value_left + value_width;
         let speed_right = width - (LAYOUT_SPEED_MARGIN as f64 * scale).round() as i32;
         let arrow_left = speed_right - (arrow_width + speed_width);
@@ -691,11 +686,16 @@ impl Layout {
 }
 
 fn draw_text(hdc: HDC, text: &mut [u16], rect: &mut RECT, align: DRAW_TEXT_FORMAT) {
-    // SAFETY: hdc 有效；rect 在栈上；text 为 NUL 结尾的 UTF-16 缓冲区。
+    // windows crate 按切片长度传 cchText：尾 NUL 会被当成一个有 advance 的字符，
+    // DT_RIGHT 下整条文本左移一个默认字形宽、最宽文本左缘被裁。与 measure_wide
+    // 同一口径截掉尾 NUL，量宽与绘制才一致。
+    let len = text.len().saturating_sub(1);
+    // SAFETY: hdc 有效；rect 在栈上；text 为 NUL 结尾的 UTF-16 缓冲区，截掉尾 NUL
+    // 后仍落在同一缓冲区内，DrawTextW 不保留指针。
     unsafe {
         let _ = DrawTextW(
             hdc,
-            text,
+            &mut text[..len],
             rect,
             DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | align,
         );
@@ -1066,6 +1066,74 @@ mod tests {
         );
 
         // 收尾：把原选中位图换回，target_bitmap 才能随 OwnedGdi 真正释放。
+        // SAFETY: old_bitmap 是本用例换出的原选中对象，仍然有效。
+        assert!(!unsafe { SelectObject(target.0, old_bitmap) }.is_invalid());
+    }
+
+    /// 百分比右对齐回归：同一帧里个位数（`5%`）与三位数（`100%`）的墨迹右缘必须
+    /// 同列并顶到字段右界，且个位数左缘更靠右。退回左对齐时右缘随位数变化，
+    /// 这些断言都会失败。
+    #[test]
+    fn percent_values_are_right_aligned() {
+        use crate::state::{CPU_USAGE, MEM_USAGE};
+
+        CPU_USAGE.store(5, Ordering::Relaxed);
+        MEM_USAGE.store(100, Ordering::Relaxed);
+
+        let mut renderer = Renderer::new().expect("测试环境 GDI 不可用");
+        let layout = renderer.layout;
+        let (width, height) = renderer.bitmap_size();
+
+        let screen_dc = ScreenDcGuard::acquire().expect("测试环境拿不到屏幕 DC");
+        // SAFETY: screen_dc.hdc 有效；尺寸取渲染器位图的实际尺寸。
+        let target = OwnedGdi::new(unsafe { CreateCompatibleDC(Some(screen_dc.hdc)) })
+            .expect("测试环境 GDI 不可用");
+        let target_bitmap =
+            OwnedGdi::new(unsafe { CreateCompatibleBitmap(screen_dc.hdc, width, height) })
+                .expect("测试环境 GDI 不可用");
+        // SAFETY: target.0 有效；target_bitmap.0 未被任何 DC 选中。
+        let old_bitmap = unsafe { SelectObject(target.0, target_bitmap.0.into()) };
+        assert!(!old_bitmap.is_invalid(), "无法把目标位图选入 DC");
+
+        renderer.render(target.0);
+
+        // 只扫数值字段窗口内的墨迹：标签在窗口左侧外，箭头在右侧外。
+        let value_ink = |y0: i32, y1: i32| -> (i32, i32) {
+            let mut lo = i32::MAX;
+            let mut hi = -1;
+            for y in y0..y1 {
+                for x in layout.value_left..=layout.value_right {
+                    // SAFETY: target.0 有效，坐标落在位图内。
+                    if unsafe { GetPixel(target.0, x, y) }.0 != COLOR_KEY {
+                        lo = lo.min(x);
+                        hi = hi.max(x);
+                    }
+                }
+            }
+            (lo, hi)
+        };
+        let cpu = value_ink(0, layout.half_height);
+        let mem = value_ink(layout.half_height, height);
+        assert!(cpu.1 >= 0 && mem.1 >= 0, "数值列没有画出墨迹");
+        assert!(
+            (cpu.1 - mem.1).abs() <= 1,
+            "两行百分比右缘不同列：cpu={} mem={}",
+            cpu.1,
+            mem.1
+        );
+        assert!(
+            cpu.0 > mem.0,
+            "个位数左缘应更靠右：cpu={} mem={}",
+            cpu.0,
+            mem.0
+        );
+        assert!(
+            mem.1 >= layout.value_right - 2,
+            "百分比右缘未顶到字段右界：{} vs {}",
+            mem.1,
+            layout.value_right
+        );
+
         // SAFETY: old_bitmap 是本用例换出的原选中对象，仍然有效。
         assert!(!unsafe { SelectObject(target.0, old_bitmap) }.is_invalid());
     }
