@@ -1,6 +1,6 @@
 # Agent Note：把缺失定时器集合与恢复武装状态降级为具名结构
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -16,10 +16,10 @@ Status: proposed
 
 ## 提案
 
-1. `MissingTimers` 换成三个具名字段的私有 struct（`fullscreen` / `network` / `cpu_mem: bool`），保留 `const EMPTY` 与 `is_empty()`；`missing_timer_plan` 直接读字段，删掉 `bit()` 与 ID→位映射；`register_missing_timers` 的日志改为显式列出缺失项（例如 `missing.fullscreen || missing.network || missing.cpu_mem` 三个具名分量）。对外 API 形状不变：`resync_monitoring_timers` 仍返回该类型、`retry_missing_timers` 仍返回 `bool`、`main.rs:588` 仍用 `.is_empty()`。
-2. `RECOVERY_ARM` 换成三态 enum（如 `Armed` / `DisarmedUnlogged` / `DisarmedLogged`）或 `Option<bool>`，删掉 `saturating_add` 与 `unwrap_or(0)`；`set_recovery_interval` 的日志去重直接读该状态。
-3. 删掉 `RECOVERY_INTERVAL_MS` 注释里「0 表示尚未武装」半句，或让 `recovery_tick` 显式以武装状态而非「间隔是否为 0」判定。
-4. 净值按行数与判据面估计约 35-40 行，不是外部评审给的「约 80 行」：`MissingTimers` 整块（含测试改写）约 25-30 行，`RECOVERY_ARM` 约 10 行。
+1. `MissingTimers` 换成三个具名字段的私有 struct（`fullscreen` / `network` / `cpu_mem: bool`），保留 `const EMPTY` 与 `is_empty()`；`missing_timer_plan` 直接读字段，删掉 `bit()` 与 ID→位映射；`register_missing_timers` 的日志由具名分量的 Debug 列出（`MissingTimers { fullscreen: true, network: false, cpu_mem: false }`），不再是 `MissingTimers(2)` 这种裸位掩码。对外 API 形状不变：`resync_monitoring_timers` 仍返回该类型、`retry_missing_timers` 仍返回 `bool`、`main.rs:588` 仍用 `.is_empty()`。
+2. `RECOVERY_ARM` 换成三态 enum（`Armed` / `DisarmedUnlogged` / `DisarmedLogged`），删掉 `saturating_add` 与 `unwrap_or(0)`；`set_recovery_interval` 的日志去重改为读该状态经纯函数 `arm_attempt_outcome` 得出的「本次是否首条」。
+3. 删掉 `RECOVERY_INTERVAL_MS` 注释里「0 表示尚未武装」半句（该变量的唯一读者是 `recovery_tick` 的退避计算，武装判据在 `RECOVERY_ARM`）。
+4. 净值实测（实施后核对）：非测试代码 +107/−70（净 +37），测试 +66/−8（净 +58），源码合计 +173/−78（净 +95）。原稿估计的「约 35-40 行（减少）」不成立，省下的位掩码与计数算术被两处新增抵消：`CoreTimer`（把「定时器 ID ↔ 缺失分量」这层一一对应显式化，否则写回方向只能退回 `usize` 的 `_ =>` 死分支），以及把「持续失败只记首条日志」从真实 `SetTimer` 失败路径解耦出来的纯函数用例。本条收益在判据面（删掉 `Option` 包装、`_ => None` 与失败计数三个无消费者/不可达判据）与现场日志可读性，不在行数。
 
 ## 明确不在本次范围
 
@@ -41,12 +41,14 @@ Status: proposed
 - `grep -n "saturating_add" src/recovery.rs` 不再出现在武装路径上。
 - `grep -n "0 表示尚未武装" src` 零命中。
 - 测试 `test_missing_timer_plan_only_covers_wanted_and_missing`（`src/suspend.rs:726`-`src/suspend.rs:755`）改写后四条断言的全部语义不变：空集 ⇒ 空清单；挂起态不补建；正常态只补缺失项且网络间隔随退避取值；全屏态只补全屏检测定时器。
+- `MissingTimers` 分量与判空由 `test_missing_timers_components_round_trip` 钉住：`mark` 只点亮对应分量，任一分量缺失都必须判为非空。
+- `arm_attempt_outcome` 的纯用例钉住「每条失败序列只在首条留痕」：从 `Armed` 或 `DisarmedUnlogged` 失败要留痕、`DisarmedLogged` 之后静默、成功即回到 `Armed` 并重置该档。
 - 冒烟用例 `src/smoke.rs:214`-`src/smoke.rs:233` 仍绿（它钉的是 `retry_missing_timers` 的返回语义而非表示）。
 - 四道门禁全绿：`cargo fmt -- --check`、`cargo test --locked`、`cargo build --release --locked`、`cargo clippy --all-targets --locked -- -D warnings`。
 
 ## 风险
 
 - 现场日志文本会与历史日志不同构。排查旧版本时需知道这一点；不影响任何自动化消费方。
-- 若用三态 enum 而变体名不精确（例如把「未记过日志」编码进 `Armed`），「持续失败只记首条日志」这条纪律会重新埋回布尔里，且现有测试覆盖不到（该路径依赖真实 `SetTimer` 失败）。落地时用显式变体名，不要靠 `Option<bool>` 的字面值猜。
+- 若用三态 enum 而变体名不精确（例如把「未记过日志」编码进 `Armed`），「持续失败只记首条日志」这条纪律会重新埋回布尔里，且现有测试覆盖不到（该路径依赖真实 `SetTimer` 失败）。落地时用显式变体名，不要靠 `Option<bool>` 的字面值猜。本次落地用三态具名变体，并把该纪律收进 `arm_attempt_outcome` 的纯用例，这条风险已收敛。
 - 删掉 `RECOVERY_INTERVAL_MS` 的死注释后，若将来真要做「0 = 未武装」判定，必须先改 `recovery_tick` 的 `.max()` 吸收逻辑，否则会造成反向误导。本提案只删死语义，不新增耦合。
 - `MissingTimers` 换成具名 struct 后，`{missing:?}` 的 Debug 形状改变；若有人曾按 `MissingTimers(` 前缀 grep 日志，需要同步更新排查手册（本仓无此类手册，此风险仅提醒）。

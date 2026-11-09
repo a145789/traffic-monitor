@@ -8,9 +8,9 @@
 //!
 //! **状态属主**：本模块的四个 `thread_local!` 事实（重建重试间隔、恢复间隔、武装
 //! 状态、DPI 失败原因）只由 UI 线程访问，唯一写方是 [`arm_rebuild_retry`] /
-//! [`disarm_rebuild_retry`] 与 [`set_recovery_interval`]，以及 DPI 失败原因那一对
-//! [`report_dpi_failure`] / [`clear_dpi_failure`]。`main.rs` 只能通过
-//! [`rebuild_retry_idle`] 这一只读判据观测重试间隔，不得在两处各持一份表示。
+//! [`disarm_rebuild_retry`]、[`set_recovery_interval`] / [`disarm_recovery_timer`]，
+//! 以及 DPI 失败原因那一对 [`report_dpi_failure`] / [`clear_dpi_failure`]。`main.rs`
+//! 只能通过 [`rebuild_retry_idle`] 这一只读判据观测重试间隔，不得在两处各持一份表示。
 
 use std::sync::atomic::Ordering;
 
@@ -37,13 +37,16 @@ thread_local! {
     /// 主窗口重建重试的当前间隔（毫秒）；0 表示不在重试序列中。
     /// 仅 UI 线程（看门狗过程与重建路径）读写。
     static REBUILD_RETRY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// 恢复调度 tick 的当前间隔（毫秒）；0 表示尚未武装。
+    /// 恢复调度 tick 的当前间隔（毫秒），只喂 [`recovery_tick`] 的退避计算。
+    /// 武装判据在 `RECOVERY_ARM`，与本值无关：本值即便为 0，`recovery_tick` 的
+    /// `.max(TIMER_INTERVAL_RECOVERY)` 也会把它吸收成基础间隔。
     /// 仅 UI 线程（看门狗过程与恢复调度路径）读写。
     static RECOVERY_INTERVAL_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// 恢复调度 tick 的武装状态：`None` = 已武装；`Some(n)` = 未武装且已连续失败 n 次
-    /// （`Some(0)` = 本进程还没试过）。唯一写方是 [`set_recovery_interval`]，
-    /// 唯一读方是 [`ensure_recovery_timer`]。仅 UI 线程访问。
-    static RECOVERY_ARM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(Some(0)) };
+    /// 恢复调度 tick 的武装状态（三态，见 [`RecoveryArm`]）。唯一写方是
+    /// [`set_recovery_interval`] 与 [`disarm_recovery_timer`]，唯一读方是
+    /// [`ensure_recovery_timer`]。仅 UI 线程访问。
+    static RECOVERY_ARM: std::cell::Cell<RecoveryArm> =
+        const { std::cell::Cell::new(RecoveryArm::DisarmedUnlogged) };
     /// 上一轮 DPI 事务的失败原因；`None` = 上一轮成功或无需提交。
     ///
     /// 唯一写方 [`report_dpi_failure`]（失败时写入本轮原因）与 [`clear_dpi_failure`]
@@ -108,6 +111,35 @@ pub(crate) fn disarm_rebuild_retry(watchdog: HWND) {
     }
 }
 
+/// 恢复调度 tick 的武装状态。
+///
+/// 三态而不是「失败计数 + 布尔」：真正承重的事实只有「已武装 / 未武装但这条失败序列
+/// 还没记过日志 / 未武装且已记过首条」这三档，计数值本身没有任何读者。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryArm {
+    /// 已武装：`SetTimer` 成功，周期 tick 由 OS 投递。
+    Armed,
+    /// 未武装，且这条失败序列还没记过日志：下次重新武装失败要留痕。
+    DisarmedUnlogged,
+    /// 未武装，且这条失败序列已记过首条日志：后续重试静默。
+    DisarmedLogged,
+}
+
+/// 一次武装尝试之后的武装状态，以及是否该记本失败序列的首条日志。
+///
+/// 首条日志纪律钉在「上一状态是否已记过」上：`Armed` 与 `DisarmedUnlogged` 都算没记过
+/// （前者是刚武装成功、后者是本进程还没试过），`DisarmedLogged` 才是已记过。做成纯
+/// 函数是为了能在无窗口环境下钉住这条纪律——真实 `SetTimer` 失败路径不进必跑门禁。
+fn arm_attempt_outcome(previous: RecoveryArm, armed: bool) -> (RecoveryArm, bool) {
+    if armed {
+        return (RecoveryArm::Armed, false);
+    }
+    (
+        RecoveryArm::DisarmedLogged,
+        previous != RecoveryArm::DisarmedLogged,
+    )
+}
+
 /// 在看门狗上武装/重置恢复调度 tick（恢复调度器唯一的定时器入口）。
 ///
 /// 看门狗**永不参与挂起、永不重建**，因此这个 tick 在任何状态下都存在——这解决了
@@ -122,17 +154,13 @@ fn set_recovery_interval(watchdog: HWND, interval: u32) {
     RECOVERY_INTERVAL_MS.with(|c| c.set(interval));
     // SAFETY: watchdog 是看门狗窗口句柄，与调用方同属 UI 线程；不使用回调函数。
     let armed = unsafe { SetTimer(Some(watchdog), TIMER_ID_RECOVERY, interval, None) != 0 };
-    let failures = RECOVERY_ARM.with(|c| c.get()).unwrap_or(0);
-    if armed {
-        RECOVERY_ARM.with(|c| c.set(None));
-    } else {
-        RECOVERY_ARM.with(|c| c.set(Some(failures.saturating_add(1))));
-        // 只在失败序列首次留痕：`ensure_recovery_timer` 会在每个周期 tick 上重试，
-        // 持续失败不得把日志刷成噪声。
-        if failures == 0 {
-            diag!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败，将在下个周期 tick 重试");
-            log_event!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败，将在下个周期 tick 重试");
-        }
+    let (next, first_failure) = arm_attempt_outcome(RECOVERY_ARM.with(|c| c.get()), armed);
+    RECOVERY_ARM.with(|c| c.set(next));
+    // 只在失败序列首次留痕：`ensure_recovery_timer` 会在每个周期 tick 上重试，
+    // 持续失败不得把日志刷成噪声。
+    if first_failure {
+        diag!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败，将在下个周期 tick 重试");
+        log_event!("恢复调度定时器({TIMER_ID_RECOVERY}) 创建失败，将在下个周期 tick 重试");
     }
 }
 
@@ -155,7 +183,7 @@ pub(crate) fn arm_recovery_timer(watchdog: HWND) {
 /// **已武装时必须直接返回**：`SetTimer` 复用同一 ID 会重设倒计时，每个 tick 都武装
 /// 一次会让恢复周期永远到不了。
 pub(crate) fn ensure_recovery_timer() {
-    if RECOVERY_ARM.with(|c| c.get()).is_none() {
+    if RECOVERY_ARM.with(|c| c.get()) == RecoveryArm::Armed {
         return;
     }
     if let Some(watchdog) = watchdog_hwnd() {
@@ -166,7 +194,7 @@ pub(crate) fn ensure_recovery_timer() {
 /// 退出在即：撤销恢复调度 tick，并标记为已武装以免退出序列被处理前被周期 tick
 /// 重新武装。
 pub(crate) fn disarm_recovery_timer(watchdog: HWND) {
-    RECOVERY_ARM.with(|c| c.set(None));
+    RECOVERY_ARM.with(|c| c.set(RecoveryArm::Armed));
     // SAFETY: watchdog 是看门狗窗口句柄，与调用方同属 UI 线程；KillTimer 对不存在的
     // 定时器 ID 只返回错误，无副作用。
     unsafe {
@@ -378,7 +406,31 @@ mod tests {
     //! 恢复能力表的语义测试：只覆盖不依赖真 Explorer 的补做失败路径与真值源纪律，
     //! 不创建真实窗口（真窗口路径见 `src/smoke.rs`）。
 
-    use super::rearm_tray_and_session_capabilities;
+    use super::{RecoveryArm, arm_attempt_outcome, rearm_tray_and_session_capabilities};
+
+    #[test]
+    fn arm_attempt_outcome_logs_first_failure_of_each_sequence_only() {
+        // 启动后的首次失败：留痕并进入「已记过」。
+        assert_eq!(
+            arm_attempt_outcome(RecoveryArm::DisarmedUnlogged, false),
+            (RecoveryArm::DisarmedLogged, true)
+        );
+        // 同一失败序列的后续重试：静默（否则周期 tick 会把日志刷成噪声）。
+        assert_eq!(
+            arm_attempt_outcome(RecoveryArm::DisarmedLogged, false),
+            (RecoveryArm::DisarmedLogged, false)
+        );
+        // 已武装的 tick 重新武装失败：旧实现的计数从 0 起算，此时同样要留痕。
+        assert_eq!(
+            arm_attempt_outcome(RecoveryArm::Armed, false),
+            (RecoveryArm::DisarmedLogged, true)
+        );
+        // 成功即回到已武装，并重置「记过日志」这一档，下次故障重新留痕。
+        assert_eq!(
+            arm_attempt_outcome(RecoveryArm::DisarmedLogged, true),
+            (RecoveryArm::Armed, false)
+        );
+    }
 
     #[test]
     fn dpi_failure_reason_dedupes_and_resets() {

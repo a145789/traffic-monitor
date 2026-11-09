@@ -318,52 +318,57 @@ fn current_timer_plan() -> TimerPlan {
     )
 }
 
-/// 核心监测定时器的缺失集合（位掩码）。
+/// 三个核心监测定时器：全屏检测、网络采样、CPU/内存采样。
+///
+/// 定时器 ID 只经由 [`CoreTimer::timer_id`] 投影一次：补建路径按本类型寻址，
+/// 缺失集合按具名分量寻址，两者之外不存在第三份「ID → 位」映射。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreTimer {
+    Fullscreen,
+    Network,
+    CpuMem,
+}
+
+impl CoreTimer {
+    fn timer_id(self) -> usize {
+        match self {
+            Self::Fullscreen => TIMER_ID_FULLSCREEN,
+            Self::Network => TIMER_ID_NETWORK,
+            Self::CpuMem => TIMER_ID_CPU_MEM,
+        }
+    }
+}
+
+/// 核心监测定时器的缺失集合（三个具名分量）。
 ///
 /// 「哪些定时器应当存在」的唯一真值源仍是 [`timer_plan`] 推导出的计划集合；本类型
 /// 只承载「上一轮『先杀后建』同步里哪几个没建起来」这一瞬态事实，供看门狗上的
-/// 恢复调度器补建。定时器 ID 与位的映射收在 [`MissingTimers::bit`] 一处。
+/// 恢复调度器补建。分量与 [`timer_plan`] 的三个核心定时器一一对应，没有「未知定时器」
+/// 这一档语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MissingTimers(u32);
+pub struct MissingTimers {
+    fullscreen: bool,
+    network: bool,
+    cpu_mem: bool,
+}
 
 impl MissingTimers {
-    pub const EMPTY: Self = Self(0);
-
-    fn bit(timer_id: usize) -> Option<u32> {
-        match timer_id {
-            TIMER_ID_FULLSCREEN => Some(1 << 0),
-            TIMER_ID_NETWORK => Some(1 << 1),
-            TIMER_ID_CPU_MEM => Some(1 << 2),
-            _ => None,
-        }
-    }
-
-    fn from_results(fullscreen_ok: bool, network_ok: bool, cpu_mem_ok: bool) -> Self {
-        let mut missing = Self::EMPTY;
-        for (timer_id, ok) in [
-            (TIMER_ID_FULLSCREEN, fullscreen_ok),
-            (TIMER_ID_NETWORK, network_ok),
-            (TIMER_ID_CPU_MEM, cpu_mem_ok),
-        ] {
-            if !ok {
-                missing = missing.with(timer_id);
-            }
-        }
-        missing
-    }
+    pub const EMPTY: Self = Self {
+        fullscreen: false,
+        network: false,
+        cpu_mem: false,
+    };
 
     pub fn is_empty(self) -> bool {
-        self.0 == 0
+        !self.fullscreen && !self.network && !self.cpu_mem
     }
 
-    fn has(self, timer_id: usize) -> bool {
-        Self::bit(timer_id).is_some_and(|b| self.0 & b != 0)
-    }
-
-    fn with(self, timer_id: usize) -> Self {
-        match Self::bit(timer_id) {
-            Some(b) => Self(self.0 | b),
-            None => self,
+    /// 补建失败时把对应分量写回缺失集合。
+    fn mark(&mut self, timer: CoreTimer) {
+        match timer {
+            CoreTimer::Fullscreen => self.fullscreen = true,
+            CoreTimer::Network => self.network = true,
+            CoreTimer::CpuMem => self.cpu_mem = true,
         }
     }
 }
@@ -407,23 +412,23 @@ pub fn resync_monitoring_timers(hwnd: HWND) -> MissingTimers {
 }
 
 /// 纯判定：把「当前计划要求的定时器」与「缺失集合」映射为补建清单
-/// `(timer_id, interval)`。
+/// `(定时器, interval)`。
 ///
 /// 两个条件必须同时满足：计划要求存在 **且** 在缺失集合里。计划不要求的缺失项
 /// 视为已解决——计划是唯一真值源，例如失败之后状态已切到挂起/全屏，此时绝不能把
 /// 监测定时器补回来。清单为空 ⇒ 补建函数不调用任何 `set_coalescable_timer`。
-fn missing_timer_plan(plan: &TimerPlan, missing: MissingTimers) -> Vec<(usize, u32)> {
+fn missing_timer_plan(plan: &TimerPlan, missing: MissingTimers) -> Vec<(CoreTimer, u32)> {
     let mut pending = Vec::new();
-    if plan.fullscreen && missing.has(TIMER_ID_FULLSCREEN) {
-        pending.push((TIMER_ID_FULLSCREEN, TIMER_INTERVAL_FULLSCREEN));
+    if plan.fullscreen && missing.fullscreen {
+        pending.push((CoreTimer::Fullscreen, TIMER_INTERVAL_FULLSCREEN));
     }
     if let Some(interval) = plan.network_interval
-        && missing.has(TIMER_ID_NETWORK)
+        && missing.network
     {
-        pending.push((TIMER_ID_NETWORK, interval));
+        pending.push((CoreTimer::Network, interval));
     }
-    if plan.cpu_mem && missing.has(TIMER_ID_CPU_MEM) {
-        pending.push((TIMER_ID_CPU_MEM, CPU_MEM_INTERVAL));
+    if plan.cpu_mem && missing.cpu_mem {
+        pending.push((CoreTimer::CpuMem, CPU_MEM_INTERVAL));
     }
     pending
 }
@@ -442,10 +447,10 @@ pub fn retry_missing_timers(hwnd: HWND) -> bool {
     }
     let plan = current_timer_plan();
     let mut still_missing = MissingTimers::EMPTY;
-    for (timer_id, interval) in missing_timer_plan(&plan, registered) {
-        if !set_coalescable_timer(hwnd, timer_id, interval) {
-            diag!("恢复调度: 补建监测定时器({timer_id}) 失败");
-            still_missing = still_missing.with(timer_id);
+    for (timer, interval) in missing_timer_plan(&plan, registered) {
+        if !set_coalescable_timer(hwnd, timer.timer_id(), interval) {
+            diag!("恢复调度: 补建监测定时器({}) 失败", timer.timer_id());
+            still_missing.mark(timer);
         }
     }
     register_missing_timers(still_missing);
@@ -502,7 +507,11 @@ pub fn sync_monitoring_timers(hwnd: HWND) -> MissingTimers {
         diag!("同步监测定时器失败: CPU/内存采样定时器({TIMER_ID_CPU_MEM}) 未创建");
     }
 
-    MissingTimers::from_results(fullscreen_ok, network_ok, cpu_mem_ok)
+    MissingTimers {
+        fullscreen: !fullscreen_ok,
+        network: !network_ok,
+        cpu_mem: !cpu_mem_ok,
+    }
 }
 
 fn set_coalescable_timer(hwnd: HWND, timer_id: usize, interval: u32) -> bool {
@@ -730,10 +739,11 @@ mod tests {
             missing_timer_plan(&timer_plan(false, false, false), MissingTimers::EMPTY).is_empty()
         );
 
-        let all_missing = MissingTimers::EMPTY
-            .with(TIMER_ID_FULLSCREEN)
-            .with(TIMER_ID_NETWORK)
-            .with(TIMER_ID_CPU_MEM);
+        let all_missing = MissingTimers {
+            fullscreen: true,
+            network: true,
+            cpu_mem: true,
+        };
 
         // 计划不要求的缺失项视为已解决：挂起态定时器集合全空，绝不允许补回来。
         assert!(missing_timer_plan(&timer_plan(true, false, false), all_missing).is_empty());
@@ -742,15 +752,48 @@ mod tests {
         assert_eq!(
             missing_timer_plan(
                 &timer_plan(false, false, true),
-                MissingTimers::EMPTY.with(TIMER_ID_NETWORK)
+                MissingTimers {
+                    network: true,
+                    ..MissingTimers::EMPTY
+                }
             ),
-            vec![(TIMER_ID_NETWORK, TIMER_INTERVAL_NETWORK_BACKOFF)]
+            vec![(CoreTimer::Network, TIMER_INTERVAL_NETWORK_BACKOFF)]
         );
 
         // 全屏态只有全屏检测定时器要求存在，其余缺失项被计划过滤掉。
         assert_eq!(
             missing_timer_plan(&timer_plan(false, true, false), all_missing),
-            vec![(TIMER_ID_FULLSCREEN, TIMER_INTERVAL_FULLSCREEN)]
+            vec![(CoreTimer::Fullscreen, TIMER_INTERVAL_FULLSCREEN)]
         );
+    }
+
+    #[test]
+    fn test_missing_timers_components_round_trip() {
+        // 位掩码换成具名分量后，两个方向各由一处代码承载，都要钉住：`mark` 的 match
+        // 错配会让补建失败的定时器被当成已补齐、从此不再重试；`is_empty` 漏判任一分量
+        // 则让启动尾段（`main.rs`）把「仍有定时器没建起来」误报成就位。
+        let fullscreen = MissingTimers {
+            fullscreen: true,
+            ..MissingTimers::EMPTY
+        };
+        let network = MissingTimers {
+            network: true,
+            ..MissingTimers::EMPTY
+        };
+        let cpu_mem = MissingTimers {
+            cpu_mem: true,
+            ..MissingTimers::EMPTY
+        };
+        for (timer, expected) in [
+            (CoreTimer::Fullscreen, fullscreen),
+            (CoreTimer::Network, network),
+            (CoreTimer::CpuMem, cpu_mem),
+        ] {
+            assert!(!expected.is_empty(), "{expected:?} 必须判为非空");
+            let mut missing = MissingTimers::EMPTY;
+            missing.mark(timer);
+            assert_eq!(missing, expected, "{timer:?} 只能点亮自己那一项");
+        }
+        assert!(MissingTimers::EMPTY.is_empty());
     }
 }
