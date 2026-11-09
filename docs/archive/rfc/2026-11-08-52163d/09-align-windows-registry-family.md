@@ -1,6 +1,6 @@
 # Agent Note：windows-registry 对齐 windows 0.62 依赖家族，消除 link/result/strings 双版本
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
