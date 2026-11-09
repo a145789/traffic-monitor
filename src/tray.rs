@@ -127,58 +127,56 @@ pub(crate) fn tray_owner() -> Option<HWND> {
     TRAY_DATA.with(|t| t.borrow().as_ref().map(|nid| nid.hWnd))
 }
 
-/// 菜单项定义。`text` 为 NUL 结尾 UTF-16（`to_wide` 产出），由调用方持有至菜单关闭。
-enum MenuEntry {
-    Item { id: u32, text: Vec<u16>, state: u32 },
-    Separator,
-}
-
-fn build_menu_entries() -> Vec<MenuEntry> {
+/// 逐项构建固定 6 项菜单。文本缓冲只需活过同步插入调用：菜单文本由菜单
+/// 自身持有（取回时 GetMenuItemInfo 要求调用方另备缓冲拷出），不引用调用方内存。
+fn build_menu(hmenu: HMENU) {
     let update_in_progress = UPDATE_IN_PROGRESS.load(Ordering::Relaxed);
-    vec![
-        MenuEntry::Item {
-            id: 0,
-            text: to_wide(&format!("{APP_TITLE} v{VERSION}")),
-            state: MFS_DISABLED.0,
+    insert_string_item(
+        hmenu,
+        0,
+        0,
+        &to_wide(&format!("{APP_TITLE} v{VERSION}")),
+        MFS_DISABLED.0,
+    );
+    insert_separator(hmenu, 1);
+    insert_string_item(
+        hmenu,
+        2,
+        MENU_ID_AUTOSTART,
+        &to_wide("开机自启"),
+        if is_autostart_enabled() {
+            MFS_CHECKED.0
+        } else {
+            MFS_UNCHECKED.0
         },
-        MenuEntry::Separator,
-        MenuEntry::Item {
-            id: MENU_ID_AUTOSTART,
-            text: to_wide("开机自启"),
-            state: if is_autostart_enabled() {
-                MFS_CHECKED.0
-            } else {
-                MFS_UNCHECKED.0
-            },
+    );
+    insert_string_item(
+        hmenu,
+        3,
+        MENU_ID_AUTO_UPDATE_TOGGLE,
+        &to_wide("自动检查更新"),
+        if ENABLE_AUTO_UPDATE.load(Ordering::Relaxed) {
+            MFS_CHECKED.0
+        } else {
+            MFS_UNCHECKED.0
         },
-        MenuEntry::Item {
-            id: MENU_ID_AUTO_UPDATE_TOGGLE,
-            text: to_wide("自动检查更新"),
-            state: if ENABLE_AUTO_UPDATE.load(Ordering::Relaxed) {
-                MFS_CHECKED.0
-            } else {
-                MFS_UNCHECKED.0
-            },
+    );
+    insert_string_item(
+        hmenu,
+        4,
+        MENU_ID_CHECK_UPDATE_MANUAL,
+        &to_wide(if update_in_progress {
+            "检查更新中..."
+        } else {
+            "检查更新..."
+        }),
+        if update_in_progress {
+            MFS_DISABLED.0
+        } else {
+            MFS_UNCHECKED.0
         },
-        MenuEntry::Item {
-            id: MENU_ID_CHECK_UPDATE_MANUAL,
-            text: to_wide(if update_in_progress {
-                "检查更新中..."
-            } else {
-                "检查更新..."
-            }),
-            state: if update_in_progress {
-                MFS_DISABLED.0
-            } else {
-                MFS_UNCHECKED.0
-            },
-        },
-        MenuEntry::Item {
-            id: MENU_ID_EXIT,
-            text: to_wide("退出"),
-            state: MFS_UNCHECKED.0,
-        },
-    ]
+    );
+    insert_string_item(hmenu, 5, MENU_ID_EXIT, &to_wide("退出"), MFS_UNCHECKED.0);
 }
 
 /// 插入字符串菜单项；`text` 须以 NUL 结尾（`to_wide` 产出即可）。
@@ -191,7 +189,8 @@ fn insert_string_item(hmenu: HMENU, pos: u32, id: u32, text: &[u16], state: u32)
         ..Default::default()
     };
     item.dwTypeData = PWSTR(text.as_ptr() as *mut u16);
-    // SAFETY: text 在 InsertMenuItemW 同步返回前保持存活。
+    // SAFETY: text NUL 终止且在 InsertMenuItemW 同步返回前保持存活；
+    // MIIM_STRING 文本由菜单复制持有，此后不再引用该缓冲。
     unsafe {
         let _ = InsertMenuItemW(hmenu, pos, true, &item);
     }
@@ -220,20 +219,11 @@ pub fn show_context_menu(hwnd: HWND) {
     };
     let menu_guard = MenuGuard(hmenu);
 
-    // entries 持有全部菜单文本缓冲区，须存活至 TrackPopupMenu 返回。
-    let entries = build_menu_entries();
-    for (pos, entry) in entries.iter().enumerate() {
-        match entry {
-            MenuEntry::Separator => insert_separator(hmenu, pos as u32),
-            MenuEntry::Item { id, text, state } => {
-                insert_string_item(hmenu, pos as u32, *id, text, *state);
-            }
-        }
-    }
+    build_menu(hmenu);
 
     // TPM_RETURNCMD：先取命令，再把前台权交还任务栏，最后执行，避免更新弹窗
     // 关闭后焦点回落主进程并初始化第三方 IME（见 AGENTS.md）。
-    // SAFETY: hmenu 由 MenuGuard 持有至 TrackPopupMenu 返回；菜单项宽串仍在栈上。
+    // SAFETY: hmenu 由 MenuGuard 持有至 TrackPopupMenu 返回；菜单文本由菜单自身持有。
     let selected_item = unsafe {
         let _ = SetForegroundWindow(hwnd);
         TrackPopupMenu(
