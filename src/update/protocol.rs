@@ -98,50 +98,29 @@ pub(super) fn run_check_subprocess(is_manual: bool) -> SubprocessOutcome {
         }
     };
 
-    let outcome_scan = match child.stdout.take() {
+    let mut outcome = match child.stdout.take() {
         Some(stdout) => {
             let mut reader = BufReader::new(stdout);
             scan_subprocess_protocol(&mut reader, post_update_action_to_watchdog)
         }
-        None => ScanOutcome {
-            saw_valid_action: false,
-            busy: false,
-            exit_signalled: false,
-            read_failed: true,
-            exit_forwarded: false,
-        },
+        None => failed(),
     };
-    let ScanOutcome {
-        saw_valid_action,
-        busy,
-        exit_signalled,
-        read_failed,
-        exit_forwarded,
-    } = outcome_scan;
 
     let exit_status = match child.wait() {
         Ok(status) => status,
         Err(_) => {
             log_event!("等待更新子进程退出失败");
-            return SubprocessOutcome {
-                is_error: true,
-                busy,
-                exit_signalled,
-                exit_forwarded,
-            };
+            outcome.is_error = true;
+            return outcome;
         }
     };
 
-    if exit_signalled && !exit_forwarded {
+    if outcome.exit_signalled && !outcome.exit_forwarded {
         log_event!("EXIT_MAIN 已读到但未送达看门狗，主进程不会开始退出");
     }
 
-    SubprocessOutcome {
-        is_error: read_failed || !saw_valid_action || !exit_status.success(),
-        busy,
-        exit_signalled,
-        exit_forwarded,
-    }
+    outcome.is_error |= !exit_status.success();
+    outcome
 }
 
 /// 父侧：把自身身份写进子进程命令行。
@@ -165,24 +144,10 @@ pub(super) fn bind_parent_identity(command: &mut std::process::Command) {
         .arg(start.to_string());
 }
 
-/// 子进程 stdout 协议扫描结果：[`scan_subprocess_protocol`] 的具名返回。
+/// 逐行扫描子进程 stdout 协议，返回 [`SubprocessOutcome`]。
 ///
-/// 替代 `(Option<UpdateAction>, bool, bool, bool)` 四元组——三个 `bool` 在位置上
-/// 无法区分，调用点只能靠顺序记忆；字段名即文档，零运行时成本。
-struct ScanOutcome {
-    /// 是否读到过至少一个有效动作行（`DONE` / `EXIT_MAIN` / `BUSY`）；空流或全无效行时为 `false`。
-    saw_valid_action: bool,
-    /// 是否读到 `BUSY`（本次未执行检查）。
-    busy: bool,
-    /// 是否读到 `EXIT_MAIN`（协议层事实，不代表通知已送达）。
-    exit_signalled: bool,
-    /// 读取是否失败（I/O 错误，含遇到无效 UTF-8 行）。
-    read_failed: bool,
-    /// `EXIT_MAIN` 是否成功转发给看门狗（消息已入队，等待看门狗处理）。
-    exit_forwarded: bool,
-}
-
-/// 逐行扫描子进程 stdout 协议，返回 [`ScanOutcome`]。
+/// `is_error` 在扫描边界折叠「读失败或未读到任何有效动作行（`DONE` / `EXIT_MAIN` /
+/// `BUSY`）」；调用方在 `child.wait()` 后再并入退出码是否成功。
 ///
 /// 不变量（由本模块 tests 以 Cursor 喂协议行钉死）：读到 `EXIT_MAIN` 即调用
 /// `on_exit_main` 转发且仅转发一次（exit_signalled 守卫），转发发生在扫描期间、
@@ -192,7 +157,7 @@ struct ScanOutcome {
 fn scan_subprocess_protocol(
     reader: &mut impl BufRead,
     mut on_exit_main: impl FnMut() -> bool,
-) -> ScanOutcome {
+) -> SubprocessOutcome {
     let mut saw_valid_action = false;
     let mut busy = false;
     let mut exit_signalled = false;
@@ -225,11 +190,10 @@ fn scan_subprocess_protocol(
         }
     }
 
-    ScanOutcome {
-        saw_valid_action,
+    SubprocessOutcome {
+        is_error: read_failed || !saw_valid_action,
         busy,
         exit_signalled,
-        read_failed,
         exit_forwarded,
     }
 }
@@ -541,7 +505,7 @@ mod tests {
         }
     }
 
-    fn scan(data: &[u8]) -> (ScanOutcome, usize) {
+    fn scan(data: &[u8]) -> (SubprocessOutcome, usize) {
         let mut reader = std::io::Cursor::new(data);
         let mut forwards = 0usize;
         let outcome = scan_subprocess_protocol(&mut reader, || {
@@ -551,7 +515,7 @@ mod tests {
         (outcome, forwards)
     }
 
-    fn scan_with_dead_target(data: &[u8]) -> ScanOutcome {
+    fn scan_with_dead_target(data: &[u8]) -> SubprocessOutcome {
         let mut reader = std::io::Cursor::new(data);
         scan_subprocess_protocol(&mut reader, || false)
     }
@@ -561,10 +525,9 @@ mod tests {
         // forwards（回调次数）与 outcome.exit_forwarded（送达结果）是两个独立观测通道：
         // 前者证明"只转发一次"，后者证明"转发成功被正确上报"，互不可推导。
         let (outcome, forwards) = scan(b"EXIT_MAIN\n");
-        assert!(outcome.saw_valid_action);
+        assert!(!outcome.is_error);
         assert!(!outcome.busy);
         assert!(outcome.exit_signalled);
-        assert!(!outcome.read_failed);
         assert_eq!(forwards, 1);
         assert!(outcome.exit_forwarded);
     }
@@ -579,20 +542,18 @@ mod tests {
     #[test]
     fn test_scan_done_does_not_forward() {
         let (outcome, forwards) = scan(b"DONE\n");
-        assert!(outcome.saw_valid_action);
+        assert!(!outcome.is_error);
         assert!(!outcome.busy);
         assert!(!outcome.exit_signalled);
-        assert!(!outcome.read_failed);
         assert_eq!(forwards, 0);
     }
 
     #[test]
     fn test_scan_busy_is_valid_action_without_completion() {
         let (outcome, forwards) = scan(b"BUSY\n");
-        assert!(outcome.saw_valid_action);
+        assert!(!outcome.is_error);
         assert!(outcome.busy);
         assert!(!outcome.exit_signalled);
-        assert!(!outcome.read_failed);
         assert_eq!(forwards, 0);
     }
 
@@ -600,36 +561,32 @@ mod tests {
     fn test_scan_unknown_line_before_busy_does_not_stop_reading() {
         let (outcome, _) = scan(b"NO_UPDATE\nBUSY\n");
         assert!(outcome.busy);
-        assert!(outcome.saw_valid_action);
-        assert!(!outcome.read_failed);
+        assert!(!outcome.is_error);
     }
 
     #[test]
     fn test_scan_invalid_lines_do_not_block_later_exit_main() {
         let (outcome, forwards) = scan(b"NO_UPDATE\nEXIT_MAIN|extra\nEXIT_MAIN\n");
-        assert!(outcome.saw_valid_action);
+        assert!(!outcome.is_error);
         assert!(!outcome.busy);
         assert!(outcome.exit_signalled);
-        assert!(!outcome.read_failed);
         assert_eq!(forwards, 1);
     }
 
     #[test]
     fn test_scan_empty_stream() {
         let (outcome, forwards) = scan(b"");
-        assert!(!outcome.saw_valid_action);
+        assert!(outcome.is_error);
         assert!(!outcome.busy);
         assert!(!outcome.exit_signalled);
-        assert!(!outcome.read_failed);
         assert_eq!(forwards, 0);
     }
 
     #[test]
     fn test_scan_invalid_utf8_marks_read_failed() {
         let (outcome, forwards) = scan(&[0xFF, 0xFE, b'\n']);
-        assert!(!outcome.saw_valid_action);
+        assert!(outcome.is_error);
         assert!(!outcome.exit_signalled);
-        assert!(outcome.read_failed);
         assert_eq!(forwards, 0);
     }
 

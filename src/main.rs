@@ -409,8 +409,7 @@ fn main() {
     }
 
     // 调试日志开关要在第一处可能写日志的调用之前加载：自去提权的自检结论只落在日志里
-    // （见 `de_elevate_self`）。本行与尾段 `refresh_debug_log_flag` 的同名调用幂等
-    // （同一次注册表读），可安全重复。
+    // （见 `de_elevate_self`）。主进程只在本入口加载一次。
     refresh_debug_log_flag();
 
     // 自去提权必须早于单例锁与任何窗口创建：否则本进程已持有互斥量，替代实例会撞上
@@ -487,7 +486,6 @@ fn main() {
 
     let auto_update = load_auto_update_enabled();
     ENABLE_AUTO_UPDATE.store(auto_update, Ordering::Relaxed);
-    refresh_debug_log_flag();
 
     match Renderer::new() {
         Ok(r) => renderer::set_renderer(r),

@@ -38,7 +38,6 @@ const SUPPORTED_IF_TYPES: [u32; 4] = [
 ];
 
 thread_local! {
-    static CURRENT_DATA: RefCell<HashMap<u64, (u64, u64)>> = RefCell::new(HashMap::with_capacity(16));
     static INTERFACE_HISTORY: RefCell<HashMap<u64, Sample>> = RefCell::new(HashMap::with_capacity(16));
     // 值 + 可选时间戳：空名单即合法初值，None 表示从未刷新。
     static VIRTUAL_BLACKLIST: RefCell<(HashSet<u64>, Option<Instant>)> =
@@ -52,9 +51,6 @@ struct MibTable(*mut MIB_IF_TABLE2);
 
 impl MibTable {
     fn rows(&self) -> &[MIB_IF_ROW2] {
-        if self.0.is_null() {
-            return &[];
-        }
         // SAFETY: self.0 是由成功返回的 GetIfTable2 分配的非空有效指针
         //（唯一构造点 `collect_network` 已判空，无其他构造路径）。
         let num_entries = unsafe { (*self.0).NumEntries as usize };
@@ -103,35 +99,32 @@ pub fn collect_network(hwnd: HWND) {
 
     let table_wrapper = MibTable(table);
 
+    let mut current_data = HashMap::with_capacity(16);
     with_virtual_blacklist(|virtual_blacklist| {
-        CURRENT_DATA.with(|cell| {
-            let mut current_data = cell.borrow_mut();
-            let fell_back =
-                fill_candidates(&mut current_data, table_wrapper.rows(), virtual_blacklist);
-            report_zero_candidate_fallback(fell_back);
+        let fell_back = fill_candidates(&mut current_data, table_wrapper.rows(), virtual_blacklist);
+        report_zero_candidate_fallback(fell_back);
 
-            // 首 tick 基线不需要独立标志：历史表为空时 select_winner_interface 对每个
-            // LUID 都取不到历史并返回 (0, 0)，同时把本次数据写入历史——"无历史即零速"
-            // 是被单测钉死的唯一属主，此处不再维护平行的初始化状态。
-            let now = Instant::now();
-            let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
-                .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
+        // 首 tick 基线不需要独立标志：历史表为空时 select_winner_interface 对每个
+        // LUID 都取不到历史并返回 (0, 0)，同时把本次数据写入历史——"无历史即零速"
+        // 是被单测钉死的唯一属主，此处不再维护平行的初始化状态。
+        let now = Instant::now();
+        let (best_speed_down, best_speed_up) = INTERFACE_HISTORY
+            .with(|hist| select_winner_interface(&current_data, &mut hist.borrow_mut(), now));
 
-            NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
-            NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
+        NET_SPEED_DOWN.store(best_speed_down, Ordering::Relaxed);
+        NET_SPEED_UP.store(best_speed_up, Ordering::Relaxed);
 
-            if current_data.is_empty() {
-                let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if count == BACKOFF_ZERO_THRESHOLD {
-                    post_to_main(hwnd, WM_USER_NETWORK_DISCONNECTED);
-                }
-            } else {
-                let previous = CONSECUTIVE_ZERO_COUNT.swap(0, Ordering::Relaxed);
-                if previous >= BACKOFF_ZERO_THRESHOLD {
-                    post_to_main(hwnd, WM_USER_NETWORK_RECONNECTED);
-                }
+        if current_data.is_empty() {
+            let count = CONSECUTIVE_ZERO_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == BACKOFF_ZERO_THRESHOLD {
+                post_to_main(hwnd, WM_USER_NETWORK_DISCONNECTED);
             }
-        });
+        } else {
+            let previous = CONSECUTIVE_ZERO_COUNT.swap(0, Ordering::Relaxed);
+            if previous >= BACKOFF_ZERO_THRESHOLD {
+                post_to_main(hwnd, WM_USER_NETWORK_RECONNECTED);
+            }
+        }
     });
 }
 
