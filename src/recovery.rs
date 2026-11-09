@@ -24,7 +24,7 @@ use crate::config::{
 };
 use crate::live_main_hwnd;
 use crate::power::{ensure_power_notifications, ensure_session_notification, rearm_display_notify};
-use crate::state::{DPI_DIRTY, SUSPEND_REASON_MONITOR};
+use crate::state::DPI_DIRTY;
 use crate::suspend::{heal_stale_suspend, retry_missing_timers};
 use crate::tray::ensure_tray_icon;
 use crate::util::{diag, log_event};
@@ -193,7 +193,7 @@ pub(crate) fn recovery_tick(watchdog: HWND) {
 }
 
 /// 一轮恢复动作，全部通过 `live_main_hwnd()` 取当前主窗口：
-/// DPI 收敛（探针 + 事务）→ 补建缺失定时器 → 补做缺失的托盘/会话通知 → 按原因探针清陈旧挂起位。
+/// DPI 收敛（探针 + 事务）→ 补建缺失定时器 → 补做缺失的托盘/会话通知 → 按各原因的真值源清陈旧挂起位。
 ///
 /// 返回本轮是否全部成功（决定下个周期是否退避）。重建间隙（无主窗口）视为
 /// 「无事可做」而不是失败：主窗口重建自有 `arm_rebuild_retry` 的独立退避，
@@ -218,7 +218,7 @@ fn run_recovery() -> bool {
         all_ok = false;
     }
 
-    if heal_stale_suspend(hwnd) & SUSPEND_REASON_MONITOR != 0 {
+    if heal_stale_suspend(hwnd) {
         // TTL 清位等价于本进程承认「可能漏掉了一次点亮通知」：先撤销再重新订阅。
         rearm_display_notify(hwnd);
     } else {
