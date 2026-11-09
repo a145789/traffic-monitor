@@ -1,7 +1,7 @@
 //! Windows 窗口过程与重建冒烟（opt-in，需真实 Explorer/任务栏）。
 //!
 //! 只覆盖能自动化的部分：建窗与嵌入、重建路径（含旧绑定的迁移断言）、
-//! 定时器收敛与挂起对称、DPI 脏位由恢复事务清位。渲染像素比对、真实跨屏 DPI、
+//! 定时器收敛与挂起对称、DPI 事务提交与探针幂等。渲染像素比对、真实跨屏 DPI、
 //! 故障注入不做自动化。残留缺口（已如实记录）：电源句柄值域不透明，
 //! “注销先于 DestroyWindow 的顺序”只由代码评审覆盖，详见重建用例内注释。
 //!
@@ -237,12 +237,17 @@ fn timers_converge_across_suspend_resume() {
 
 #[test]
 #[ignore]
-fn dpi_dirty_cleared_by_recovery_transaction() {
+fn dpi_change_transaction_commits_window_and_bitmap() {
     let fx = Fixture::setup();
-    // 处理器用 GetDpiForWindow 取当前 DPI，手工发消息不会改变它：
-    // 消息分支只更新资源并重嵌入，从不清脏位（清位点唯一归恢复事务所有）；
-    // 真正的跨屏 DPI 行为见本文件头部人工清单。
+    // 主窗口过程的 WM_DPICHANGED 走 `recovery::sync_dpi`：手工发消息不会改变真实
+    // DPI，但前置脏位让事务真的跑一遍（重建位图/字体 → 对齐尺寸 → 提交几何 → 清位）。
+    // 嵌入后收不到本消息这一事实无法在单进程内伪造，真实的缩放/跨屏行为见文件头
+    // 人工清单；周期探针的存在由末尾的幂等断言钉住。
     require_taskbar();
+    // DPI 事务第 2 步会重跑嵌入序列；先在本机确认嵌入可行，否则失败信息会错误地
+    // 指向「清位」断言，而真正原因是环境不允许跨进程 SetParent（如提权 shell）。
+    crate::window::embed_in_taskbar(fx.main())
+        .expect("嵌入任务栏失败：请确认 explorer.exe 正在运行");
     // 前置脏位：模拟一次已失败的 DPI 更新。干净初值会让末尾断言空洞
     // （成功分支根本不碰该位），预置是本用例承重的必要条件。
     crate::state::DPI_DIRTY.store(true, Ordering::Release);
@@ -251,10 +256,10 @@ fn dpi_dirty_cleared_by_recovery_transaction() {
     unsafe {
         SendMessageW(fx.main(), WM_DPICHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
     }
-    // 本分支的承重不变量：WM_DPICHANGED 的两条失败出口都必须收敛到「窗口物理尺寸
-    // == 位图尺寸」——资源换新成功那条由 embed_in_taskbar 提交完整几何，嵌入失败
-    // 那条由 align_window_size_to 兜底。此处真跑的是成功出口（本机任务栏横向、嵌入
-    // 成功）；失败出口需竖排任务栏或真实瞬态失败，仍归文件头的人工清单。
+    assert!(
+        !crate::state::DPI_DIRTY.load(Ordering::Acquire),
+        "WM_DPICHANGED 的 DPI 事务成功即清位（清位权仍只在 recover_dpi 内）"
+    );
     let mut rc = RECT::default();
     assert!(
         // SAFETY: fx.main 为本线程有效窗口；GetWindowRect 为查询型调用，只写本地 RECT。
@@ -266,19 +271,16 @@ fn dpi_dirty_cleared_by_recovery_transaction() {
     assert_eq!(
         (rc.right - rc.left, rc.bottom - rc.top),
         bitmap,
-        "WM_DPICHANGED 后窗口尺寸必须等于渲染器位图尺寸，否则 BitBlt 边缘会露色键底色"
+        "DPI 事务提交后窗口尺寸必须等于渲染器位图尺寸，否则 BitBlt 边缘会露色键底色"
     );
+    // 同 DPI 下再探一次必须是空操作：周期 tick 每秒都会调用它，若每次都重建位图，
+    // 「显示设置不变时零重建」这条就断了。
     assert!(
-        crate::state::DPI_DIRTY.load(Ordering::Acquire),
-        "消息分支成功时不得清位：清位权只归恢复事务"
-    );
-    // 驱动真正的清位 owner（恢复调度器的 DPI 事务），断言它收敛并清位。
-    assert!(
-        crate::recovery::recover_dpi(fx.main()),
-        "同 DPI 下恢复事务须成功"
+        !crate::recovery::sync_dpi(fx.main()),
+        "有效 DPI 未变时 DPI 探针必须返回 false（空操作）"
     );
     assert!(
         !crate::state::DPI_DIRTY.load(Ordering::Acquire),
-        "恢复事务成功后脏位必须被清"
+        "空操作不得置脏位"
     );
 }

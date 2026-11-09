@@ -66,6 +66,33 @@ pub fn take_renderer() {
     });
 }
 
+/// 渲染资源是否已按窗口的有效 DPI 构建；`None` 表示渲染器尚未初始化。
+///
+/// `Some(true)` 是「位图/字体/布局都跟得上显示设置」的唯一判据，两个调用方共用：
+/// [`dpi_is_stale`] 取反得到周期探针的触发条件，`recovery::recover_dpi` 用它跳过
+/// 「几何重试」场景下的无谓 GDI 重建（脏位可能只剩几何没提交，位图早已是新 DPI）。
+pub fn bitmap_dpi_matches(hwnd: HWND) -> Option<bool> {
+    let effective = crate::window::effective_dpi(hwnd);
+    RENDERER.with(|r| match r.try_borrow() {
+        Ok(borrowed) => borrowed.as_ref().map(|r| r.dpi == effective),
+        Err(_) => None,
+    })
+}
+
+/// 渲染资源是否已落后于窗口的有效 DPI。
+///
+/// 这是嵌入后 DPI 变化的**唯一发现路径**：主窗口 `SetParent` 进任务栏后是 explorer
+/// 的跨进程子窗口，OS 只把 `WM_DPICHANGED` 投递给顶层窗口，主窗口过程永远收不到；
+/// 因此显示设置（分辨率/缩放）变更后，只能由周期 tick 拿位图构建时的 DPI 与
+/// [`crate::window::effective_dpi`] 比对来发现。
+///
+/// 渲染器未初始化（启动早期、退出期）或正被重入借用时返回 false：没有可信的位图
+/// 可重建，空操作交给启动路径的 `update_dpi`；重入时返回 false 而不是 panic，
+/// 与 [`with_renderer`] 的 `try_borrow_mut` 同一纪律（release 为 `panic = "abort"`）。
+pub fn dpi_is_stale(hwnd: HWND) -> bool {
+    matches!(bitmap_dpi_matches(hwnd), Some(false))
+}
+
 pub fn invalidate_if_values_changed(hwnd: HWND) {
     let values = DisplayValues::load();
     let changed = LAST_RENDERED_VALUES.with(|last| last.get() != Some(values));
@@ -87,6 +114,11 @@ pub struct Renderer {
     text_color: COLORREF,
     width: i32,
     height: i32,
+    /// 当前位图/字体/布局构建时采用的有效 DPI（`window::effective_dpi`）。
+    ///
+    /// 它是「渲染资源是否已经跟上显示设置」的唯一真值源：周期探针拿它与当前有效
+    /// DPI 比对（见 [`dpi_is_stale`]），不一致即说明嵌入后的窗口漏掉了 DPI 变化。
+    dpi: u32,
     layout: Layout,
     buf: Vec<u16>,
     /// 十进制文本的复用缓冲区，与 `buf` 同属渲染器：每帧四次格式化都在此摊还分配，
@@ -345,6 +377,9 @@ impl Renderer {
             text_color: COLORREF(COLOR_LIGHT_TEXT),
             width: DISPLAY_WIDTH,
             height: DISPLAY_HEIGHT,
+            // 初始位图/字体按 96-DPI 基准常量创建；真实 DPI 由启动路径的
+            // `update_dpi` 提交并覆盖此值。
+            dpi: 96,
             layout,
             buf: Vec::with_capacity(32),
             scratch: String::with_capacity(8),
@@ -534,14 +569,16 @@ impl Renderer {
         }
     }
 
-    /// 按窗口当前 DPI 重建位图/字体并缓存新布局。返回 false 表示位图/字体创建失败，
-    /// 或新对象选入内存 DC 失败（此时已回滚到调用前的 DC 状态），两种情况都维持旧
-    /// 尺寸不变（调用方须把窗口回滚到 [`bitmap_size`]，否则「窗口新尺寸 + 位图旧尺寸」
-    /// 会让 BitBlt 只覆盖旧位图区域、露出色键底色）。
+    /// 按窗口当前有效 DPI 重建位图/字体并缓存新布局。返回 false 表示位图/字体创建
+    /// 失败，或新对象选入内存 DC 失败（此时已回滚到调用前的 DC 状态），两种情况都
+    /// 维持旧尺寸不变（调用方须把窗口回滚到 [`bitmap_size`]，否则「窗口新尺寸 +
+    /// 位图旧尺寸」会让 BitBlt 只覆盖旧位图区域、露出色键底色）。
     pub fn update_dpi(&mut self, hwnd: HWND) -> bool {
-        // SAFETY: hwnd 是在当前进程上下文中有效且处于活动状态的窗口句柄，调用
-        // GetDpiForWindow 是纯查询 API，无跨进程非法访问问题。
-        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+        // DPI 真值源收口在 `window::effective_dpi`：嵌入后主窗口是任务栏的跨进程
+        // 子窗口，收不到 `WM_DPICHANGED`，它自己的 `GetDpiForWindow` 也不保证随显示
+        // 设置刷新；任务栏窗口的 DPI 才是权威来源。窗口几何（`calc_widget_rect`）
+        // 与本函数的位图/字体必须共用同一来源，否则会出现差一像素或整档错位。
+        let dpi = crate::window::effective_dpi(hwnd);
         let width = dpi_scaled(DISPLAY_WIDTH, dpi);
         let height = dpi_scaled(DISPLAY_HEIGHT, dpi);
         let font_size = dpi_scaled(FONT_BASE_SIZE, dpi);
@@ -590,6 +627,7 @@ impl Renderer {
 
         self.width = width;
         self.height = height;
+        self.dpi = dpi;
         self.layout = Layout::measure(self.hdc_mem, width, height);
 
         // hdc_mem 常驻：背景模式只需 new() 设一次，此处仅换位图/字体。

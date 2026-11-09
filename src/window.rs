@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT, SetLastError, WIN32_ERROR};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetParent,
     GetWindowLongPtrW, GetWindowRect, HWND_TOP, IsWindow, LWA_COLORKEY, RegisterClassExW,
@@ -228,6 +229,35 @@ fn is_horizontal_taskbar(rect: RECT) -> bool {
     rect.bottom - rect.top <= rect.right - rect.left
 }
 
+/// 组件应采用的有效 DPI。
+///
+/// **优先取任务栏窗口的 DPI**：嵌入后主窗口是 explorer 任务栏的跨进程子窗口，
+/// 而 Windows 的 DPI 变化通知只投递给顶层窗口——主窗口永远收不到 `WM_DPICHANGED`，
+/// 它自己的 `GetDpiForWindow` 也不保证随显示设置刷新。任务栏是顶层窗口，缩放变化时
+/// 由系统直接更新其 DPI，组件的位图/字体/几何都应当跟它走，否则会停在建窗时的版式
+/// （显示设置改完不生效，只能重启程序）。
+///
+/// 任务栏暂不可得（Explorer 重启间隙）时回退主窗口 DPI，再回退 96-DPI 基准：
+/// 宁可退到保守值由后续 tick 收敛，也不让除零/零尺寸进入尺寸推导。
+pub fn effective_dpi(hwnd: HWND) -> u32 {
+    // SAFETY: 两个句柄都只用于纯查询 API；GetDpiForWindow 对任意窗口句柄安全返回
+    // （取不到时返回 0），不解引用调用方内存。
+    let taskbar_dpi = get_taskbar_hwnd().map_or(0, |h| unsafe { GetDpiForWindow(h) });
+    let window_dpi = unsafe { GetDpiForWindow(hwnd) };
+    pick_effective_dpi(taskbar_dpi, window_dpi)
+}
+
+/// 纯判定：任务栏 DPI 优先，其次主窗口 DPI，最后回落到 96（100% 缩放）。
+fn pick_effective_dpi(taskbar_dpi: u32, window_dpi: u32) -> u32 {
+    if taskbar_dpi != 0 {
+        taskbar_dpi
+    } else if window_dpi != 0 {
+        window_dpi
+    } else {
+        96
+    }
+}
+
 /// 计算小组件在任务栏上的目标矩形 (x, y, w, h)；仅 window.rs 内部消费。
 ///
 /// 竖排任务栏返回 `None`：横条面板在竖排任务栏上没有合法放置位置，显式失败优于留下
@@ -250,7 +280,9 @@ fn calc_widget_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
         return None;
     }
 
-    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    // 尺寸与位图/字体共用同一 DPI 真值源（见 `effective_dpi`）：任一处自行取
+    // `GetDpiForWindow` 都会在「任务栏已换 DPI、子窗口尚未刷新」的窗口期分叉。
+    let dpi = effective_dpi(hwnd);
     let display_width = dpi_scaled(DISPLAY_WIDTH, dpi);
     let display_height = dpi_scaled(DISPLAY_HEIGHT, dpi);
     let gap = dpi_scaled(GAP, dpi);
@@ -455,12 +487,12 @@ fn parent_is_current_taskbar(hwnd: HWND) -> bool {
 
 /// 任务栏定位的 `SetWindowPos` 标志集合（纯判定，便于单测）。
 ///
-/// `dpi_dirty` 期间追加 `SWP_NOSIZE`：此时渲染器位图尺寸与实际 DPI 已经错位，
-/// 尺寸的提交权归 DPI 恢复事务（`recovery::recover_dpi`）；若定位路径也改尺寸，事务
+/// `size_locked` 期间追加 `SWP_NOSIZE`：此时渲染器位图尺寸与实际 DPI 已经错位，
+/// 尺寸的提交权归 DPI 事务（`recovery::recover_dpi`）；若定位路径也改尺寸，事务
 /// 失败后的回滚会在下个 tick 被再次推翻，窗口尺寸将停在位图尺寸不匹配的一方。
-fn position_flags(dpi_dirty: bool) -> SET_WINDOW_POS_FLAGS {
+fn position_flags(size_locked: bool) -> SET_WINDOW_POS_FLAGS {
     let base = SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER;
-    if dpi_dirty { base | SWP_NOSIZE } else { base }
+    if size_locked { base | SWP_NOSIZE } else { base }
 }
 
 pub fn update_taskbar_position(hwnd: HWND) -> bool {
@@ -475,7 +507,11 @@ pub fn update_taskbar_position(hwnd: HWND) -> bool {
     };
 
     let target = (display_x, display_y, display_width, display_height);
-    let dpi_dirty = DPI_DIRTY.load(Ordering::Acquire);
+    // 尺寸锁定有两种来源，语义相同：脏位（事务待重试）与「位图 DPI 已落后于有效
+    // DPI」。后者的必要性在于 calc_widget_rect 一取到新 DPI 就会给出新尺寸，而
+    // 位图/字体还没按新 DPI 重建——若这里照常提交尺寸，就会出现「新窗口 + 旧位图」，
+    // BitBlt 只覆盖左上角、边缘露色键底色。等 `sync_dpi` 提交完整几何即可。
+    let size_locked = DPI_DIRTY.load(Ordering::Acquire) || crate::renderer::dpi_is_stale(hwnd);
     if LAST_RECT.with(|lp| lp.get()) == Some(target) {
         return false;
     }
@@ -488,15 +524,15 @@ pub fn update_taskbar_position(hwnd: HWND) -> bool {
             display_y,
             display_width,
             display_height,
-            position_flags(dpi_dirty),
+            position_flags(size_locked),
         )
         .is_ok()
     };
     // 缓存只在「移动成功且本次真的提交了完整几何」时写入：SetWindowPos 瞬时失败
     // （如 Explorer 重启竞态）时下个周期会重试，而不是因「矩形 == 缓存」被永久跳过；
-    // 脏位期间的调用带 `SWP_NOSIZE`，尺寸分量并未生效，提交缓存等于把未生效的尺寸
-    // 记成已生效。
-    if moved && !dpi_dirty {
+    // 尺寸被锁期间的调用带 `SWP_NOSIZE`，尺寸分量并未生效，提交缓存等于把未生效的
+    // 尺寸记成已生效。
+    if moved && !size_locked {
         LAST_RECT.with(|lp| lp.set(Some(target)));
     }
     moved
@@ -509,7 +545,7 @@ mod tests {
 
     use super::{
         LAST_RECT, LAST_REEMBED_FAILURE, clear_reembed_failure, invalidate_last_rect,
-        is_horizontal_taskbar, position_flags, report_reembed_failure,
+        is_horizontal_taskbar, pick_effective_dpi, position_flags, report_reembed_failure,
     };
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE, SWP_NOZORDER};
@@ -535,13 +571,24 @@ mod tests {
     }
 
     #[test]
-    fn dpi_dirty_position_keeps_window_size() {
-        // 脏位期间只改位置：尺寸由 DPI 事务提交，定位路径不得越权改尺寸。
+    fn dpi_size_lock_keeps_window_size() {
+        // 尺寸被锁（脏位或位图 DPI 落后）期间只改位置：尺寸由 DPI 事务提交，
+        // 定位路径不得越权改尺寸。
         assert!(position_flags(true).contains(SWP_NOSIZE));
         assert!(!position_flags(false).contains(SWP_NOSIZE));
         // 两个分支都必须保持「不改 Z 序」，否则面板会被拉到任务栏图标之上/之下。
         assert!(position_flags(true).contains(SWP_NOZORDER));
         assert!(position_flags(false).contains(SWP_NOZORDER));
+    }
+
+    #[test]
+    fn effective_dpi_prefers_taskbar_then_window_then_baseline() {
+        // 任务栏 DPI 是权威来源：主窗口是它的跨进程子窗口，自身 DPI 可能陈旧。
+        assert_eq!(pick_effective_dpi(144, 96), 144);
+        // 任务栏暂不可得（Explorer 重启间隙）时回退主窗口 DPI，不能直接掉到 96。
+        assert_eq!(pick_effective_dpi(0, 120), 120);
+        // 两者都取不到时回落到 96 基准：零 DPI 会推出零尺寸，绝不允许进入几何推导。
+        assert_eq!(pick_effective_dpi(0, 0), 96);
     }
 
     #[test]

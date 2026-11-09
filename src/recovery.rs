@@ -6,10 +6,11 @@
 //! 搬迁后恢复日程表只落在本模块的 [`run_recovery`]，重建编排只落在
 //! `main.rs::rebuild_main_window`。
 //!
-//! **状态属主**：本模块的三个 `thread_local!` 事实（重建重试间隔、恢复间隔、武装
-//! 状态）只由 UI 线程访问，唯一写方是 [`arm_rebuild_retry`] / [`disarm_rebuild_retry`]
-//! 与 [`set_recovery_interval`]。`main.rs` 只能通过 [`rebuild_retry_idle`] 这一只读判据
-//! 观测重试间隔，不得在两处各持一份表示。
+//! **状态属主**：本模块的四个 `thread_local!` 事实（重建重试间隔、恢复间隔、武装
+//! 状态、DPI 失败原因）只由 UI 线程访问，唯一写方是 [`arm_rebuild_retry`] /
+//! [`disarm_rebuild_retry`] 与 [`set_recovery_interval`]，以及 DPI 失败原因那一对
+//! [`report_dpi_failure`] / [`clear_dpi_failure`]。`main.rs` 只能通过
+//! [`rebuild_retry_idle`] 这一只读判据观测重试间隔，不得在两处各持一份表示。
 
 use std::sync::atomic::Ordering;
 
@@ -43,6 +44,15 @@ thread_local! {
     /// （`Some(0)` = 本进程还没试过）。唯一写方是 [`set_recovery_interval`]，
     /// 唯一读方是 [`ensure_recovery_timer`]。仅 UI 线程访问。
     static RECOVERY_ARM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(Some(0)) };
+    /// 上一轮 DPI 事务的失败原因；`None` = 上一轮成功或无需提交。
+    ///
+    /// 唯一写方 [`report_dpi_failure`]（失败时写入本轮原因）与 [`clear_dpi_failure`]
+    /// （成功时清空）；读方只有 [`report_dpi_failure`] 自身的去重比较。脏位期间周期
+    /// 探针每 1 s 重试一次，同一原因连续出现只记首条、原因变化才再记一条——否则持续
+    /// 失败（典型：竖排任务栏让 `embed_in_taskbar` 一直返回 Err）会把现场日志刷成每秒
+    /// 一条，并让恢复调度的退避形同虚设。仅在 UI 线程访问，故用 `RefCell` 而非锁。
+    static LAST_DPI_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// 把窗口回滚到渲染器当前的位图尺寸。
@@ -183,7 +193,7 @@ pub(crate) fn recovery_tick(watchdog: HWND) {
 }
 
 /// 一轮恢复动作，全部通过 `live_main_hwnd()` 取当前主窗口：
-/// 重试 DPI 事务 → 补建缺失定时器 → 补做缺失的托盘/会话通知 → 按原因探针清陈旧挂起位。
+/// DPI 收敛（探针 + 事务）→ 补建缺失定时器 → 补做缺失的托盘/会话通知 → 按原因探针清陈旧挂起位。
 ///
 /// 返回本轮是否全部成功（决定下个周期是否退避）。重建间隙（无主窗口）视为
 /// 「无事可做」而不是失败：主窗口重建自有 `arm_rebuild_retry` 的独立退避，
@@ -194,7 +204,9 @@ fn run_recovery() -> bool {
     };
     let mut all_ok = true;
 
-    if DPI_DIRTY.load(Ordering::Acquire) && !recover_dpi(hwnd) {
+    // `sync_dpi` 同时承担探针与事务：主窗口 tick 在挂起/全屏态可能不存在，
+    // 恢复调度是这些状态下唯一仍活着的周期入口。返回 false 且脏位仍在 = 事务失败。
+    if !sync_dpi(hwnd) && DPI_DIRTY.load(Ordering::Acquire) {
         all_ok = false;
     }
     if !retry_missing_timers(hwnd) {
@@ -251,40 +263,106 @@ fn rearm_tray_and_session_capabilities(hwnd: HWND) -> CapabilityRearm {
     }
 }
 
+/// 记录本轮 DPI 事务失败：同一原因只记首条，原因变化才再记一条。
+///
+/// 脏位期间周期探针每 1 s 重试一次（见 `main.rs` 的 `TIMER_ID_NETWORK`），持续失败
+/// 必须保持静默——这里是与 `window::report_reembed_failure` 同一套「失败序列去重」
+/// 纪律：失败重试由定时器驱动，每轮一条会把现场日志刷成噪声并高频触发环形截断。
+/// 日志在状态提交后写，保证「写日志失败」不会反过来影响去重状态。
+fn report_dpi_failure(reason: &str) {
+    LAST_DPI_FAILURE.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.as_deref() == Some(reason) {
+            return;
+        }
+        *last = Some(reason.to_string());
+        diag!("DPI 恢复: {reason}");
+        log_event!("DPI 恢复: {reason}");
+    });
+}
+
+/// 清空上次 DPI 失败原因（事务成功）。与 [`report_dpi_failure`] 共用同一份状态，
+/// 这是「恢复后再失败仍要记一条」的前提。
+fn clear_dpi_failure() {
+    LAST_DPI_FAILURE.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.is_some() {
+            *last = None;
+        }
+    });
+}
+
+/// DPI 收敛入口：把渲染资源与窗口几何一起推到当前有效 DPI。
+///
+/// 这是 DPI 事务的**唯一入口**，两个触发源共用它：
+/// - 主窗口过程与看门狗过程的 `WM_DPICHANGED` / `WM_SETTINGCHANGE`（顶层窗口期与
+///   广播接收者，见 `main.rs`）；
+/// - 周期 tick 的 DPI 探针（[`crate::renderer::dpi_is_stale`]）。
+///
+/// 第二条是嵌入后的主路径：主窗口 `SetParent` 进任务栏后是 explorer 的跨进程子
+/// 窗口，OS 只把 `WM_DPICHANGED` 投给顶层窗口，它永远收不到——显示设置改完不生效、
+/// 只能重启程序，正是这条缺失的收敛路径造成的。
+///
+/// 返回 `true` 表示本轮把「位图/字体 + 窗口几何」推到了当前有效 DPI 并已整幅重绘
+/// （资源是否真的重建取决于位图此前是否已同步：脏位可能只剩几何没提交）。返回
+/// `false` 表示有效 DPI 未变（空操作）或事务失败；要区分这两种情况读 `DPI_DIRTY`
+/// 即可——失败时它保持置位，由下一个周期继续重试（[`run_recovery`] 正是这样判失败）。
+pub(crate) fn sync_dpi(hwnd: HWND) -> bool {
+    if DPI_DIRTY.load(Ordering::Acquire) {
+        return recover_dpi(hwnd);
+    }
+    if !crate::renderer::dpi_is_stale(hwnd) {
+        return false;
+    }
+    // 先登记脏位再提交：定位路径（`update_taskbar_position`）据此只改位置、
+    // 不改尺寸，直到事务把「位图 + 几何」成对推上去。
+    DPI_DIRTY.store(true, Ordering::Release);
+    recover_dpi(hwnd)
+}
+
 /// DPI 恢复事务（四步顺序不可拆，第 2 步内部再分「先对齐尺寸、再提交完整几何」）。
 ///
-/// 1. 重试 `Renderer::update_dpi`（只换位图/字体，不动窗口几何）；
-/// 2. **先无条件把窗口尺寸对齐到新位图**（`align_window_size_to`，只改尺寸），
+/// 1. 位图/字体落后于有效 DPI 时重建（`Renderer::update_dpi`，只换资源、不动窗口
+///    几何）。已同步则跳过：脏位可能只剩「几何没提交」这一项，而周期探针每 tick
+///    都会调到这里，重复重建 GDI 资源没有意义；
+/// 2. **先无条件把窗口尺寸对齐到位图尺寸**（`align_window_size_to`，只改尺寸），
 ///    再重跑嵌入序列提交位置与分层属性——这一步不能省也不能挪到失败分支里：
-///    `update_dpi` 一旦成功，位图就已经是新尺寸，而接下来的嵌入序列可能在任何一步
-///    瞬态失败，且它中途失败会把 `EMBEDDED` 清成 false，使带嵌入门回滚的
-///    `rollback_window_to_bitmap` 拒绝动作。先对齐尺寸把「新位图 + 旧窗口」这一错配
-///    的窗口期压到零，剩下没提交的只是位置与可见性，由本事务或 `reembed_if_lost` 重试；
+///    位图一旦换新就是新尺寸，而接下来的嵌入序列可能在任何一步瞬态失败，且它中途
+///    失败会把 `EMBEDDED` 清成 false，使带嵌入门回滚的 `rollback_window_to_bitmap`
+///    拒绝动作。先对齐尺寸把「新位图 + 旧窗口」这一错配的窗口期压到零，剩下没提交
+///    的只是位置与可见性，由本事务或 `reembed_if_lost` 重试；
 /// 3. 失效位置缓存，避免刚提交的几何被旧缓存判为「已到位」；
 /// 4. 前三步全部成功才清 `DPI_DIRTY` 并整幅重绘。
 ///
-/// 任一步失败即保持脏位，由下一个恢复周期重试。`rollback_window_to_bitmap` 仍是
-/// `WM_DPICHANGED` / 启动路径失败当时的即时兜底（那时位图未换、窗口尺寸必须跟着旧位图）。
+/// 任一步失败即保持脏位，由下一个周期重试。本函数只由 [`sync_dpi`] 调用；
+/// `rollback_window_to_bitmap` 只剩启动/重建路径的 `update_dpi` 失败兜底（那时位图
+/// 未换、窗口尺寸必须跟着旧位图）。
 pub(crate) fn recover_dpi(hwnd: HWND) -> bool {
-    let mut dpi_updated = false;
+    // 已同步时跳过重建；`None`（渲染器未初始化）与 `Some(false)` 都走重建路径，
+    // 后者会由 `with_renderer` 的空转把结果如实报成失败。
+    let mut dpi_updated = matches!(crate::renderer::bitmap_dpi_matches(hwnd), Some(true));
     let mut bitmap_size = (0, 0);
-    crate::renderer::with_renderer(|r| {
-        dpi_updated = r.update_dpi(hwnd);
-        bitmap_size = r.bitmap_size();
-    });
     if !dpi_updated {
-        diag!("DPI 恢复: 重建位图/字体失败，保持脏位等待下一轮");
+        crate::renderer::with_renderer(|r| {
+            dpi_updated = r.update_dpi(hwnd);
+            bitmap_size = r.bitmap_size();
+        });
+    } else {
+        crate::renderer::with_renderer(|r| bitmap_size = r.bitmap_size());
+    }
+    if !dpi_updated {
+        report_dpi_failure("重建位图/字体失败，保持脏位等待下一轮");
         return false;
     }
 
     align_window_size_to(hwnd, bitmap_size.0, bitmap_size.1);
 
     if let Err(e) = embed_in_taskbar(hwnd) {
-        diag!("DPI 恢复: 提交窗口几何失败: {e}");
-        log_event!("DPI 恢复: 提交窗口几何失败: {e}");
+        report_dpi_failure(&format!("提交窗口几何失败: {e}"));
         return false;
     }
 
+    clear_dpi_failure();
     invalidate_last_rect();
     DPI_DIRTY.store(false, Ordering::Release);
     // SAFETY: hwnd 是本线程有效的主窗口句柄；InvalidateRect 只把该窗口标记为待重绘，
@@ -301,6 +379,38 @@ mod tests {
     //! 不创建真实窗口（真窗口路径见 `src/smoke.rs`）。
 
     use super::rearm_tray_and_session_capabilities;
+
+    #[test]
+    fn dpi_failure_reason_dedupes_and_resets() {
+        // 脏位期间周期探针每 1 s 重试一次，同一原因连续出现只记首条、原因变化才再记
+        // 一条；恢复成功后必须清空，否则「恢复 → 再失败」的第二次故障会被误判为重复
+        // 而完全静默（与 `window::report_reembed_failure` 同一契约）。
+        super::clear_dpi_failure();
+        assert_eq!(super::LAST_DPI_FAILURE.with(|c| c.borrow().clone()), None);
+
+        super::report_dpi_failure("提交窗口几何失败: 找不到 Shell_TrayWnd");
+        assert_eq!(
+            super::LAST_DPI_FAILURE.with(|c| c.borrow().clone()),
+            Some("提交窗口几何失败: 找不到 Shell_TrayWnd".to_string())
+        );
+
+        // 同一原因重复上报：状态保持不变（去重门生效的直接可观测面）。
+        super::report_dpi_failure("提交窗口几何失败: 找不到 Shell_TrayWnd");
+        assert_eq!(
+            super::LAST_DPI_FAILURE.with(|c| c.borrow().clone()),
+            Some("提交窗口几何失败: 找不到 Shell_TrayWnd".to_string())
+        );
+
+        // 原因变化：必须更新为最新原因，否则日志会停在第一次的现场。
+        super::report_dpi_failure("重建位图/字体失败，保持脏位等待下一轮");
+        assert_eq!(
+            super::LAST_DPI_FAILURE.with(|c| c.borrow().clone()),
+            Some("重建位图/字体失败，保持脏位等待下一轮".to_string())
+        );
+
+        super::clear_dpi_failure();
+        assert_eq!(super::LAST_DPI_FAILURE.with(|c| c.borrow().clone()), None);
+    }
 
     #[test]
     fn test_recovery_rearms_tray_and_session() {

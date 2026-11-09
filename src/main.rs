@@ -42,7 +42,7 @@ use crate::power::{
 };
 use crate::recovery::{
     arm_rebuild_retry, arm_recovery_timer, disarm_rebuild_retry, disarm_recovery_timer,
-    ensure_recovery_timer, rebuild_retry_idle, recovery_tick, rollback_window_to_bitmap,
+    ensure_recovery_timer, rebuild_retry_idle, recovery_tick, rollback_window_to_bitmap, sync_dpi,
 };
 use crate::renderer::Renderer;
 use crate::state::{DPI_DIRTY, ENABLE_AUTO_UPDATE, MONITOR_FULLSCREEN, reset_network_backoff};
@@ -61,9 +61,9 @@ use crate::util::{
     wait_main_instance_appear, window_process_is_elevated,
 };
 use crate::window::{
-    align_window_size_to, create_main_window, create_watchdog_window, embed_in_taskbar,
-    invalidate_last_rect, invalidate_taskbar_cache, reembed_if_lost, register_watchdog_class,
-    register_window_class, update_taskbar_position,
+    create_main_window, create_watchdog_window, embed_in_taskbar, invalidate_last_rect,
+    invalidate_taskbar_cache, reembed_if_lost, register_watchdog_class, register_window_class,
+    update_taskbar_position,
 };
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
@@ -767,6 +767,22 @@ pub extern "system" fn watchdog_wnd_proc(
             if unsafe { is_immersive_color_set(lparam) } {
                 apply_theme_change_to_main();
             }
+            // 显示设置（分辨率/缩放）变更同样走这条顶层广播。主窗口嵌入后是 explorer
+            // 的跨进程子窗口，收不到广播、也收不到 WM_DPICHANGED，这里是它唯一能
+            // 「立刻」得知缩放变化的通道；周期 tick 的 DPI 探针是兜底。
+            if let Some(hwnd) = live_main_hwnd() {
+                sync_dpi(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        // 看门狗是常驻顶层窗口，DPI 变化时可能收到本消息（隐藏窗口是否收到由 OS
+        // 决定，故它只是加速通道，不能当唯一入口）。把 DPI 事务落到当前主窗口：
+        // 主窗口自身是跨进程子窗口，这条消息永远到不了它。
+        WM_DPICHANGED => {
+            if let Some(hwnd) = live_main_hwnd() {
+                sync_dpi(hwnd);
+            }
             LRESULT(0)
         }
 
@@ -791,6 +807,10 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_FULLSCREEN => {
             if !is_suspended() {
+                // DPI 探针：嵌入后主窗口是任务栏的跨进程子窗口，收不到 WM_DPICHANGED，
+                // 显示设置（分辨率/缩放）变更只能靠周期探针发现并成对提交位图与几何。
+                // 放在挂起门内：挂起期间组件不可见，恢复后由 resync 重建的 tick 补上。
+                sync_dpi(hwnd);
                 // 常驻 tick（三种非挂起状态下都存在）兼作嵌入自愈：嵌入失败后
                 // TaskbarCreated 不会再来，只能靠这里静默重试；重嵌入成功必须重绘，
                 // 否则刚恢复可见的分层窗口仍是空白画布。
@@ -804,6 +824,9 @@ fn handle_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         TIMER_ID_NETWORK => {
             if !is_suspended() && !MONITOR_FULLSCREEN.load(Ordering::Acquire) {
+                // 1 Hz 的 DPI 探针是嵌入后缩放变化的主收敛路径（理由同上）。
+                // 必须在定位之前跑：它成功后位图与几何已一致，随后的定位才允许改尺寸。
+                sync_dpi(hwnd);
                 // 任务栏通知区域变化时，即使数值不变也必须刷新新位置的画布。
                 let position_changed = update_taskbar_position(hwnd);
                 collect_network(hwnd);
@@ -870,33 +893,22 @@ pub extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             if unsafe { is_immersive_color_set(lparam) } {
                 apply_theme_change(hwnd);
             }
+            // 显示设置（分辨率/缩放）变更同样经 WM_SETTINGCHANGE 广播到达：这里
+            // 不区分广播的具体设置项，DPI 探针本身是廉价空操作，只在真的变了时重建。
+            sync_dpi(hwnd);
             LRESULT(0)
         }
 
         WM_DPICHANGED => {
-            let mut dpi_updated = false;
-            renderer::with_renderer(|r| dpi_updated = r.update_dpi(hwnd));
-            if dpi_updated {
-                // 失败不弹框：DPI 变更本身就是重排，改由 reembed_if_lost 在下一 tick
-                // 补做，避免跨屏拖动时连环弹窗。
-                if let Err(e) = embed_in_taskbar(hwnd) {
-                    diag!("WM_DPICHANGED: 嵌入失败，尺寸已对齐，交由 reembed_if_lost 重试: {e}");
-                    // 与 recovery::recover_dpi 第 2 步同原语：SWP_NOMOVE，只提交新位图
-                    // 尺寸，把「新位图 + 旧窗口」错配压到零。注意别复用
-                    // recovery::rollback_window_to_bitmap：它走 resize_embedded_window，
-                    // 被 EMBEDDED 门控，而嵌入失败后 EMBEDDED 必为 false，那一步会空转。
-                    renderer::with_renderer(|r| {
-                        let (w, h) = r.bitmap_size();
-                        align_window_size_to(hwnd, w, h);
-                    });
-                }
-            } else {
-                // 位图/字体创建失败：先把窗口回滚到渲染器维持的旧尺寸（尺寸与位图必须
-                // 始终一致），再登记脏位。只回滚不登记会永久停在这个错配状态——真正
-                // 该把窗口推到新几何的是恢复调度器的 DPI 事务，回滚本身等不到那次提交。
-                rollback_window_to_bitmap(hwnd);
-                DPI_DIRTY.store(true, Ordering::Release);
-            }
+            // 顶层窗口期（启动后、嵌入任务栏之前）由本分支处理。嵌入后主窗口是
+            // explorer 的跨进程子窗口，OS 只把本消息投递给顶层窗口——这条路径会
+            // 彻底失效，改由周期 tick 的 DPI 探针与看门狗的广播转发接管（见
+            // `handle_timer` 与 `watchdog_wnd_proc`）。
+            //
+            // 返回 false 有两种含义：有效 DPI 未变（无需提交）或事务失败（脏位保持
+            // 置位，由周期探针与恢复调度器继续重试）。两种情况都不弹框——DPI 变更
+            // 本身就是重排，跨屏拖动时连环弹窗比错版更糟。
+            sync_dpi(hwnd);
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }

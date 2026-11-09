@@ -55,15 +55,16 @@ pub static SUSPEND_REASONS: SuspendReasons = SuspendReasons::new();
 /// 读写：Acquire / Release（定时器与全屏检测）。
 pub static MONITOR_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
-/// DPI 资源重建失败后置位：窗口几何与渲染器位图/字体可能不一致，须由恢复调度器
-/// 的 DPI 事务重试（见 `recovery::recover_dpi`）。
+/// DPI 资源重建失败后置位：窗口几何与渲染器位图/字体可能不一致，须由 DPI 事务
+/// 重试（见 `recovery::recover_dpi`）。
 ///
 /// 唯一真值源，归属明确：
-/// - 置位（2 处）：`WM_DPICHANGED` 的失败分支、`bind_display_and_timers` 的启动/
-///   重建失败分支。
+/// - 置位（2 处）：`recovery::sync_dpi` 发现位图 DPI 落后于有效 DPI 时、
+///   `bind_display_and_timers` 的启动/重建失败分支。
 /// - 清位（1 处）：DPI 事务四步全部成功之后，`recover_dpi` 内。
-/// - 读（2 处）：`recover_dpi` 的入口门、`window::update_taskbar_position` 的
-///   标志选择（脏位期间只改位置、不改尺寸、不提交位置缓存）。
+/// - 读（3 处）：`sync_dpi` 的入口门、`recover_dpi` 的调用前提、
+///   `window::update_taskbar_position` 的尺寸锁定（脏位期间只改位置、不改尺寸、
+///   不提交位置缓存）。
 ///
 /// 读写：Release / Acquire。写读虽同在 UI 线程（主窗口过程与看门狗过程同属一个
 /// 消息循环线程），但两者经消息循环可见，保持与 `MONITOR_FULLSCREEN` 一致的内存序。
