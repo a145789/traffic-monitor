@@ -1,6 +1,6 @@
 # Agent Note：拆除 tray 菜单的两阶段 MenuEntry 机制，改为直接插入
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
