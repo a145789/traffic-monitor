@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
@@ -20,13 +21,18 @@ use crate::util::{copy_wide_truncated, diag, dpi_scaled, log_event, reg_read_dwo
 const ARROW_UP: [u16; 2] = [0x2191, 0];
 const ARROW_DOWN: [u16; 2] = [0x2193, 0];
 
-/// 网速列宽度按**最宽可能文本**预留，不再用固定像素列宽。
+const KIB: u64 = 1024;
+const MIB: u64 = KIB * 1024;
+const GIB: u64 = MIB * 1024;
+
+/// 网速列宽度按**最宽可能文本**预留，不再用固定像素列宽：网速列宽 = 箭头列 + 这几个
+/// 档位边界输入现场格式化后的最大字宽，既不会被右对齐裁掉高位，也压不到箭头列。
 ///
-/// `format_speed_wide` 每个档位只有一个最宽形态（值的上界是档位上限，整数位最多 4 位，
-/// 无小数位），取这几条候选串宽度的最大值即网速文本的上界：`1023 MB/s` 整条放得下，
-/// 既不会被右对齐裁掉高位，也压不到箭头列。改档位或单位必须同步这里；
-/// `speed_column_fits_every_tier` 用真实格式化结果复验。
-const SPEED_WIDTH_PROBES: [&str; 4] = ["1023 B/s", "1023 KB/s", "1023 MB/s", "4 GB/s"];
+/// `format_speed_wide` 每个档位只有一个最宽形态（值的上界是档位上限，无小数位），
+/// 所以取各档上界的格式化结果即文本上界。探针只给**输入**，文本形态由格式化器
+/// 唯一产出——改档位、单位或量级都不需要同步这里。`speed_column_fits_every_tier`
+/// 用真实格式化结果复验布局合身。
+const SPEED_WIDTH_SAMPLES: [u32; 4] = [1023, (MIB - 1) as u32, (GIB - 1) as u32, u32::MAX];
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
@@ -83,6 +89,9 @@ pub struct Renderer {
     height: i32,
     layout: Layout,
     buf: Vec<u16>,
+    /// 十进制文本的复用缓冲区，与 `buf` 同属渲染器：每帧四次格式化都在此摊还分配，
+    /// 不得改成每次新建（渲染热路径零分配纪律）。
+    scratch: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -338,6 +347,7 @@ impl Renderer {
             height: DISPLAY_HEIGHT,
             layout,
             buf: Vec::with_capacity(32),
+            scratch: String::with_capacity(8),
         })
     }
 
@@ -362,9 +372,13 @@ impl Renderer {
     ///
     /// 上界钳到 100：数值列宽按 `100%` 的实测字宽预留，钳制让「字段一定装得下」
     /// 由格式化本身保证，而不是依赖采集侧永不越界——越界会被右对齐裁掉高位数字。
-    fn format_percent_wide(buf: &mut Vec<u16>, value: u32) -> &mut [u16] {
+    fn format_percent_wide<'a>(
+        buf: &'a mut Vec<u16>,
+        scratch: &mut String,
+        value: u32,
+    ) -> &'a mut [u16] {
         buf.clear();
-        write_u32(buf, value.min(100));
+        push_decimal_wide(buf, scratch, u64::from(value.min(100)));
         buf.push(b'%' as u16);
         buf.push(0);
         buf
@@ -376,11 +390,11 @@ impl Renderer {
     /// 要能在测试里逐字节断言，不引入浮点。每档的值再钳到 1023，避免舍入把界内值
     /// 顶到下一档的量级——`1023.9 KB/s` 显示 `1024 KB/s` 会紧接着跳到 `1 MB/s`，
     /// 读起来像倒退；钳制后换档单调（`1023 KB/s` → `1 MB/s`）。
-    fn format_speed_wide(buf: &mut Vec<u16>, bytes_per_sec: u32) -> &mut [u16] {
-        const KIB: u64 = 1024;
-        const MIB: u64 = KIB * 1024;
-        const GIB: u64 = MIB * 1024;
-
+    fn format_speed_wide<'a>(
+        buf: &'a mut Vec<u16>,
+        scratch: &mut String,
+        bytes_per_sec: u32,
+    ) -> &'a mut [u16] {
         buf.clear();
         let bytes = bytes_per_sec as u64;
         let (value, unit): (u64, &str) = if bytes < KIB {
@@ -393,7 +407,7 @@ impl Renderer {
             // 万兆链路满速是 1.25e9 B/s：没有这一档就只能显示成 4 位数的 MB。
             ((bytes + GIB / 2) / GIB, " GB/s")
         };
-        write_u32(buf, value as u32);
+        push_decimal_wide(buf, scratch, value);
         buf.extend(unit.encode_utf16());
         buf.push(0);
         buf
@@ -439,7 +453,7 @@ impl Renderer {
             right: layout.speed_right,
             bottom: layout.half_height,
         };
-        let up_val = Self::format_speed_wide(&mut self.buf, values.speed_up);
+        let up_val = Self::format_speed_wide(&mut self.buf, &mut self.scratch, values.speed_up);
         draw_text(self.hdc_mem, up_val, &mut rc_up_val, DT_RIGHT);
 
         let mut rc_down_arrow = RECT {
@@ -457,7 +471,7 @@ impl Renderer {
             right: layout.speed_right,
             bottom: self.height,
         };
-        let down_val = Self::format_speed_wide(&mut self.buf, values.speed_down);
+        let down_val = Self::format_speed_wide(&mut self.buf, &mut self.scratch, values.speed_down);
         draw_text(self.hdc_mem, down_val, &mut rc_down_val, DT_RIGHT);
 
         // CPU/MEM 列：标签从各自实测起点左对齐画到同一个右缘（冒号同列），数值在
@@ -471,7 +485,7 @@ impl Renderer {
         };
         draw_text(self.hdc_mem, cpu_label, &mut rc_cpu_label, DT_LEFT);
 
-        let cpu_value = Self::format_percent_wide(&mut self.buf, values.cpu);
+        let cpu_value = Self::format_percent_wide(&mut self.buf, &mut self.scratch, values.cpu);
         let mut rc_cpu_value = RECT {
             left: layout.value_left,
             top: 0,
@@ -489,7 +503,7 @@ impl Renderer {
         };
         draw_text(self.hdc_mem, mem_label, &mut rc_mem_label, DT_LEFT);
 
-        let mem_value = Self::format_percent_wide(&mut self.buf, values.mem);
+        let mem_value = Self::format_percent_wide(&mut self.buf, &mut self.scratch, values.mem);
         let mut rc_mem_value = RECT {
             left: layout.value_left,
             top: layout.half_height,
@@ -618,7 +632,8 @@ impl Drop for Renderer {
 ///   字段宽度按最宽数值 `100%` 预留：数字位数变化只往左长，`%` 永远停在同一列；
 ///   个位数时数字与冒号之间会有字段内的留白，这是右对齐的必然代价；
 /// - **网速列**左锚在 `arrow_left`、右锚在 `speed_right`，列宽 = 箭头列 + 最宽速率
-///   文本（[`SPEED_WIDTH_PROBES`]），故速率矩形恰好装得下 `1023 MB/s`，压不到箭头。
+///   文本（[`SPEED_WIDTH_SAMPLES`] 经 `format_speed_wide` 现算），故速率矩形恰好装得下
+///   `1023 MB/s`，压不到箭头。
 ///
 /// 标签块左锚、网速列右锚，两列之间剩下的空间全部留在中间：它随 DPI 变化是因为
 /// 「位图宽度取整」与「字号取整」不同步（字号先跳一档、宽度只涨几个百分点）。96-DPI
@@ -659,11 +674,19 @@ impl Layout {
         // 箭头列宽 = 字形实测宽 + 固定间距：间距算进列宽，右对齐的速率字段才不会碰到箭头。
         let arrow_width =
             measure_wide(hdc, &ARROW_UP) + (LAYOUT_ARROW_GAP as f64 * scale).round() as i32;
-        let speed_width = SPEED_WIDTH_PROBES
-            .iter()
-            .map(|probe| measure_str(hdc, probe))
-            .max()
-            .unwrap_or(0);
+        let speed_width = {
+            // 各档上界喂给格式化器，取其真实文本的最宽形态——文本形态只由格式化器定义。
+            let mut speed_buf = Vec::with_capacity(16);
+            let mut scratch = String::with_capacity(8);
+            SPEED_WIDTH_SAMPLES
+                .iter()
+                .map(|bytes| {
+                    let text = Renderer::format_speed_wide(&mut speed_buf, &mut scratch, *bytes);
+                    measure_wide(hdc, text)
+                })
+                .max()
+                .unwrap_or(0)
+        };
 
         let label_right = (LAYOUT_LEFT_MARGIN as f64 * scale).round() as i32 + label_width;
         let value_left = label_right + (LAYOUT_VALUE_GAP as f64 * scale).round() as i32;
@@ -742,19 +765,16 @@ fn is_system_light_theme() -> bool {
         .unwrap_or(false)
 }
 
-fn write_u32(buf: &mut Vec<u16>, mut n: u32) {
-    if n == 0 {
-        buf.push(b'0' as u16);
-        return;
-    }
-    let start = buf.len();
-    while n > 0 {
-        buf.push((b'0' + (n % 10) as u8) as u16);
-        n /= 10;
-    }
-    buf[start..].reverse();
+/// 把 `value` 的十进制文本追加到 `buf`（不含尾 NUL），十进制形态由 std 的 `Display`
+/// 唯一产出：格式必须与 `u32`/`u64` 的 `Display` 一致，否则宽度探针与绘制文本会对不上。
+///
+/// `scratch` 是调用方复用的缓冲区，写入失败只可能来自 `fmt::Error`（`String` 不会产生），
+/// 故忽略返回值；`scratch` 在返回前已清空复写，容量随渲染器生命周期摊还。
+fn push_decimal_wide(buf: &mut Vec<u16>, scratch: &mut String, value: u64) {
+    scratch.clear();
+    let _ = write!(scratch, "{value}");
+    buf.extend(scratch.encode_utf16());
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,41 +788,51 @@ mod tests {
     #[test]
     fn test_format_speed_wide_boundaries() {
         let mut buf = Vec::with_capacity(32);
+        let mut scratch = String::new();
 
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 0)),
+            wide_to_string(Renderer::format_speed_wide(&mut buf, &mut scratch, 0)),
             "0 B/s"
         );
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 512)),
+            wide_to_string(Renderer::format_speed_wide(&mut buf, &mut scratch, 512)),
             "512 B/s"
         );
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1023)),
+            wide_to_string(Renderer::format_speed_wide(&mut buf, &mut scratch, 1023)),
             "1023 B/s"
         );
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024)),
+            wide_to_string(Renderer::format_speed_wide(&mut buf, &mut scratch, 1024)),
             "1 KB/s"
         );
         // 档内四舍五入：1.5 KiB/s 进位到 2。
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1536)),
+            wide_to_string(Renderer::format_speed_wide(&mut buf, &mut scratch, 1536)),
             "2 KB/s"
         );
         // 档内上界钳制：1023.9 KB/s 舍入后是 1024，但 1024 已是 MB 档的量级，
         // 显示成 "1024 KB/s" 会紧接 "1 MB/s" 像倒退；钳到 1023 保持单调。
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 - 1)),
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                1024 * 1024 - 1
+            )),
             "1023 KB/s"
         );
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024)),
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                1024 * 1024
+            )),
             "1 MB/s"
         );
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(
                 &mut buf,
+                &mut scratch,
                 1024 * 1024 * 10 + 1024 * 512
             )),
             "11 MB/s"
@@ -811,22 +841,35 @@ mod tests {
         assert_eq!(
             wide_to_string(Renderer::format_speed_wide(
                 &mut buf,
+                &mut scratch,
                 1024 * 1024 * 1024 - 1
             )),
             "1023 MB/s"
         );
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1024 * 1024 * 1024)),
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                1024 * 1024 * 1024
+            )),
             "1 GB/s"
         );
         // 万兆链路满速（1.25e9 B/s）：没有 GB 档时这里是 4 位数的 "1192 MB/s"。
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, 1_250_000_000)),
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                1_250_000_000
+            )),
             "1 GB/s"
         );
         // u32 上限 = 4 GiB/s - 1 字节，四舍五入后正好 4（不是溢出）。
         assert_eq!(
-            wide_to_string(Renderer::format_speed_wide(&mut buf, u32::MAX)),
+            wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                u32::MAX
+            )),
             "4 GB/s"
         );
     }
@@ -840,9 +883,18 @@ mod tests {
             (1024 * 1024 * 1024, "GB/s"),
         ];
         let mut buf = Vec::with_capacity(32);
+        let mut scratch = String::new();
         for (boundary, _) in limits {
-            let below = wide_to_string(Renderer::format_speed_wide(&mut buf, boundary - 1));
-            let at = wide_to_string(Renderer::format_speed_wide(&mut buf, boundary));
+            let below = wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                boundary - 1,
+            ));
+            let at = wide_to_string(Renderer::format_speed_wide(
+                &mut buf,
+                &mut scratch,
+                boundary,
+            ));
             let number =
                 |s: &str| -> u32 { s.split(' ').next().unwrap_or("").parse().unwrap_or(0) };
             assert!(
@@ -854,24 +906,9 @@ mod tests {
     }
 
     #[test]
-    fn test_write_u32() {
-        for (input, expected) in [
-            (0, "0"),
-            (9, "9"),
-            (10, "10"),
-            (99, "99"),
-            (100, "100"),
-            (u32::MAX, "4294967295"),
-        ] {
-            let mut buf = Vec::new();
-            write_u32(&mut buf, input);
-            assert_eq!(wide_to_string(&buf), expected);
-        }
-    }
-
-    #[test]
     fn test_format_label_and_percent_wide() {
         let mut buf = Vec::new();
+        let mut scratch = String::new();
         assert_eq!(
             wide_to_string(Renderer::format_label_wide(&mut buf, "CPU")),
             "CPU:"
@@ -882,17 +919,21 @@ mod tests {
         );
         for (value, expected) in [(0, "0%"), (5, "5%"), (50, "50%"), (100, "100%")] {
             assert_eq!(
-                wide_to_string(Renderer::format_percent_wide(&mut buf, value)),
+                wide_to_string(Renderer::format_percent_wide(&mut buf, &mut scratch, value)),
                 expected
             );
         }
         // 越界钳制：数值列宽按 `100%` 预留，超出只显示 100%，不裁掉高位数字。
         assert_eq!(
-            wide_to_string(Renderer::format_percent_wide(&mut buf, 101)),
+            wide_to_string(Renderer::format_percent_wide(&mut buf, &mut scratch, 101)),
             "100%"
         );
         assert_eq!(
-            wide_to_string(Renderer::format_percent_wide(&mut buf, u32::MAX)),
+            wide_to_string(Renderer::format_percent_wide(
+                &mut buf,
+                &mut scratch,
+                u32::MAX
+            )),
             "100%"
         );
     }
@@ -983,8 +1024,9 @@ mod tests {
             let layout = Layout::measure(hdc, DISPLAY_WIDTH, DISPLAY_HEIGHT);
             let field_width = layout.speed_right - layout.arrow_right;
             let mut buf = Vec::with_capacity(32);
+            let mut scratch = String::new();
             for value in samples {
-                let text = Renderer::format_speed_wide(&mut buf, value);
+                let text = Renderer::format_speed_wide(&mut buf, &mut scratch, value);
                 let shown = wide_to_string(text);
                 let text_width = measure_wide(hdc, text);
                 assert!(
