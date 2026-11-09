@@ -1,6 +1,6 @@
 # Agent Note：拆除 tray 菜单的两阶段 MenuEntry 机制，改为直接插入
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
@@ -13,7 +13,7 @@ Status: proposed
 
 ## 提案
 
-把 `build_menu_entries` 改为接收 `hmenu` 并逐项直接调用 `insert_string_item`/`insert_separator`，每项的 `to_wide` 局部缓冲在同步插入调用期间存活即可；删除 `MenuEntry` 枚举、`Vec` 中转与 match 循环，修正 `src/tray.rs:130` 与 `:223` 的过度保守文档。预估净删约 15 行。菜单外观与命令路由不产生任何变化。
+把 `build_menu_entries` 改为接收 `hmenu` 并逐项直接调用 `insert_string_item`/`insert_separator`（pos 递增计数器，顺序即唯一真源），每项的 `to_wide` 局部缓冲在同步插入调用期间存活即可；删除 `MenuEntry` 枚举、`Vec` 中转与 match 循环，修正 `src/tray.rs:130` 与 `:223` 的过度保守文档。补两个无头单测：菜单形状（项数/顺序/ID/文案/勾选态与命令路由对应）与文本复制语义（插入后覆写并释放源缓冲仍取回原文）。菜单外观与命令路由不产生任何变化。
 
 ## 明确不在本次范围
 
@@ -24,7 +24,7 @@ Status: proposed
 
 ## 为什么不保留？
 
-最强反方：① 现结构把全部文本缓冲的生命周期集中在一处（entries Vec），审查负担低；直接插入依赖「InsertMenuItemW 复制文本」这一 Win32 语义，需要评审确认；② 这是固定小菜单上的机制层，但也是风格边界案例，净删有限。回应：① 生命周期前提已被同文件 SAFETY 注释（`src/tray.rs:194`）按同步复制语义书写，集中持有至菜单关闭是多余的保守——直接插入让每项的真实（更短）生命周期就近显式，反而降低审查负担；InsertMenuItemW 的复制语义是 Win32 文档保证，实施时复核一次即可。② 判据针对的正是「没有第二个消费者的推测性通用机制」：枚举 + Vec + match 循环服务于一个不存在的复用场景，删除后菜单定义与插入动作合一，6 项菜单一目了然。
+最强反方：① 现结构把全部文本缓冲的生命周期集中在一处（entries Vec），审查负担低；直接插入依赖「InsertMenuItemW 复制文本」这一 Win32 语义，需要评审确认；② 这是固定小菜单上的机制层，但也是风格边界案例，净删有限。回应：① 生命周期前提已被同文件 SAFETY 注释（`src/tray.rs:194`）按同步复制语义书写，集中持有至菜单关闭是多余的保守——直接插入让每项的真实（更短）生命周期就近显式，反而降低审查负担；复制语义已本机实测并由常驻单测锁定（见风险段），不再依赖文档措辞。② 判据针对的正是「没有第二个消费者的推测性通用机制」：枚举 + Vec + match 循环服务于一个不存在的复用场景，删除后菜单定义与插入动作合一，6 项菜单一目了然。
 
 ## 验收标准
 
@@ -34,4 +34,4 @@ Status: proposed
 
 ## 风险
 
-残留风险：若 InsertMenuItemW 的复制语义假设错误，菜单文本会悬空——证伪依据：该语义是 Win32 文档保证（菜单持有字符串副本），且现有 `insert_string_item` SAFETY 注释已按同步语义书写；实施时以官方文档复核，冒烟中菜单显示正常即现场验证。本提案不改任何命令路由，回归面限于菜单构建一处。
+残留风险已关闭：复制语义在本机（Windows 11）实测成立，并由 `src/tray.rs` 的 `inserted_menu_text_is_copied` 用例常驻锁定——插入后覆写源缓冲为全 X 再释放，GetMenuItemInfoW 两段式取回仍为原文（含 CJK 与长串）。官方 InsertMenuItemW/MENUITEMINFO/SetMenuItemInfoW 文档对 `dwTypeData` 无逐字「复制」承诺，但均无缓冲存活期要求（对比 ListView `LVITEM.pszText` 有显式存活期条款），两段式取文本协议与复制语义一致。菜单形状（项数/顺序/ID/文案/勾选态）由 `menu_shape_matches_command_routes` 用例锁定。本提案不改任何命令路由，回归面限于菜单构建一处。

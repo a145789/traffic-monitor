@@ -127,58 +127,62 @@ pub(crate) fn tray_owner() -> Option<HWND> {
     TRAY_DATA.with(|t| t.borrow().as_ref().map(|nid| nid.hWnd))
 }
 
-/// 菜单项定义。`text` 为 NUL 结尾 UTF-16（`to_wide` 产出），由调用方持有至菜单关闭。
-enum MenuEntry {
-    Item { id: u32, text: Vec<u16>, state: u32 },
-    Separator,
-}
-
-fn build_menu_entries() -> Vec<MenuEntry> {
+/// 逐项构建菜单，pos 递增、顺序即唯一真源；形状由 menu_shape_matches_command_routes 锁定。
+/// 文本缓冲只需活过同步插入调用：菜单复制持有文本（inserted_menu_text_is_copied 实测锁定）。
+fn build_menu(hmenu: HMENU) {
     let update_in_progress = UPDATE_IN_PROGRESS.load(Ordering::Relaxed);
-    vec![
-        MenuEntry::Item {
-            id: 0,
-            text: to_wide(&format!("{APP_TITLE} v{VERSION}")),
-            state: MFS_DISABLED.0,
+    let mut pos = 0;
+    insert_string_item(
+        hmenu,
+        pos,
+        0,
+        &to_wide(&format!("{APP_TITLE} v{VERSION}")),
+        MFS_DISABLED.0,
+    );
+    pos += 1;
+    insert_separator(hmenu, pos);
+    pos += 1;
+    insert_string_item(
+        hmenu,
+        pos,
+        MENU_ID_AUTOSTART,
+        &to_wide("开机自启"),
+        if is_autostart_enabled() {
+            MFS_CHECKED.0
+        } else {
+            MFS_UNCHECKED.0
         },
-        MenuEntry::Separator,
-        MenuEntry::Item {
-            id: MENU_ID_AUTOSTART,
-            text: to_wide("开机自启"),
-            state: if is_autostart_enabled() {
-                MFS_CHECKED.0
-            } else {
-                MFS_UNCHECKED.0
-            },
+    );
+    pos += 1;
+    insert_string_item(
+        hmenu,
+        pos,
+        MENU_ID_AUTO_UPDATE_TOGGLE,
+        &to_wide("自动检查更新"),
+        if ENABLE_AUTO_UPDATE.load(Ordering::Relaxed) {
+            MFS_CHECKED.0
+        } else {
+            MFS_UNCHECKED.0
         },
-        MenuEntry::Item {
-            id: MENU_ID_AUTO_UPDATE_TOGGLE,
-            text: to_wide("自动检查更新"),
-            state: if ENABLE_AUTO_UPDATE.load(Ordering::Relaxed) {
-                MFS_CHECKED.0
-            } else {
-                MFS_UNCHECKED.0
-            },
+    );
+    pos += 1;
+    insert_string_item(
+        hmenu,
+        pos,
+        MENU_ID_CHECK_UPDATE_MANUAL,
+        &to_wide(if update_in_progress {
+            "检查更新中..."
+        } else {
+            "检查更新..."
+        }),
+        if update_in_progress {
+            MFS_DISABLED.0
+        } else {
+            MFS_UNCHECKED.0
         },
-        MenuEntry::Item {
-            id: MENU_ID_CHECK_UPDATE_MANUAL,
-            text: to_wide(if update_in_progress {
-                "检查更新中..."
-            } else {
-                "检查更新..."
-            }),
-            state: if update_in_progress {
-                MFS_DISABLED.0
-            } else {
-                MFS_UNCHECKED.0
-            },
-        },
-        MenuEntry::Item {
-            id: MENU_ID_EXIT,
-            text: to_wide("退出"),
-            state: MFS_UNCHECKED.0,
-        },
-    ]
+    );
+    pos += 1;
+    insert_string_item(hmenu, pos, MENU_ID_EXIT, &to_wide("退出"), MFS_UNCHECKED.0);
 }
 
 /// 插入字符串菜单项；`text` 须以 NUL 结尾（`to_wide` 产出即可）。
@@ -191,7 +195,8 @@ fn insert_string_item(hmenu: HMENU, pos: u32, id: u32, text: &[u16], state: u32)
         ..Default::default()
     };
     item.dwTypeData = PWSTR(text.as_ptr() as *mut u16);
-    // SAFETY: text 在 InsertMenuItemW 同步返回前保持存活。
+    // SAFETY: text NUL 终止且在 InsertMenuItemW 同步返回前保持存活；
+    // 此后菜单持有自己的副本（inserted_menu_text_is_copied 实测锁定），不再引用该缓冲。
     unsafe {
         let _ = InsertMenuItemW(hmenu, pos, true, &item);
     }
@@ -220,20 +225,11 @@ pub fn show_context_menu(hwnd: HWND) {
     };
     let menu_guard = MenuGuard(hmenu);
 
-    // entries 持有全部菜单文本缓冲区，须存活至 TrackPopupMenu 返回。
-    let entries = build_menu_entries();
-    for (pos, entry) in entries.iter().enumerate() {
-        match entry {
-            MenuEntry::Separator => insert_separator(hmenu, pos as u32),
-            MenuEntry::Item { id, text, state } => {
-                insert_string_item(hmenu, pos as u32, *id, text, *state);
-            }
-        }
-    }
+    build_menu(hmenu);
 
     // TPM_RETURNCMD：先取命令，再把前台权交还任务栏，最后执行，避免更新弹窗
     // 关闭后焦点回落主进程并初始化第三方 IME（见 AGENTS.md）。
-    // SAFETY: hmenu 由 MenuGuard 持有至 TrackPopupMenu 返回；菜单项宽串仍在栈上。
+    // SAFETY: hmenu 由 MenuGuard 持有至 TrackPopupMenu 返回；菜单文本由菜单自身持有。
     let selected_item = unsafe {
         let _ = SetForegroundWindow(hwnd);
         TrackPopupMenu(
@@ -295,4 +291,113 @@ fn toggle_auto_update() {
     let new_state = !current;
     ENABLE_AUTO_UPDATE.store(new_state, Ordering::Relaxed);
     crate::update::save_auto_update_enabled(new_state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DestroyMenu, GetMenuItemCount, GetMenuItemID, GetMenuItemInfoW,
+    };
+
+    /// 两段式取回菜单项文本与状态（GetMenuItemInfoW 协议：先探长度，再备缓冲拷出）。
+    fn menu_item(hmenu: HMENU, pos: u32) -> (String, MENU_ITEM_STATE) {
+        let mut item = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_STATE,
+            ..Default::default()
+        };
+        // SAFETY: hmenu 有效；dwTypeData 为 NULL 时本次调用只探文本长度。
+        unsafe { GetMenuItemInfoW(hmenu, pos, true, &mut item) }.unwrap();
+        let mut buf = vec![0u16; item.cch as usize + 1];
+        item.dwTypeData = PWSTR(buf.as_mut_ptr());
+        item.cch = buf.len() as u32;
+        // SAFETY: buf 容量含 NUL 且在同步返回前保持存活、无别名。
+        unsafe { GetMenuItemInfoW(hmenu, pos, true, &mut item) }.unwrap();
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        (String::from_utf16_lossy(&buf[..len]), item.fState)
+    }
+
+    #[test]
+    fn menu_shape_matches_command_routes() {
+        // SAFETY: 本测试线程创建弹出菜单，用例末尾 DestroyMenu 配对释放。
+        // 不用 MenuGuard：ffi_guard 的计数用例要求它是默认门禁下唯一构造点。
+        let hmenu = unsafe { CreatePopupMenu() }.unwrap();
+        let autostart = is_autostart_enabled();
+        let auto_update = ENABLE_AUTO_UPDATE.load(Ordering::Relaxed);
+        build_menu(hmenu);
+        // SAFETY: hmenu 在本用例内有效。
+        unsafe {
+            assert_eq!(GetMenuItemCount(Some(hmenu)), 6);
+            assert_eq!(GetMenuItemID(hmenu, 0), 0);
+            // 分隔线用 fType 判定：文档称 GetMenuItemID 返回 -1，Win11 实测返回 0。
+            let mut sep = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE,
+                ..Default::default()
+            };
+            GetMenuItemInfoW(hmenu, 1, true, &mut sep).unwrap();
+            assert_eq!(sep.fType, MFT_SEPARATOR, "位置 1 必须是分隔线");
+            assert_eq!(GetMenuItemID(hmenu, 2), MENU_ID_AUTOSTART);
+            assert_eq!(GetMenuItemID(hmenu, 3), MENU_ID_AUTO_UPDATE_TOGGLE);
+            assert_eq!(GetMenuItemID(hmenu, 4), MENU_ID_CHECK_UPDATE_MANUAL);
+            assert_eq!(GetMenuItemID(hmenu, 5), MENU_ID_EXIT);
+        }
+        let (title, state) = menu_item(hmenu, 0);
+        assert_eq!(title, format!("{APP_TITLE} v{VERSION}"));
+        assert_eq!(state, MFS_DISABLED);
+        let (text, state) = menu_item(hmenu, 2);
+        assert_eq!(text, "开机自启");
+        assert_eq!(
+            state,
+            if autostart {
+                MFS_CHECKED
+            } else {
+                MFS_UNCHECKED
+            }
+        );
+        let (text, state) = menu_item(hmenu, 3);
+        assert_eq!(text, "自动检查更新");
+        assert_eq!(
+            state,
+            if auto_update {
+                MFS_CHECKED
+            } else {
+                MFS_UNCHECKED
+            }
+        );
+        // UPDATE_IN_PROGRESS 在并行测试里有写者（protocol.rs 的复位用例），
+        // 只锁定文案与置灰态来自同一快照，不对标志本身做精确断言。
+        let (text, state) = menu_item(hmenu, 4);
+        assert!(
+            (text == "检查更新中..." && state == MFS_DISABLED)
+                || (text == "检查更新..." && state == MFS_UNCHECKED),
+            "文案与置灰态必须成对: {text:?} {state:?}"
+        );
+        let (text, state) = menu_item(hmenu, 5);
+        assert_eq!(text, "退出");
+        assert_eq!(state, MFS_UNCHECKED);
+        // SAFETY: hmenu 为本用例创建的成功句柄，此处恰好释放一次。
+        unsafe {
+            let _ = DestroyMenu(hmenu);
+        }
+    }
+
+    #[test]
+    fn inserted_menu_text_is_copied() {
+        // SAFETY: 本测试线程创建弹出菜单，用例末尾 DestroyMenu 配对释放。
+        let hmenu = unsafe { CreatePopupMenu() }.unwrap();
+        let mut text = to_wide("开机自启 Traffic Monitor lifetime probe");
+        let expected = String::from_utf16_lossy(&text[..text.len() - 1]);
+        insert_string_item(hmenu, 0, MENU_ID_EXIT, &text, MFS_UNCHECKED.0);
+        // 若菜单引用调用方缓冲，覆写后取回的将是全 X；取回原文即证明复制语义。
+        text.fill(u16::from(b'X'));
+        assert_eq!(menu_item(hmenu, 0).0, expected);
+        drop(text);
+        assert_eq!(menu_item(hmenu, 0).0, expected);
+        // SAFETY: hmenu 为本用例创建的成功句柄，此处恰好释放一次。
+        unsafe {
+            let _ = DestroyMenu(hmenu);
+        }
+    }
 }
