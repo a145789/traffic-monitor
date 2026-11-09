@@ -1,6 +1,6 @@
 # Agent Note：统一 renderer 数值文本表示——std 格式化替换 write_u32，宽度探针由格式化器派生
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
