@@ -158,31 +158,20 @@ pub fn handle_session_change(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     LRESULT(0)
 }
 
-/// 恢复调度的原因探针：三个挂起原因的证据强度不同，判定强度必须不同。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReasonProbe {
-    /// 本进程正在执行恢复 tick：挂起的机器不会跑定时器 ⇒ `SYSTEM` 位必为陈旧。
-    /// 零 API、零超时、零误判。
-    RunningTick,
-    /// 会话锁状态探针结果。探针不可用时调用方根本不构造本变体——保守方向是保持位不变。
-    Session { unlocked: bool },
-    /// `SUSPEND_REASON_MONITOR` 位已置位的秒数。
-    Monitor { elapsed_secs: u64 },
+/// `SUSPEND_REASON_MONITOR` 位已置位的秒数是否已达到保守超长 TTL。
+///
+/// 纯判定，便于在无 Win32 环境下钉住边界：TTL-1 秒不清位，TTL 秒清位。
+fn monitor_ttl_reached(elapsed_secs: u64) -> bool {
+    elapsed_secs >= SUSPEND_MONITOR_TTL_SECS
 }
 
-/// 纯判定：一个已置位的挂起原因是否已可自证/已超 TTL，应当走 [`resume_system`] 清位。
+/// 会话锁探针结果是否明确证明「已解锁」。
 ///
-/// 本函数只决定「是否清位」，不实现清位：位协议与恢复边沿归 `SuspendReasons` /
-/// `resume_system` 唯一所有，绕过它们会漏掉基线重建与网络退避复位。
-fn should_resume_for_reason(reason: u32, probe: ReasonProbe) -> bool {
-    match (reason, probe) {
-        (SUSPEND_REASON_SYSTEM, _) => true,
-        (SUSPEND_REASON_SESSION, ReasonProbe::Session { unlocked }) => unlocked,
-        (SUSPEND_REASON_MONITOR, ReasonProbe::Monitor { elapsed_secs }) => {
-            elapsed_secs >= SUSPEND_MONITOR_TTL_SECS
-        }
-        _ => false,
-    }
+/// `None`（探针不可用）与 `Some(false)`（仍锁屏）都判否：锁屏期间误清位会把省电语义
+/// 反向破坏掉。保守方向由 `== Some(true)` 承载——写成 `!= Some(false)` 即把探针失败
+/// 当成解锁。
+fn session_unlocked_confirmed(probe: Option<bool>) -> bool {
+    probe == Some(true)
 }
 
 /// `SUSPEND_REASON_MONITOR` 已置位的秒数。
@@ -252,39 +241,32 @@ fn probe_session_unlocked() -> Option<bool> {
 /// `SYSTEM` 自证、`SESSION` 探针、`MONITOR` 保守超长 TTL；不做统一超时，那会把
 /// 零成本的 `SYSTEM` 自证降级成猜测。
 ///
-/// 返回本轮真正清掉的位集；调用方据此决定是否需要重新注册显示器订阅。
-pub fn heal_stale_suspend(hwnd: HWND) -> u32 {
-    let mut healed = 0;
+/// 返回本轮是否按 TTL 清掉了 `SUSPEND_REASON_MONITOR` 位；调用方据此决定是否需要
+/// 重新注册显示器订阅。
+pub fn heal_stale_suspend(hwnd: HWND) -> bool {
+    let mut monitor_healed = false;
 
-    if SUSPEND_REASONS.is_set(SUSPEND_REASON_SYSTEM)
-        && should_resume_for_reason(SUSPEND_REASON_SYSTEM, ReasonProbe::RunningTick)
-    {
+    if SUSPEND_REASONS.is_set(SUSPEND_REASON_SYSTEM) {
+        // 本函数只在恢复 tick 上运行：挂起的机器不跑定时器，故这里读到该位必为陈旧。
+        // 零 API、零超时、零误判，判据即 `is_set` 本身。
         resume_system(hwnd, SUSPEND_REASON_SYSTEM);
-        healed |= SUSPEND_REASON_SYSTEM;
     }
 
     if SUSPEND_REASONS.is_set(SUSPEND_REASON_SESSION)
-        && let Some(unlocked) = probe_session_unlocked()
-        && should_resume_for_reason(SUSPEND_REASON_SESSION, ReasonProbe::Session { unlocked })
+        && session_unlocked_confirmed(probe_session_unlocked())
     {
         resume_system(hwnd, SUSPEND_REASON_SESSION);
-        healed |= SUSPEND_REASON_SESSION;
     }
 
     if SUSPEND_REASONS.is_set(SUSPEND_REASON_MONITOR)
-        && should_resume_for_reason(
-            SUSPEND_REASON_MONITOR,
-            ReasonProbe::Monitor {
-                elapsed_secs: monitor_suspended_secs(),
-            },
-        )
+        && monitor_ttl_reached(monitor_suspended_secs())
     {
         log_event!("显示器挂起位超过 {SUSPEND_MONITOR_TTL_SECS}s 未见点亮通知，按 TTL 清位");
         resume_system(hwnd, SUSPEND_REASON_MONITOR);
-        healed |= SUSPEND_REASON_MONITOR;
+        monitor_healed = true;
     }
 
-    healed
+    monitor_healed
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -727,46 +709,18 @@ mod tests {
     }
 
     #[test]
-    fn test_should_resume_for_reason_matches_evidence_strength() {
-        // SYSTEM：在 tick 上下文中恒为真——挂起的机器不会跑定时器，故位必为陈旧。
-        assert!(should_resume_for_reason(
-            SUSPEND_REASON_SYSTEM,
-            ReasonProbe::RunningTick
-        ));
+    fn test_session_unlocked_confirmed_requires_explicit_unlock() {
+        // 探针不可用（None）必须判否：锁屏期间误清位会把省电语义反向破坏掉。
+        assert!(!session_unlocked_confirmed(None));
+        assert!(!session_unlocked_confirmed(Some(false)));
+        assert!(session_unlocked_confirmed(Some(true)));
+    }
 
-        // SESSION：只有探针明确报「已解锁」才清位。
-        assert!(should_resume_for_reason(
-            SUSPEND_REASON_SESSION,
-            ReasonProbe::Session { unlocked: true }
-        ));
-        assert!(!should_resume_for_reason(
-            SUSPEND_REASON_SESSION,
-            ReasonProbe::Session { unlocked: false }
-        ));
-
-        // MONITOR：TTL 是唯一判据，未到 TTL 必须保持位不变。
-        assert!(!should_resume_for_reason(
-            SUSPEND_REASON_MONITOR,
-            ReasonProbe::Monitor {
-                elapsed_secs: SUSPEND_MONITOR_TTL_SECS - 1
-            }
-        ));
-        assert!(should_resume_for_reason(
-            SUSPEND_REASON_MONITOR,
-            ReasonProbe::Monitor {
-                elapsed_secs: SUSPEND_MONITOR_TTL_SECS
-            }
-        ));
-
-        // 原因与探针不匹配时一律判否：不得凭「别的探针说可以」清掉无关位。
-        assert!(!should_resume_for_reason(
-            SUSPEND_REASON_SESSION,
-            ReasonProbe::RunningTick
-        ));
-        assert!(!should_resume_for_reason(
-            SUSPEND_REASON_MONITOR,
-            ReasonProbe::Session { unlocked: true }
-        ));
+    #[test]
+    fn test_monitor_ttl_reached_boundary() {
+        // TTL 是唯一判据，未到 TTL 必须保持位不变。
+        assert!(!monitor_ttl_reached(SUSPEND_MONITOR_TTL_SECS - 1));
+        assert!(monitor_ttl_reached(SUSPEND_MONITOR_TTL_SECS));
     }
 
     #[test]
