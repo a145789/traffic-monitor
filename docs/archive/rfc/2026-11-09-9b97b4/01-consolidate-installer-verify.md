@@ -1,10 +1,10 @@
 # Agent Note：合并安装包锁定重验的两份实现，让缓存复用共用同一套瞬态重试
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
-「加只读共享锁 → 对锁定句柄重算哈希 → 与期望值比对 → 构造持锁体」这件事在 `src/update/installer.rs` 里有两个包装入口，核心已经收口在 `verify_locked_installer`（`src/update/installer.rs:131`-`src/update/installer.rs:149`），但两个包装层各自决定「打开失败怎么办」，而决定是相反的：`try_reuse_cached_installer`（`src/update/installer.rs:155`-`src/update/installer.rs:161`）用 `.ok()` 把一切失败折叠成「缓存不可用」，`reverify_installer_for_handoff`（`src/update/installer.rs:171`-`src/update/installer.rs:192`）对 `VerifyFailure::Open` 里的瞬态共享错误最多重试 3 次、每次间隔 `INSTALLER_LAUNCH_RETRY_DELAY_MS`。
+「加只读共享锁 → 对锁定句柄重算哈希 → 与期望值比对 → 构造持锁体」这件事在 `src/update/installer.rs` 里有两个包装入口，核心已经收口在 `verify_locked_installer`（`src/update/installer.rs:131`-`src/update/installer.rs:149`），但两个包装层各自决定「打开失败怎么办」，而决定是相反的：`try_reuse_cached_installer`（`src/update/installer.rs:155`-`src/update/installer.rs:161`）用 `.ok()` 把一切失败折叠成「缓存不可用」，`reverify_installer_for_handoff`（`src/update/installer.rs:171`-`src/update/installer.rs:192`）对 `VerifyFailure::Open` 里的瞬态共享错误做有限次重试（合计 `INSTALLER_LAUNCH_MAX_ATTEMPTS` 次尝试，即最多重试 2 次）、每次间隔 `INSTALLER_LAUNCH_RETRY_DELAY_MS`。
 
 生产消费者两处：更新检查路径调缓存复用（`src/update/mod.rs:311`-`src/update/mod.rs:317`），安装交接副本路径调重验（`src/update/mod.rs:447`-`src/update/mod.rs:450`）。非生产消费者：`src/update/installer.rs:826`-`src/update/installer.rs:839`、`src/update/installer.rs:841`-`src/update/installer.rs:856`（复用侧两条），`src/update/installer.rs:695`-`src/update/installer.rs:717`（只钉归因，不跑重试）。
 

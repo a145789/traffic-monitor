@@ -38,8 +38,8 @@ use cache::get_temp_installer_path;
 use http::{FetchFileError, fetch_url};
 use installer::{
     VerifiedInstaller, fetch_verified_installer, relaunch_main_app, relaunch_main_app_at,
-    reverify_installer_for_handoff, run_install_handoff, spawn_install_helper,
-    try_reuse_cached_installer, wait_main_instance_gone,
+    run_install_handoff, spawn_install_helper, verify_installer_with_retry,
+    wait_main_instance_gone,
 };
 use protocol::{
     ParentProbe, UpdateContext, reset_update_progress_after_check, run_check_subprocess,
@@ -308,10 +308,10 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
         return CheckResult::Abandoned;
     }
 
-    // 缓存复用：先加锁再对锁定句柄哈希（见 try_reuse_cached_installer），
-    // 同一句柄验证与持有，不按路径另开文件。缺失/占用/不匹配都落到重下。
+    // 缓存复用：先加锁再对锁定句柄哈希（见 verify_installer_with_retry），
+    // 同一句柄验证与持有，不按路径另开文件。缺失/不匹配落到重下，瞬态占用等它自愈。
     if let Some(verified) =
-        try_reuse_cached_installer(temp_path.clone(), &latest_version, &expected_hash_hex)
+        verify_installer_with_retry(temp_path.clone(), &latest_version, &expected_hash_hex)
     {
         return CheckResult::InstalledReady(verified);
     }
@@ -443,9 +443,13 @@ pub fn install_handoff_main(
     // 这一步刻意排在「等协调者退出」之前：协调者若仍存活，它持有的安装包只读共享锁
     // 会把第三方写者挡在门外，这次打开因此能落在一个没有写者的窗口里。这只覆盖
     // 「协调者还没退完」的那一小段时序，不是保证；真正的兜底是
-    // `reverify_installer_for_handoff` 内部的有限次重试。
-    let Some(verified) = reverify_installer_for_handoff(
+    // `verify_installer_with_retry` 内部的有限次重试。
+    //
+    // version 传空串：副本路径没有确认框（本函数全程不读 `VerifiedInstaller::version`），
+    // 该参数只服务缓存复用那条会弹框的路径（见 `verify_installer_with_retry` 的注释）。
+    let Some(verified) = verify_installer_with_retry(
         std::path::PathBuf::from(installer_path),
+        "",
         &expected_hash_hex,
     ) else {
         log_event!("安装交接: 安装包重验失败（缺失/占用/哈希不符），恢复主程序");

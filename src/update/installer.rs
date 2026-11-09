@@ -148,46 +148,55 @@ fn verify_locked_installer(
     })
 }
 
-/// 缓存复用：先加只读共享锁，再对锁定句柄哈希——同一句柄验证与持有。
-/// 不变量：不按路径另开文件做验证，不探针 `exists()`（加锁与哈希以 Err 表达缺失）；
-/// 哈希不匹配/读取失败返回 `None`，调用方删文件后重下。锁随 `VerifiedInstaller`
-/// 持有至安装器启动返回（见 `launch_installer`）。
-pub(super) fn try_reuse_cached_installer(
+/// [`verify_locked_installer`] 的唯一包装：两个消费者（缓存复用、安装交接副本重验）
+/// 都走这里，「打开失败怎么办」只有一份解释权（判据见 [`should_retry_verify`]）。
+///
+/// 为什么要重试：打开可能撞上「文件正被外部进程以写方式持有」（典型是杀软实时扫描
+/// 刚写完的安装包，`ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION`），那是可自愈的
+/// 瞬态。缓存复用若把它折叠成「缓存不可用」，接下来会先删文件再重下，而 `create_new`
+/// 撞的是同一个占用者、只重试一次——一次本可复用的检查于是变成一次报错加弹框。
+/// 内容层失败则始终是终局（重试同一个文件没有意义）。
+///
+/// `version` 只服务**会弹确认框**的那条路径：缓存复用传当前最新版本（它被写进确认框
+/// 文案与「跳过此版本」记录，见 `update::complete_update_interaction`），安装交接副本
+/// 传空串——副本路径没有确认框，`update::install_handoff_main` 全程不读
+/// [`VerifiedInstaller::version`]。空串是刻意的，不是遗漏。
+pub(super) fn verify_installer_with_retry(
     path: std::path::PathBuf,
     version: &str,
     expected_hash_hex: &str,
 ) -> Option<VerifiedInstaller> {
-    verify_locked_installer(path, version, expected_hash_hex).ok()
-}
-
-/// 安装交接副本的重验入口：判据与缓存复用同一处（[`verify_locked_installer`]），比对
-/// 基准是协调者经命令行传来的期望哈希。version 仅用于确认框文案，交接路径没有确认框，
-/// 留空。
-///
-/// 与缓存复用唯一的差别是**打开失败会有限次重试**：这次打开发生在协调者释放安装包
-/// 只读共享锁之后（旧设计全程只打开一次，不存在这次打开），而「刚下载完的安装包被杀软
-/// 实时扫描以写方式持有」会让带 `FILE_SHARE_READ` 的打开直接失败——那是可自愈的瞬态，
-/// 不该变成一次静默的更新放弃。内容不符是终局，不重试。
-pub(super) fn reverify_installer_for_handoff(
-    path: std::path::PathBuf,
-    expected_hash_hex: &str,
-) -> Option<VerifiedInstaller> {
     let mut attempt = 1;
     loop {
-        match verify_locked_installer(path.clone(), "", expected_hash_hex) {
+        let failure = match verify_locked_installer(path.clone(), version, expected_hash_hex) {
             Ok(verified) => return Some(verified),
-            Err(VerifyFailure::Content) => return None,
-            Err(VerifyFailure::Open(e)) => {
-                if !is_transient_sharing_error(&e) || attempt >= INSTALLER_LAUNCH_MAX_ATTEMPTS {
-                    return None;
-                }
-                log_event!("安装包重验打开失败 ({e})，重试");
-            }
+            Err(failure) => failure,
+        };
+        if !should_retry_verify(&failure, attempt) {
+            return None;
+        }
+        // 走到这里必然是可重试的瞬态打开失败（内容层失败已被判据拒掉）。
+        if let VerifyFailure::Open(e) = &failure {
+            log_event!("安装包重验打开失败 ({e})，重试");
         }
         attempt += 1;
         std::thread::sleep(std::time::Duration::from_millis(
             INSTALLER_LAUNCH_RETRY_DELAY_MS,
         ));
+    }
+}
+
+/// 重验的重试判据（纯函数：入参是失败归因与已尝试次数）。
+///
+/// 内容层失败是终局——重试同一个文件只会重复同一次比较；打开失败里只有瞬态占用值得
+/// 重试，且已尝试次数未达 `INSTALLER_LAUNCH_MAX_ATTEMPTS`（与安装器启动共用同一对
+/// 常量，见 `launch_installer`）。
+fn should_retry_verify(failure: &VerifyFailure, attempt: u32) -> bool {
+    match failure {
+        VerifyFailure::Content => false,
+        VerifyFailure::Open(e) => {
+            is_transient_sharing_error(e) && attempt < INSTALLER_LAUNCH_MAX_ATTEMPTS
+        }
     }
 }
 
@@ -689,7 +698,7 @@ mod tests {
     }
 
     /// 重验的失败归因必须区分「打不开」与「内容不符」：前者可重试（见
-    /// `reverify_installer_for_handoff`），后者是终局。这里只钉住归因本身，不真跑重试
+    /// [`should_retry_verify`]），后者是终局。这里只钉住归因本身，不真跑重试
     /// （重试要占住安装包 400ms×N，属时序成本，不适合进单测）。
     #[test]
     fn test_verify_failure_distinguishes_open_from_content() {
@@ -714,6 +723,42 @@ mod tests {
             "哈希不符必须归因到「内容层」，不得因可重试而被反复打开"
         );
         let _ = std::fs::remove_file(&tampered);
+    }
+
+    /// 重试上限与「内容层终局」由唯一判据钉住：`should_retry_verify` 是重试回路唯一的
+    /// 放行点，回路本身（真实睡眠 + 真实打开）不进单测——真跑要另起进程持写锁并空等
+    /// 400ms×N，属时序成本。
+    /// 缺口（未实测）：本用例只钉判据的放行次数，不覆盖 `verify_installer_with_retry`
+    /// 的睡眠与循环实现；真实 `ERROR_SHARING_VIOLATION` 打开失败也未在本机实测。
+    #[test]
+    fn test_verify_retry_capped_at_max_attempts_and_never_for_content() {
+        let transient = VerifyFailure::Open(std::io::Error::from_raw_os_error(
+            ERROR_SHARING_VIOLATION.0 as i32,
+        ));
+        // 每放行一次就多尝试一次，故总尝试次数 = 放行次数 + 1。常量取 0 时回路仍会
+        // 尝试一次再返回 `None`（同 `relaunch_main_app_at` 的保守落点），故与 `.max(1)` 比。
+        let retries = (1..=INSTALLER_LAUNCH_MAX_ATTEMPTS + 1)
+            .filter(|attempt| should_retry_verify(&transient, *attempt))
+            .count();
+        assert_eq!(
+            retries + 1,
+            INSTALLER_LAUNCH_MAX_ATTEMPTS.max(1) as usize,
+            "瞬态打开失败的总尝试次数必须恰好是 INSTALLER_LAUNCH_MAX_ATTEMPTS"
+        );
+
+        // 内容层失败在任何尝试次数上都不放行：重试同一个文件只会重复同一次比较。
+        // 非瞬态打开失败（访问拒绝）同理，它不会「稍后自己好起来」。
+        let permanent = VerifyFailure::Open(std::io::Error::from_raw_os_error(5));
+        for attempt in 1..=INSTALLER_LAUNCH_MAX_ATTEMPTS + 1 {
+            assert!(
+                !should_retry_verify(&VerifyFailure::Content, attempt),
+                "内容层失败必须终局 (attempt {attempt})"
+            );
+            assert!(
+                !should_retry_verify(&permanent, attempt),
+                "非瞬态打开失败必须终局 (attempt {attempt})"
+            );
+        }
     }
 
     #[test]
@@ -832,7 +877,7 @@ mod tests {
             let mut f = open_locked_installer(&path).unwrap();
             compute_sha256_hex_locked(&mut f).unwrap()
         };
-        let reused = try_reuse_cached_installer(path.clone(), "9.9.9", &expected);
+        let reused = verify_installer_with_retry(path.clone(), "9.9.9", &expected);
         assert!(reused.is_some(), "锁定句柄哈希一致时必须复用");
         drop(reused);
         let _ = std::fs::remove_file(&path);
@@ -850,7 +895,7 @@ mod tests {
             compute_sha256_hex_locked(&mut f).unwrap()
         };
         std::fs::write(&path, b"tampered-installer-payload").unwrap();
-        let reused = try_reuse_cached_installer(path.clone(), "9.9.9", &expected_good);
+        let reused = verify_installer_with_retry(path.clone(), "9.9.9", &expected_good);
         assert!(reused.is_none(), "锁定句柄哈希不一致时必须拒绝复用");
         let _ = std::fs::remove_file(&path);
     }
