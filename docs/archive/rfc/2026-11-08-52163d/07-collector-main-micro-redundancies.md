@@ -1,6 +1,6 @@
 # Agent Note：清除 collector/main 三处微冗余——每 tick 表的 thread_local、不可达判空、二次日志开关重载
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
