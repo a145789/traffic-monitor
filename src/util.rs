@@ -609,8 +609,14 @@ pub fn reg_write_string_os(subkey: &str, value_name: &str, value: &std::ffi::OsS
         .is_ok()
 }
 
+/// 删除注册表值；值不存在时返回 `false`（调用方按「已经不在」处理）。
+///
+/// 必须用 `write()` 打开：`open()` 只请求 KEY_READ，而 `RegDeleteValueW` 需要
+/// KEY_SET_VALUE，用只读句柄删除会恒失败于 ERROR_ACCESS_DENIED。
 pub fn reg_remove_value(subkey: &str, value_name: &str) -> bool {
     CURRENT_USER
+        .options()
+        .write()
         .open(subkey)
         .and_then(|key| key.remove_value(value_name))
         .is_ok()
@@ -831,5 +837,30 @@ mod tests {
         // Some(false) 会让 main::de_elevate_self 把「查不到」当成「shell 未提权」，
         // 从而把组件托付给一个根本不该被信任的中转对象。
         assert_eq!(window_process_is_elevated(HWND(std::ptr::null_mut())), None);
+    }
+
+    #[test]
+    fn test_reg_remove_value_deletes_with_write_access() {
+        // 回归：`reg_remove_value` 曾用 `open()`（只请求 KEY_READ）打开再删值，而
+        // `RegDeleteValueW` 需要 KEY_SET_VALUE，删除因此恒失败于 ERROR_ACCESS_DENIED
+        // ——「取消开机自启」静默失效。这里用真实 HKCU 做一次写入→删除往返。
+        const SUBKEY: &str = "Software\\Traffic Monitor Test\\remove_value";
+        const VALUE: &str = "probe";
+        // 受限环境（沙箱、无 HKCU 写权限）写不进去就无从验证删除，直接跳过。这个守卫
+        // 不掩盖被测缺陷：它盯的是写入，删除失败仍会让下面的断言变红。
+        if !reg_write_string(SUBKEY, VALUE, "x") {
+            return;
+        }
+        assert_eq!(reg_read_string(SUBKEY, VALUE).as_deref(), Some("x"));
+        assert!(reg_remove_value(SUBKEY, VALUE), "有写权限时必须删除成功");
+        assert_eq!(reg_read_string(SUBKEY, VALUE), None);
+        // 值已不在：再次删除返回 false，调用方据此判定「已经不在」。
+        assert!(!reg_remove_value(SUBKEY, VALUE));
+        // 清理：连同本次测试用的键一起删掉，不在用户注册表里留残迹。
+        let _ = CURRENT_USER
+            .options()
+            .write()
+            .open("Software")
+            .and_then(|key| key.remove_tree("Traffic Monitor Test"));
     }
 }
