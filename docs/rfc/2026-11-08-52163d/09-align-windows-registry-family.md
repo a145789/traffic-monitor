@@ -4,7 +4,7 @@ Status: proposed
 
 ## 问题
 
-`Cargo.toml:44` 的 `windows-registry = "0.100.0"` 引入 windows-link 0.100.0 / windows-result 0.100.0 / windows-strings 0.100.0，与 windows 0.62.2 已有的 0.2.1 / 0.4.1 / 0.5.1 三胞胎并存——`Cargo.lock:224`-290 实见六个条目（每个 crate 两个版本）。生产消费面极窄：`src/util.rs:19` 的 `CURRENT_USER` 与 `src/util.rs:570`-621 的 6 个 reg_* 包装，用到的 API 仅 open/create/get_u32/set_u32/get_string/set_string/set_bytes(Type::String)/remove_value，错误处理只做 `.ok()/.is_ok()`，不依赖错误类型的版本（下游 tray.rs、update/mod.rs、renderer.rs 经包装消费，不直接触碰 windows-registry 类型）。版本对齐证据（本人从 crates.io index 缓存解析 0.6.1 记录）：windows-registry 0.6.1 非 yanked、rust_version 1.82（< 项目 MSRV 1.95）、依赖恰为 windows-link ^0.2.1 / windows-result ^0.4.1 / windows-strings ^0.5.1——与现有 windows 0.62 树完全重合，降级后三个 0.100 包从 lock 消失。
+`Cargo.toml:44` 的 `windows-registry = "0.100.0"` 引入 windows-link 0.100.0 / windows-result 0.100.0 / windows-strings 0.100.0，与 windows 0.62.2 已有的 0.2.1 / 0.4.1 / 0.5.1 三胞胎并存——`Cargo.lock:123`-186 实见七个条目（link/result/strings 各两个版本，registry 自身一条）。生产消费面极窄：`src/util.rs:19` 的 `CURRENT_USER` 与 `src/util.rs:566`-617 的 6 个 reg_* 包装，用到的 API 仅 open/create/get_u32/set_u32/get_string/set_string/set_bytes(Type::String)/remove_value，错误处理只做 `.ok()/.is_ok()`，不依赖错误类型的版本（下游 tray.rs、update/mod.rs、renderer.rs 经包装消费，不直接触碰 windows-registry 类型）。版本对齐证据（本人从 crates.io index 缓存解析 0.6.1 记录）：windows-registry 0.6.1 非 yanked、rust_version 1.82（< 项目 MSRV 1.95）、依赖恰为 windows-link ^0.2.1 / windows-result ^0.4.1 / windows-strings ^0.5.1——与现有 windows 0.62 树完全重合，降级后三个 0.100 包从 lock 消失。
 
 消费者分类：
 
@@ -13,7 +13,7 @@ Status: proposed
 
 ## 提案
 
-`windows-registry = "0.6.1"`，同提交改 Cargo.lock；三条 --locked 门禁 + release build 重跑。Cargo.lock 净删 24 行、3 个重复包（windows-link/result/strings 的 0.100 三块各 6/9/9 行，逐块实数；windows-registry 自身块行数不变），编译/审计面去掉一整套平行 windows 基础 crate。在笔记或 Cargo.toml 就近留一句版本对齐约定：未来 windows 升级到 0.100 家族时，windows-registry 同批升回。
+`windows-registry = "0.6.1"`，同提交改 Cargo.lock；三条 --locked 门禁 + release build 重跑。Cargo.lock 净删 21 行（17 增 / 38 删）、3 个重复包整块消失（windows-link/result/strings 的 0.100 三块各 6/9/9 行，逐块实数；余下删行是依赖列表里 `windows-link 0.2.1` 这类带版本后缀的消歧写法改回不带版本），windows-registry 自身块行数不变，编译/审计面去掉一整套平行 windows 基础 crate。在笔记或 Cargo.toml 就近留一句版本对齐约定：未来 windows 升级到 0.100 家族时，windows-registry 同批升回。
 
 ## 明确不在本次范围
 
