@@ -49,6 +49,10 @@ thread_local! {
     /// 唯一写方是 [`suspend_system`] 的 MONITOR 分支（首次置位时记时），
     /// 唯一清方是 [`resume_system`] 的 MONITOR 分支；读者只有 [`monitor_suspended_secs`]。
     /// 位集与全部处理器都跑在 UI 消息循环线程上，故用 `Cell` 而非原子。
+    ///
+    /// 不变量：本值为 `Some` ⇒ `SUSPEND_REASON_MONITOR` 位**当时置位**（两个写点都在
+    /// 该位已置位的前提下写），故该位未置位时本值必为 `None`——[`resume_system`] 的
+    /// 假恢复早退据此不必清它。
     static SUSPEND_SINCE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
@@ -70,6 +74,11 @@ pub fn suspend_system(hwnd: HWND, reason: u32) {
     if reason == SUSPEND_REASON_MONITOR && previous & SUSPEND_REASON_MONITOR == 0 {
         SUSPEND_SINCE.with(|c| c.set(Some(Instant::now())));
     }
+    // `MONITOR_FULLSCREEN` 的第二个写点（唯一另一个是 `on_fullscreen_edge`）：进入挂起
+    // 必须清掉它。挂起态下监测定时器集合全空，位若留真，恢复后的 `timer_plan` 会停在
+    // 「仅全屏检测」分支，把网络与 CPU/内存采样一起挡掉。刻意不走 `on_fullscreen_edge`：
+    // 那条路径会带出强制重绘与一次基线重置，而本函数紧接着自己还会
+    // `resync_monitoring_timers` 一次，等于凭空多一轮定时器先杀后建。
     MONITOR_FULLSCREEN.store(false, Ordering::Release);
     resync_monitoring_timers(hwnd);
     if previous == 0 {
@@ -79,7 +88,13 @@ pub fn suspend_system(hwnd: HWND, reason: u32) {
 
 pub fn resume_system(hwnd: HWND, reason: u32) {
     let was_suspended = SUSPEND_REASONS.is_suspended();
-    SUSPEND_REASONS.resume(reason);
+    let previous = SUSPEND_REASONS.resume(reason);
+    // 位本来没置位 ⇒ 这一轮并没有经历过对应的挂起，不构成恢复边沿：下面的四个副作用
+    // （基线重建、退避复位、定时器同步、强制重绘）一个都不付。判据与「基线重建挂边沿」
+    // 是同一条纪律，见 [`should_apply_resume_side_effects`]。
+    if !should_apply_resume_side_effects(previous, reason) {
+        return;
+    }
     if reason == SUSPEND_REASON_MONITOR {
         SUSPEND_SINCE.with(|c| c.set(None));
     }
@@ -103,12 +118,30 @@ fn should_rebuild_baseline(was_suspended: bool, reasons: &SuspendReasons) -> boo
     was_suspended && !reasons.is_suspended()
 }
 
+/// 本次 `resume(reason)` 之后是否该付恢复副作用：位本来置位才算真实恢复边沿。
+///
+/// 「位没置位也会走到 `resume_system`」的通路都在本文件内：两个显示器电源订阅
+/// （`GUID_MONITOR_POWER_ON` / `GUID_CONSOLE_DISPLAY_STATE`）可能对同一次点亮各投一次；
+/// 显示状态非 0（含变暗）一律按点亮处理；`PBT_APMRESUMEAUTOMATIC` 可能没有前驱；
+/// 解锁消息可能没有对应的锁屏。假恢复若照跑副作用，会白付一次定时器「先杀后建」
+/// ——把健康定时器的倒计时归零（见 [`retry_missing_timers`] 与 [`sync_monitoring_timers`]
+/// 的注释），并清掉零速退避计数。
+///
+/// 与本函数并列的另一道门是 [`should_rebuild_baseline`]：那个看「清掉之后是否还有别的
+/// 原因位」以决定基线重建，本函数看「本次原因位原本在不在」。本判据到位后，那个函数的
+/// 首个合取项在调用点恒为真，保留它是因为「只有清掉最后一个原因位才重建基线」这条
+/// 判据仍只有它能表达。
+fn should_apply_resume_side_effects(previous: u32, reason: u32) -> bool {
+    previous & reason != 0
+}
+
 /// 显示器开关的两个电源设置订阅点：`GUID_MONITOR_POWER_ON`（legacy）与
 /// `GUID_CONSOLE_DISPLAY_STATE`（文档化替代，也是 Modern Standby 息屏的唯一省电
 /// 信号来源——S0 下 `PBT_APMSUSPEND` 根本不发）。
 ///
 /// 两个都订阅、两个都处理：哪个真的投递由机器与电源模型决定，任一投递即可置/清
-/// `SUSPEND_REASON_MONITOR`；重复事件被位集幂等吸收（代价只是一次多余的定时器同步）。
+/// `SUSPEND_REASON_MONITOR`；重复事件被位集幂等吸收——位已清除时再来的点亮通知不构成
+/// 恢复边沿，[`resume_system`] 首行即早退，不付任何副作用。
 fn is_display_power_setting(setting: &windows::core::GUID) -> bool {
     *setting == GUID_MONITOR_POWER_ON || *setting == GUID_CONSOLE_DISPLAY_STATE
 }
@@ -667,6 +700,36 @@ mod tests {
         let was = state.is_suspended();
         state.resume(SUSPEND_REASON_SESSION);
         assert!(!should_rebuild_baseline(was, &state));
+    }
+
+    #[test]
+    fn test_resume_side_effects_only_on_reason_edge() {
+        // 位未置位 ⇒ 假恢复，必须一个副作用都不付（双订阅点亮、无前驱的
+        // PBT_APMRESUMEAUTOMATIC、无锁屏的解锁消息都走这条路）。
+        assert!(!should_apply_resume_side_effects(0, SUSPEND_REASON_MONITOR));
+        assert!(!should_apply_resume_side_effects(0, SUSPEND_REASON_SYSTEM));
+
+        // 只置了别的原因位：本次原因同样是假恢复，早退（否则会把另一个原因的
+        // 挂起态连带做一次定时器重同步与重绘）。
+        assert!(!should_apply_resume_side_effects(
+            SUSPEND_REASON_SESSION,
+            SUSPEND_REASON_MONITOR
+        ));
+        assert!(!should_apply_resume_side_effects(
+            SUSPEND_REASON_SYSTEM | SUSPEND_REASON_MONITOR,
+            SUSPEND_REASON_SESSION
+        ));
+
+        // 本原因位原本在 ⇒ 真边沿，副作用照付；还有别的原因位并不意味着不是边沿
+        // （是否重建基线由 `should_rebuild_baseline` 另判）。
+        assert!(should_apply_resume_side_effects(
+            SUSPEND_REASON_MONITOR,
+            SUSPEND_REASON_MONITOR
+        ));
+        assert!(should_apply_resume_side_effects(
+            SUSPEND_REASON_SYSTEM | SUSPEND_REASON_MONITOR,
+            SUSPEND_REASON_MONITOR
+        ));
     }
 
     #[test]

@@ -42,9 +42,13 @@ impl SuspendReasons {
         self.0.fetch_or(reason, Ordering::AcqRel)
     }
 
-    /// 清除一个暂停原因；对已清除的位重复调用幂等。
-    pub fn resume(&self, reason: u32) {
-        self.0.fetch_and(!reason, Ordering::AcqRel);
+    /// 清除一个暂停原因，返回清除前的位集（与 [`SuspendReasons::suspend`] 对称）。
+    ///
+    /// 「本次调用是否真的构成恢复边沿」这个事实由属主在此给出：调用方读返回值里本
+    /// 原因位是否还在即可，不必自己另取快照重算。对已清除的位重复调用幂等，此时返回
+    /// 的位集不含该位（即 `previous & reason == 0`）。
+    pub fn resume(&self, reason: u32) -> u32 {
+        self.0.fetch_and(!reason, Ordering::AcqRel)
     }
 }
 
@@ -166,5 +170,40 @@ mod tests {
 
         state.resume(SUSPEND_REASON_MONITOR);
         assert!(!state.is_suspended());
+    }
+
+    #[test]
+    fn resume_returns_pre_clear_bitset() {
+        // 返回值是「本次调用是否构成恢复边沿」的唯一判据（`suspend::resume_system`
+        // 据此决定要不要付恢复副作用），消费方式恒为 `previous & reason`。两个方向
+        // 都要钉住：本原因位原本在 ⇒ 真边沿；已经不在 ⇒ 假恢复，且位集不得被再动一次。
+        let state = SuspendReasons::new();
+        state.suspend(SUSPEND_REASON_SESSION | SUSPEND_REASON_MONITOR);
+
+        assert_eq!(
+            state.resume(SUSPEND_REASON_SESSION),
+            SUSPEND_REASON_SESSION | SUSPEND_REASON_MONITOR,
+            "必须返回清除前的完整位集，而不是被清掉的那一位"
+        );
+        assert!(!state.is_set(SUSPEND_REASON_SESSION), "本原因位应已清除");
+        assert!(state.is_set(SUSPEND_REASON_MONITOR), "其余原因位不得被牵连");
+
+        // 对已清位的原因重复调用：返回值里不再有该位，其余位原样带出（此时位集非空，
+        // 故返回值不是 0——「返回 0」只在其原因位也已清除时成立，见末段）。
+        for _ in 0..2 {
+            let previous = state.resume(SUSPEND_REASON_SESSION);
+            assert_eq!(
+                previous & SUSPEND_REASON_SESSION,
+                0,
+                "已清位的原因必须报告「没有边沿」"
+            );
+            assert_eq!(previous, SUSPEND_REASON_MONITOR, "返回值是清除前的剩余位集");
+            assert!(state.is_set(SUSPEND_REASON_MONITOR), "重复调用不得改动位集");
+        }
+
+        // 位集清空后，对已清位的原因再调用返回 0。
+        assert_eq!(state.resume(SUSPEND_REASON_MONITOR), SUSPEND_REASON_MONITOR);
+        assert!(!state.is_suspended());
+        assert_eq!(state.resume(SUSPEND_REASON_MONITOR), 0);
     }
 }
