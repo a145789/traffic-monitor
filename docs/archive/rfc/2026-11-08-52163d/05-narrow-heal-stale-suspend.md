@@ -1,6 +1,6 @@
 # Agent Note：收窄 heal_stale_suspend 返回值并拆除 ReasonProbe 判定矩阵的仪式层
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
