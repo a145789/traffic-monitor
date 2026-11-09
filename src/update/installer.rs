@@ -461,16 +461,18 @@ pub(super) fn spawn_install_helper(verified: &VerifiedInstaller) -> std::io::Res
     }
 }
 
-/// 交接路径上「文件被占用」类瞬态失败的共同判据：与安装器启动的
-/// `is_transient_launch_error` 同一语义；落在这里的失败都以 `io::Error` 报错
+/// 「文件被外部进程占用」类瞬态裸码的唯一判定位置（典型为杀软实时扫描刚写完的
+/// 文件）：交接路径与安装器启动面对同一码集，新增瞬态码只改这里。
+fn is_transient_code(code: u32) -> bool {
+    code == ERROR_SHARING_VIOLATION.0 || code == ERROR_LOCK_VIOLATION.0
+}
+
+/// 交接路径上的瞬态占用判据：落在这里的失败都以 `io::Error` 报错
 /// （副本落盘/复制、`Command::spawn`、副本重验时打开安装包），裸码取自
 /// `raw_os_error`。
 fn is_transient_sharing_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(code)
-            if code == ERROR_SHARING_VIOLATION.0 as i32 || code == ERROR_LOCK_VIOLATION.0 as i32
-    )
+    e.raw_os_error()
+        .is_some_and(|code| is_transient_code(code as u32))
 }
 
 /// 启动安装器并等它收场，按「组件是否已在跑」的客观事实决定是否补拉起。
@@ -599,11 +601,7 @@ pub(super) fn launch_installer(
 }
 
 fn is_transient_launch_error(launch: &InstallerLaunch) -> bool {
-    matches!(
-        launch,
-        InstallerLaunch::Failed(code)
-            if *code == ERROR_SHARING_VIOLATION.0 || *code == ERROR_LOCK_VIOLATION.0
-    )
+    matches!(launch, InstallerLaunch::Failed(code) if is_transient_code(*code))
 }
 
 fn try_launch_installer(path: &std::path::Path) -> Result<InstallerProcess, InstallerLaunch> {
@@ -673,26 +671,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_transient_launch_errors_are_retried() {
-        assert!(is_transient_launch_error(&InstallerLaunch::Failed(
-            ERROR_SHARING_VIOLATION.0
-        )));
-        assert!(is_transient_launch_error(&InstallerLaunch::Failed(
-            ERROR_LOCK_VIOLATION.0
-        )));
-    }
-
-    #[test]
-    fn test_transient_sharing_errors_are_retried() {
+    fn test_transient_code_truth_table_through_both_wrappers() {
         // 副本落盘/复制、spawn、重验打开与安装器启动面对同一类瞬态（刚写完的文件被
-        // 杀软实时扫描占用），但报错形态不同：io::Error 的裸码取自 raw_os_error（i32）。
-        let sharing = std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.0 as i32);
-        assert!(is_transient_sharing_error(&sharing));
-        let lock = std::io::Error::from_raw_os_error(ERROR_LOCK_VIOLATION.0 as i32);
-        assert!(is_transient_sharing_error(&lock));
-        // 访问拒绝不是「稍后重试就能好」的占用形态，必须立即按失败上报。
-        let denied = std::io::Error::from_raw_os_error(5);
-        assert!(!is_transient_sharing_error(&denied));
+        // 杀软实时扫描占用），但报错形态不同：io::Error 的裸码取自 raw_os_error（i32），
+        // 启动侧取自 Failed(u32)。同一真值表经两个 wrapper 各走一遍，钉死委托适配。
+        for (code, transient) in [
+            (ERROR_SHARING_VIOLATION.0, true),
+            (ERROR_LOCK_VIOLATION.0, true),
+            // 访问拒绝不是「稍后重试就能好」的占用形态，必须立即按失败上报。
+            (5, false),
+        ] {
+            assert!(is_transient_code(code) == transient);
+            let io = std::io::Error::from_raw_os_error(code as i32);
+            assert!(is_transient_sharing_error(&io) == transient);
+            assert!(is_transient_launch_error(&InstallerLaunch::Failed(code)) == transient);
+        }
     }
 
     /// 重验的失败归因必须区分「打不开」与「内容不符」：前者可重试（见

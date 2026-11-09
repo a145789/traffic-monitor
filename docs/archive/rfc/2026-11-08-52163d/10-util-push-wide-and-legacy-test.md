@@ -1,6 +1,6 @@
 # Agent Note：util.rs 两处——内联 push_wide 并删除 dpi_scaled 的 legacy 等价钉死
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

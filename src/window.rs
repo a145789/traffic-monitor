@@ -54,8 +54,8 @@ thread_local! {
     /// 上次失败原因；`None` 表示上一轮没有失败（本就已嵌入，或刚重嵌入成功）。
     ///
     /// 唯一写方：`report_reembed_failure`（失败时写入本轮原因）与
-    /// `clear_reembed_failure`（已嵌入/成功时清空）；读方只有 `should_log_reembed_failure`
-    /// 的比较。同一失败原因连续出现只记首条、原因变化才再记一条：失败重试由 2 秒
+    /// `clear_reembed_failure`（已嵌入/成功时清空）；读方只有 `report_reembed_failure`
+    /// 自身的去重比较。同一失败原因连续出现只记首条、原因变化才再记一条：失败重试由 2 秒
     /// 定时器驱动，竖排任务栏下每轮一条会把现场日志刷成噪声并高频触发环形截断。
     /// 仅在 UI 线程访问，故用 `RefCell` 而非锁。
     static LAST_REEMBED_FAILURE: std::cell::RefCell<Option<String>> =
@@ -417,17 +417,12 @@ pub fn reembed_if_lost(hwnd: HWND) -> bool {
     }
 }
 
-/// 失败日志去重判定（纯函数）：仅当失败原因与上次不同才为真。
-fn should_log_reembed_failure(previous: Option<&str>, current: &str) -> bool {
-    previous != Some(current)
-}
-
 /// 记录本轮失败：同一原因只记首条，原因变化才再记一条；日志在状态提交后写，
 /// 保证「写日志失败」不会反过来影响去重状态。
 fn report_reembed_failure(reason: &str) {
     LAST_REEMBED_FAILURE.with(|last| {
         let mut last = last.borrow_mut();
-        if !should_log_reembed_failure(last.as_deref(), reason) {
+        if last.as_deref() == Some(reason) {
             return;
         }
         *last = Some(reason.to_string());
@@ -514,7 +509,7 @@ mod tests {
 
     use super::{
         LAST_RECT, LAST_REEMBED_FAILURE, clear_reembed_failure, invalidate_last_rect,
-        is_horizontal_taskbar, position_flags, report_reembed_failure, should_log_reembed_failure,
+        is_horizontal_taskbar, position_flags, report_reembed_failure,
     };
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE, SWP_NOZORDER};
@@ -554,18 +549,6 @@ mod tests {
         LAST_RECT.with(|c| c.set(Some((1, 2, 3, 4))));
         invalidate_last_rect();
         assert_eq!(LAST_RECT.with(|c| c.get()), None);
-    }
-
-    #[test]
-    fn reembed_failure_log_dedup() {
-        // 同一失败原因连续 N 次只产出 1 条记录（去重判定的全部语义）。
-        assert!(should_log_reembed_failure(None, "嵌入失败"));
-        assert!(!should_log_reembed_failure(Some("嵌入失败"), "嵌入失败"));
-        assert!(!should_log_reembed_failure(Some("嵌入失败"), "嵌入失败"));
-        // 失败原因变化必须再记一条，否则换了一种坏法现场就没有证据。
-        assert!(should_log_reembed_failure(Some("嵌入失败"), "任务栏不存在"));
-        // 恢复（状态被清空）后再失败仍要记：与「一直失败」不是同一状态。
-        assert!(should_log_reembed_failure(None, "嵌入失败"));
     }
 
     #[test]

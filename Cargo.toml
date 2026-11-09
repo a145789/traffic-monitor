@@ -45,7 +45,9 @@ windows-registry = "0.100.0"
 
 
 [build-dependencies]
-winresource = "0.1"
+# 本仓库无 [package.metadata.winresource] 表段，关闭默认 toml feature，
+# 避免引入 toml/serde/syn 整条构建依赖链；未来要加该表段时再显式开启。
+winresource = { version = "0.1", default-features = false }
 
 [lints]
 rust.unsafe_op_in_unsafe_fn = "deny"

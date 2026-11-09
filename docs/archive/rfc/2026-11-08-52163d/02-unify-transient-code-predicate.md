@@ -1,6 +1,6 @@
 # Agent Note：抽取码级瞬态判据，消除 installer 孪生占用错误判据的重复表示
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

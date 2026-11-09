@@ -1,6 +1,6 @@
 # Agent Note：内联 should_log_reembed_failure，删除只复述 std 语义的专用测试
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

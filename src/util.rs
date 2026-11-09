@@ -32,13 +32,9 @@ use crate::config::{
 /// （会多一个多余的 NUL，虽通常无害但语义不清晰）。
 pub fn to_wide(s: &str) -> Vec<u16> {
     let mut v = Vec::with_capacity(s.len() + 1);
-    push_wide(&mut v, s);
+    v.extend(s.encode_utf16());
+    v.push(0);
     v
-}
-
-pub fn push_wide(buf: &mut Vec<u16>, s: &str) {
-    buf.extend(s.encode_utf16());
-    buf.push(0);
 }
 
 /// 定长宽字符缓冲截断拷贝：`src`（含尾 NUL 的 `to_wide` 产出）截断装入 `dst`
@@ -699,13 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn test_push_wide_appends() {
-        let mut buf = to_wide("A");
-        push_wide(&mut buf, "B");
-        assert_eq!(buf, vec![b'A' as u16, 0, b'B' as u16, 0]);
-    }
-
-    #[test]
     fn test_copy_wide_truncated_fits_and_truncates() {
         let mut dst = [0xFFFFu16; 4];
         copy_wide_truncated(&mut dst, &to_wide("ab"));
@@ -752,21 +741,6 @@ mod tests {
             (76, 120, 95),
         ] {
             assert_eq!(dpi_scaled(base, dpi), expected, "base={base} dpi={dpi}");
-            let legacy = (base as f64 * (dpi as f64 / 96.0)).round() as i32;
-            assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
-        }
-    }
-
-    #[test]
-    fn test_dpi_scaled_matches_legacy_across_dpi_range() {
-        // 新旧公式只是浮点乘除顺序不同，等价是实测结论而非恒等式：
-        // 四个实际调用点常量在 96–384 全范围逐点相等，改舍入即红。
-        use crate::config::{DISPLAY_HEIGHT, DISPLAY_WIDTH, FONT_BASE_SIZE, GAP};
-        for base in [DISPLAY_WIDTH, DISPLAY_HEIGHT, GAP, FONT_BASE_SIZE] {
-            for dpi in 96..=384u32 {
-                let legacy = (base as f64 * (dpi as f64 / 96.0)).round() as i32;
-                assert_eq!(dpi_scaled(base, dpi), legacy, "base={base} dpi={dpi}");
-            }
         }
     }
 

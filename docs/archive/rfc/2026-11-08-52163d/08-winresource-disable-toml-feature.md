@@ -1,6 +1,6 @@
 # Agent Note：关闭 winresource 默认 feature，删除整条 toml/serde/syn3 构建依赖链
 
-Status: proposed
+Status: implemented
 
 ## 问题
 

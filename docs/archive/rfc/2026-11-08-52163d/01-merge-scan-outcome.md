@@ -1,6 +1,6 @@
 # Agent Note：合并 ScanOutcome 进 SubprocessOutcome，消除协议扫描结果的镜像表示
 
-Status: proposed
+Status: implemented
 
 ## 问题
 
