@@ -57,7 +57,7 @@ macro_rules! repo_owner_name {
     };
 }
 const GITHUB_HOST: &str = "github.com";
-const PROXY_HOST: &str = "ghproxy.cn";
+const PROXY_HOSTS: &[&str] = &["gh-proxy.com", "ghproxy.net"];
 const GITHUB_REPOSITORY_URL: &str = concat!("https://github.com/", repo_owner_name!());
 const RELEASE_PAGE_URL: &str = concat!("https://github.com/", repo_owner_name!(), "/releases");
 const VERSION_PATH: &str = concat!(
@@ -331,25 +331,34 @@ fn do_update_check(is_manual: bool, ctx: &UpdateContext) -> CheckResult {
         Ok(verified) => CheckResult::InstalledReady(verified),
         Err(FetchFileError::Download(e)) => {
             let proxy_path = format!("/{GITHUB_REPOSITORY_URL}/{asset_path}");
-            match fetch_verified_installer(
-                &temp_path,
-                PROXY_HOST,
-                &proxy_path,
-                &expected_hash_hex,
-                &latest_version,
-                &still_wanted,
-            ) {
-                Ok(verified) => CheckResult::InstalledReady(verified),
-                Err(FetchFileError::Download(pe)) => {
-                    CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
+            let mut proxy_errors = Vec::new();
+            for host in PROXY_HOSTS {
+                match fetch_verified_installer(
+                    &temp_path,
+                    host,
+                    &proxy_path,
+                    &expected_hash_hex,
+                    &latest_version,
+                    &still_wanted,
+                ) {
+                    Ok(verified) => return CheckResult::InstalledReady(verified),
+                    Err(FetchFileError::Download(pe)) => {
+                        proxy_errors.push(format!("{host}: {pe}"));
+                    }
+                    // 主源下载已失败，代理本地失败：两段都报出，不只报后者。
+                    Err(FetchFileError::Local(pe)) => {
+                        return CheckResult::Error(format!(
+                            "主源失败({e}), 代理源失败({host}: {pe})"
+                        ));
+                    }
+                    // 各段都只在父进程消失时取消：静默放弃，不报「代理源失败」的假错误。
+                    Err(FetchFileError::Cancelled) => return CheckResult::Abandoned,
                 }
-                // 主源下载已失败，代理本地失败：两段都报出，不只报后者。
-                Err(FetchFileError::Local(pe)) => {
-                    CheckResult::Error(format!("主源失败({e}), 代理源失败({pe})"))
-                }
-                // 两段都只在父进程消失时取消：静默放弃，不报「代理源失败」的假错误。
-                Err(FetchFileError::Cancelled) => CheckResult::Abandoned,
             }
+            CheckResult::Error(format!(
+                "主源失败({e}), 代理源失败({})",
+                proxy_errors.join("; ")
+            ))
         }
         Err(FetchFileError::Local(e)) => CheckResult::Error(e),
         // 取消不是失败：不再回落代理、不再重试。
