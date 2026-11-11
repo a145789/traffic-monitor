@@ -44,7 +44,7 @@ windows = { version = "0.62", features = [
 # 版本对齐约定：windows-registry 与上面 windows crate 的 windows-link/result/strings
 # 家族必须同批（windows 0.62 ↔ 0.2.1/0.4.1/0.5.1，即 registry 0.6.x）。升 windows 到
 # 新家族时同批把 registry 升回去，避免 lock 里并存两套基础 crate。
-windows-registry = "0.6.1"
+windows-registry = "0.100.0"
 
 
 [build-dependencies]
